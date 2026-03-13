@@ -39,7 +39,7 @@ echo "  Built successfully."
 echo "[2/4] Setting up skills..."
 mkdir -p "$CLAUDE_DIR/skills"
 
-for skill in salesforce-futurenergy futureenergy-git future-tickets; do
+for skill in salesforce-futurenergy; do
   if [ -L "$CLAUDE_DIR/skills/$skill" ]; then
     rm "$CLAUDE_DIR/skills/$skill"
   elif [ -d "$CLAUDE_DIR/skills/$skill" ]; then
