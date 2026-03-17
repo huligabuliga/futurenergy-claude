@@ -14,44 +14,46 @@ futurenergy-claude/
 └── README.md
 ```
 
-## Quick Setup
+## Quick Setup (Mac)
 
 ### Prerequisites
-- **Node.js** — [nodejs.org](https://nodejs.org) (LTS version)
-- **Git** — usually pre-installed on Mac
-- **Claude Desktop** or **Claude Code**
+- **Node.js** — [nodejs.org](https://nodejs.org) (LTS version, click the big green button)
+- **Claude Desktop** — [claude.ai/download](https://claude.ai/download)
 
 ### Install
 
+**Option A — Download from GitHub (no git needed):**
+1. Go to https://github.com/huligabuliga/futurenergy-claude
+2. Click the green **Code** button → **Download ZIP**
+3. Unzip it (double-click the .zip in Finder)
+4. Open Terminal and run:
+```bash
+cd ~/Downloads/futurenergy-claude-main
+chmod +x setup.sh
+./setup.sh
+```
+
+**Option B — With git:**
 ```bash
 git clone https://github.com/huligabuliga/futurenergy-claude.git
 cd futurenergy-claude
 ./setup.sh
 ```
 
-The script will:
-1. Symlink the MCP server into `~/.claude/mcp-servers/`
-2. Symlink all skills into `~/.claude/skills/`
-3. Install npm dependencies and build the MCP server
-4. Create `.env` from template (you fill in credentials)
-5. Set up Claude Desktop config (Mac only)
+### After setup
 
-After setup, edit the `.env` file with real credentials (ask Jonas):
+Edit the `.env` file with the credentials Jonas sent you:
 ```bash
 nano mcp-servers/salesforce-futurenergy/.env
 ```
 
-Then restart Claude Desktop or reconnect MCP in Claude Code.
+Then **quit and reopen Claude Desktop** for the MCP server to connect.
+
+Test it by asking Claude: **"Dame los KPIs de este mes"**
 
 ## Updating
 
-```bash
-cd futurenergy-claude
-git pull
-./setup.sh
-```
-
-Restart Claude after updating.
+Re-download the ZIP (or `git pull` if you used git), then run `./setup.sh` again. Restart Claude after updating.
 
 ## Salesforce MCP Tools
 
