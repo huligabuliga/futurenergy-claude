@@ -9,9 +9,7 @@ futurenergy-claude/
 ├── mcp-servers/
 │   └── salesforce-futurenergy/     # Salesforce MCP (17 tools, KPIs, queries)
 ├── skills/
-│   ├── salesforce-futurenergy/     # Salesforce org knowledge
-│   ├── futureenergy-git/           # Git workflow conventions
-│   └── future-tickets/             # Pronto Resolver integration
+│   └── salesforce-futurenergy/     # Salesforce org knowledge
 ├── setup.sh                        # One-command installer
 └── README.md
 ```
