@@ -1,11 +1,17 @@
 #!/bin/bash
 # Future Energy — Claude Config Setup
-# Run this once after cloning to install MCP server + skills into ~/.claude/
+# Installs all MCP servers + skills into ~/.claude/ and wires them into Claude Desktop / Claude Code.
 
 set -e
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
+
+# MCP servers to install (directory name under mcp-servers/ in this repo)
+MCP_SERVERS=("salesforce-futurenergy" "futurerp")
+
+# Skills to symlink (directory name under skills/ in this repo)
+SKILLS=("salesforce-futurenergy" "futurerp")
 
 echo "=== Future Energy Claude Setup ==="
 echo "Repo: $REPO_DIR"
@@ -26,41 +32,46 @@ fi
 echo "Node.js: $(node --version) at $(which node)"
 echo ""
 
-# ── 1. MCP Server ────────────────────────────────────────────
+# ── 1. MCP servers ──────────────────────────────────────────
 
-echo "[1/4] Setting up Salesforce MCP server..."
 mkdir -p "$CLAUDE_DIR/mcp-servers"
 
-# Symlink MCP server
-if [ -L "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy" ]; then
-  rm "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy"
-elif [ -d "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy" ]; then
-  echo "  ⚠ Existing mcp-server directory found. Backing up..."
-  mv "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy" "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy.bak.$(date +%s)"
-fi
+step=1
+for mcp in "${MCP_SERVERS[@]}"; do
+  echo "[$step/4] Setting up MCP server: $mcp"
 
-ln -s "$REPO_DIR/mcp-servers/salesforce-futurenergy" "$CLAUDE_DIR/mcp-servers/salesforce-futurenergy"
-echo "  Linked: ~/.claude/mcp-servers/salesforce-futurenergy -> repo"
+  if [ -L "$CLAUDE_DIR/mcp-servers/$mcp" ]; then
+    rm "$CLAUDE_DIR/mcp-servers/$mcp"
+  elif [ -d "$CLAUDE_DIR/mcp-servers/$mcp" ]; then
+    echo "  ⚠ Existing mcp-server directory found. Backing up..."
+    mv "$CLAUDE_DIR/mcp-servers/$mcp" "$CLAUDE_DIR/mcp-servers/$mcp.bak.$(date +%s)"
+  fi
 
-# Install dependencies & build
-echo "  Installing npm dependencies..."
-cd "$REPO_DIR/mcp-servers/salesforce-futurenergy"
-if ! npm install; then
-  echo "  ✗ npm install failed. Is Node.js installed? https://nodejs.org"
-  exit 1
-fi
-if ! npm run build; then
-  echo "  ✗ Build failed. Check errors above."
-  exit 1
-fi
-echo "  Built successfully."
+  ln -s "$REPO_DIR/mcp-servers/$mcp" "$CLAUDE_DIR/mcp-servers/$mcp"
+  echo "  Linked: ~/.claude/mcp-servers/$mcp -> repo"
 
-# ── 2. Skills ─────────────────────────────────────────────────
+  echo "  Installing npm dependencies..."
+  cd "$REPO_DIR/mcp-servers/$mcp"
+  if ! npm install; then
+    echo "  ✗ npm install failed for $mcp. Is Node.js installed? https://nodejs.org"
+    exit 1
+  fi
+  if ! npm run build; then
+    echo "  ✗ Build failed for $mcp. Check errors above."
+    exit 1
+  fi
+  echo "  Built successfully."
+  step=$((step + 1))
+done
 
-echo "[2/4] Setting up skills..."
+cd "$REPO_DIR"
+
+# ── 2. Skills ────────────────────────────────────────────────
+
+echo "[$step/4] Setting up skills..."
 mkdir -p "$CLAUDE_DIR/skills"
 
-for skill in salesforce-futurenergy; do
+for skill in "${SKILLS[@]}"; do
   if [ -L "$CLAUDE_DIR/skills/$skill" ]; then
     rm "$CLAUDE_DIR/skills/$skill"
   elif [ -d "$CLAUDE_DIR/skills/$skill" ]; then
@@ -71,29 +82,44 @@ for skill in salesforce-futurenergy; do
   ln -s "$REPO_DIR/skills/$skill" "$CLAUDE_DIR/skills/$skill"
   echo "  Linked: ~/.claude/skills/$skill -> repo"
 done
+step=$((step + 1))
 
-# ── 3. Credentials ────────────────────────────────────────────
+# ── 3. Credentials ───────────────────────────────────────────
 
-echo "[3/4] Checking credentials..."
-ENV_FILE="$REPO_DIR/mcp-servers/salesforce-futurenergy/.env"
+echo "[$step/4] Checking credentials..."
+needs_attention=0
 
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$REPO_DIR/mcp-servers/salesforce-futurenergy/.env.example" "$ENV_FILE"
-  echo ""
-  echo "  !! IMPORTANT: Edit the .env file with real credentials:"
-  echo "  $ENV_FILE"
-  echo ""
-  echo "  Ask Jonas for the SF_CLIENT_ID and SF_CLIENT_SECRET values."
-  echo ""
-else
-  echo "  .env file already exists. Skipping."
-fi
+for mcp in "${MCP_SERVERS[@]}"; do
+  env_file="$REPO_DIR/mcp-servers/$mcp/.env"
+  env_example="$REPO_DIR/mcp-servers/$mcp/.env.example"
 
-# ── 4. Claude Desktop config (Mac only) ──────────────────────
+  if [ ! -f "$env_file" ] && [ -f "$env_example" ]; then
+    cp "$env_example" "$env_file"
+    echo ""
+    echo "  !! IMPORTANT: Edit credentials for $mcp:"
+    echo "  $env_file"
+    case "$mcp" in
+      salesforce-futurenergy)
+        echo "  Ask Jonas for the SF_CLIENT_ID and SF_CLIENT_SECRET values."
+        ;;
+      futurerp)
+        echo "  Get SUPABASE_SERVICE_ROLE_KEY from Supabase Dashboard:"
+        echo "    https://supabase.com/dashboard/project/rczhnuurvcxtkfussmfj/settings/api"
+        echo "    Project Settings → API → Project API keys → service_role → reveal"
+        ;;
+    esac
+    echo ""
+    needs_attention=1
+  else
+    echo "  $mcp: .env exists. Skipping."
+  fi
+done
+step=$((step + 1))
 
-echo "[4/4] Claude Desktop configuration..."
+# ── 4. Claude Desktop / Claude Code config ──────────────────
 
-# Resolve full path to node (Claude Desktop doesn't inherit terminal PATH)
+echo "[$step/4] Claude Desktop / Code configuration..."
+
 NODE_PATH="$(which node 2>/dev/null || true)"
 if [ -z "$NODE_PATH" ]; then
   echo "  ✗ Node.js not found in PATH. Install from https://nodejs.org"
@@ -104,54 +130,53 @@ echo "  Node.js: $NODE_PATH"
 if [[ "$OSTYPE" == "darwin"* ]]; then
   CLAUDE_DESKTOP_DIR="$HOME/Library/Application Support/Claude"
   CLAUDE_DESKTOP_CONFIG="$CLAUDE_DESKTOP_DIR/claude_desktop_config.json"
-  MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
+  SF_MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
+  ERP_MCP_PATH="$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"
 
   mkdir -p "$CLAUDE_DESKTOP_DIR"
 
-  if [ -f "$CLAUDE_DESKTOP_CONFIG" ]; then
-    # Merge into existing config (preserves other MCP servers)
-    if command -v python3 &>/dev/null; then
-      python3 -c "
-import json, sys
-with open('$CLAUDE_DESKTOP_CONFIG') as f:
-    config = json.load(f)
+  if command -v python3 &>/dev/null; then
+    # Merge — preserves other MCP servers and creates the file if missing.
+    python3 - "$CLAUDE_DESKTOP_CONFIG" "$NODE_PATH" "$SF_MCP_PATH" "$ERP_MCP_PATH" <<'PYEOF'
+import json, os, sys
+config_path, node_path, sf_path, erp_path = sys.argv[1:5]
+config = {}
+if os.path.exists(config_path):
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except json.JSONDecodeError:
+        print(f"  ⚠ Existing {config_path} is not valid JSON. Aborting merge — fix it manually.")
+        sys.exit(1)
 config.setdefault('mcpServers', {})
-config['mcpServers']['salesforce'] = {
-    'command': '$NODE_PATH',
-    'args': ['$MCP_PATH']
-}
-with open('$CLAUDE_DESKTOP_CONFIG', 'w') as f:
+config['mcpServers']['salesforce'] = {'command': node_path, 'args': [sf_path]}
+config['mcpServers']['futurerp']   = {'command': node_path, 'args': [erp_path]}
+with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
-print('  Updated: $CLAUDE_DESKTOP_CONFIG')
-print('  (existing MCP servers preserved)')
-"
-    else
-      echo "  ⚠ Config exists but python3 not found to merge safely."
-      echo "  Manually add this to mcpServers in: $CLAUDE_DESKTOP_CONFIG"
-      echo "  \"salesforce\": { \"command\": \"$NODE_PATH\", \"args\": [\"$MCP_PATH\"] }"
-    fi
+print(f"  Wrote: {config_path}")
+print(f"  (existing MCP servers preserved)")
+PYEOF
   else
-    cat > "$CLAUDE_DESKTOP_CONFIG" << JSONEOF
-{
-  "mcpServers": {
-    "salesforce": {
-      "command": "$NODE_PATH",
-      "args": [
-        "$MCP_PATH"
-      ]
-    }
-  }
-}
-JSONEOF
-    echo "  Created: $CLAUDE_DESKTOP_CONFIG"
+    echo "  ⚠ python3 not found — cannot safely merge into $CLAUDE_DESKTOP_CONFIG."
+    echo "  Manually add this to mcpServers:"
+    echo "    \"salesforce\": { \"command\": \"$NODE_PATH\", \"args\": [\"$SF_MCP_PATH\"] }"
+    echo "    \"futurerp\":   { \"command\": \"$NODE_PATH\", \"args\": [\"$ERP_MCP_PATH\"] }"
   fi
 else
-  echo "  Not macOS. For Claude Code (CLI), add to ~/.claude.json mcpServers:"
-  echo '  "salesforce": {'
-  echo '    "type": "stdio",'
-  echo "    \"command\": \"$NODE_PATH\","
-  echo "    \"args\": [\"$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js\"]"
-  echo '  }'
+  echo "  Not macOS. For Claude Code, add this to ~/.claude.json (under mcpServers):"
+  echo ""
+  cat <<EOF
+  "salesforce": {
+    "type": "stdio",
+    "command": "$NODE_PATH",
+    "args": ["$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"]
+  },
+  "futurerp": {
+    "type": "stdio",
+    "command": "$NODE_PATH",
+    "args": ["$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"]
+  }
+EOF
 fi
 
 # ── Done ──────────────────────────────────────────────────────
@@ -160,8 +185,17 @@ echo ""
 echo "=== Setup complete! ==="
 echo ""
 echo "Next steps:"
-echo "  1. Make sure .env has real credentials (if not already)"
-echo "  2. Restart Claude Desktop (or reconnect MCP in Claude Code)"
-echo "  3. Ask Claude: 'Dame los KPIs de este mes'"
+if [ "$needs_attention" -eq 1 ]; then
+  echo "  1. Edit the .env files above with real credentials"
+  echo "  2. Restart Claude Desktop (or reconnect MCPs in Claude Code)"
+  echo "  3. Test:"
+  echo "     Salesforce → 'Dame los KPIs de este mes'"
+  echo "     FuturERP   → '¿Cuántos tickets abiertos hay por área?'"
+else
+  echo "  1. Restart Claude Desktop (or reconnect MCPs in Claude Code)"
+  echo "  2. Test:"
+  echo "     Salesforce → 'Dame los KPIs de este mes'"
+  echo "     FuturERP   → '¿Cuántos tickets abiertos hay por área?'"
+fi
 echo ""
-echo "To update later, just run: git pull && ./setup.sh"
+echo "To update later: git pull && ./setup.sh"

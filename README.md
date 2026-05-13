@@ -7,10 +7,12 @@ Claude dotfiles for Future Energy. Contains MCP servers, skills, and an install 
 ```
 futurenergy-claude/
 ├── mcp-servers/
-│   └── salesforce-futurenergy/     # Salesforce MCP (17 tools, KPIs, queries)
+│   ├── salesforce-futurenergy/   # Salesforce MCP (17 tools, KPIs, queries, documents)
+│   └── futurerp/                 # FuturERP MCP (17 tools, tickets/leads/instalaciones KPIs)
 ├── skills/
-│   └── salesforce-futurenergy/     # Salesforce org knowledge
-├── setup.sh                        # One-command installer
+│   ├── salesforce-futurenergy/   # Salesforce org knowledge
+│   └── futurerp/                 # Pronto Resolver (internal ERP) knowledge
+├── setup.sh                      # One-command installer
 └── README.md
 ```
 
@@ -42,20 +44,28 @@ cd futurenergy-claude
 
 ### After setup
 
-Edit the `.env` file with the credentials Jonas sent you:
+Edit the `.env` files with the credentials Jonas sent you:
+
 ```bash
-nano mcp-servers/salesforce-futurenergy/.env
+nano mcp-servers/salesforce-futurenergy/.env   # SF_CLIENT_ID, SF_CLIENT_SECRET
+nano mcp-servers/futurerp/.env                  # SUPABASE_SERVICE_ROLE_KEY
 ```
 
-Then **quit and reopen Claude Desktop** for the MCP server to connect.
+Then **quit and reopen Claude Desktop** for the MCP servers to connect.
 
-Test it by asking Claude: **"Dame los KPIs de este mes"**
+Test it by asking Claude:
+- Salesforce: **"Dame los KPIs de este mes"**
+- FuturERP: **"¿Cuántos tickets abiertos hay por área?"**
 
 ## Updating
 
 Re-download the ZIP (or `git pull` if you used git), then run `./setup.sh` again. Restart Claude after updating.
 
+---
+
 ## Salesforce MCP Tools
+
+Future Energy's customer-facing CRM (Opportunities, Accounts, Leads, Documento__c).
 
 ### KPI & Analytics
 - **salesforce_kpis** — Full dashboard: pipeline, conversion, leads, owners, projects
@@ -82,4 +92,39 @@ Re-download the ZIP (or `git pull` if you used git), then run `./setup.sh` again
 - **salesforce_download_file** — Download a file locally
 
 ### Reference
-- **salesforce_field_mappings** — Pronto Resolver <> Salesforce mappings
+- **salesforce_field_mappings** — Pronto Resolver ↔ Salesforce mappings
+
+---
+
+## FuturERP MCP Tools
+
+Future Energy's internal operations platform — **pronto-resolver-61** on Supabase: tickets, leads (pronto-side), instalaciones, drones, cantina, reports, dashboards, financial milestones, notifications. Read-only — bypasses RLS via the service role key.
+
+### Schema & Metadata
+- **futurerp_describe_table** — Live column list for any table (types, nullability, defaults, FK refs)
+- **futurerp_list_tables** — All tables grouped by domain category
+- **futurerp_list_enums** — PG enums + lead string-typed enums + CRM activity types
+- **futurerp_list_rpcs** — Catalog of DB RPCs by category, with mutating flag
+
+### Data Access
+- **futurerp_query** — Generic select with structured filters (PostgREST under the hood)
+- **futurerp_count** — Fast row count with filters
+- **futurerp_get_record** — Single row by id (or any unique column)
+- **futurerp_get_related** — Child rows by FK (e.g. ticket_activities for a ticket)
+- **futurerp_recent_records** — Last N rows of any table
+
+### Search
+- **futurerp_search** — Fuzzy ilike across tickets, leads, clients, instalaciones, projects
+
+### KPIs & Analytics
+- **futurerp_lead_kpis** — Pipeline KPIs (close rate, avg ticket, projects sold, pipeline value, cycle days)
+- **futurerp_ticket_kpis** — Open vs resolved, SLA breaches, by area / responsable / channel
+- **futurerp_instalacion_kpis** — Status breakdown, completion rate, per-cuadrilla counts
+- **futurerp_drone_leaderboard** — User leaderboard + per-drone metrics (via existing RPCs)
+- **futurerp_aggregate** — Generic GROUP BY (count / sum / avg / min / max)
+
+### Context
+- **futurerp_get_lead** — Lead row + crm_activities + stage history + converted project, one call
+
+### Reference
+- **futurerp_field_mappings** — Lead/ticket enums, notification types, RPC catalog, SLA rules, key fields, Pronto↔Salesforce crosswalk
