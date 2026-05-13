@@ -154,6 +154,36 @@ function filtersToQs(filters) {
     })
         .join("&");
 }
+/** Canonical uuid v4-ish shape — 8-4-4-4-12 hex with dashes. Rejects EFU folios. */
+const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Batch-resolve a list of auth-user uuids to "First Last" display names.
+ *
+ * Pronto's `profiles` table has BOTH `id` (the profile row's own uuid) and `user_id`
+ * (the auth.users uuid). Foreign-key columns across the app — `responsables_ids`,
+ * `assigned_to`, `created_by`, `performed_by`, etc. — reference `auth.users.id`,
+ * which corresponds to `profiles.user_id`. Joining via `profiles.id` returns nothing.
+ *
+ * Returns a Map<authUuid, displayName>. Best-effort — failures resolve to an empty map
+ * so callers can fall back to the raw uuid.
+ */
+async function resolveProfiles(authUuids) {
+    const out = new Map();
+    const valid = [...new Set(authUuids)].filter((u) => u && UUID_RX.test(u));
+    if (valid.length === 0)
+        return out;
+    try {
+        const rows = await sbApi(`/profiles?user_id=in.(${valid.map((u) => encodeURIComponent(u)).join(",")})&select=user_id,first_name,last_name,email`);
+        for (const p of Array.isArray(rows) ? rows : []) {
+            const name = [p.first_name, p.last_name].filter(Boolean).join(" ").trim() || p.email || p.user_id;
+            out.set(p.user_id, name);
+        }
+    }
+    catch {
+        /* swallow — callers fall back to raw uuid */
+    }
+    return out;
+}
 /** Render an array of records as a markdown table when narrow enough, else as a JSON code block. */
 function renderRecords(records, heading, maxCols = 8) {
     if (!records?.length)
@@ -220,7 +250,7 @@ function periodToRange(period) {
 // ── Server ────────────────────────────────────────────────
 const server = new McpServer({
     name: "futurerp",
-    version: "1.1.0",
+    version: "1.2.0",
 });
 // ────────────────────────────────────────────────────────────
 // SCHEMA & METADATA TOOLS
@@ -531,7 +561,15 @@ server.tool("futurerp_get_record", "Fetch a single row from a table by id (or an
             };
         }
         const row = rows[0];
-        const label = row.folio ?? row.name ?? row.title ?? row.full_name ?? id;
+        const composedName = row.first_name || row.last_name ? [row.first_name, row.last_name].filter(Boolean).join(" ") : null;
+        const label = row.folio ??
+            row.efu ??
+            row.name ??
+            row.nombre_cliente ??
+            row.title ??
+            composedName ??
+            row.email ??
+            id;
         return {
             content: [
                 {
@@ -635,50 +673,49 @@ server.tool("futurerp_search", "Fuzzy multi-table search across the main entitie
         const fieldMap = {
             tickets: {
                 cols: ["folio", "asunto", "descripcion", "cliente_nombre"],
-                select: "id,folio,asunto,status,prioridad,created_at",
+                select: "id,folio,asunto,estado,prioridad,fecha_creacion",
             },
             leads: {
                 cols: ["first_name", "last_name", "email", "phone", "mobile_phone", "company"],
                 select: "id,first_name,last_name,email,phone,status,created_at",
             },
             clients: {
-                cols: ["nombre", "email", "telefono"],
-                select: "id,nombre,email,telefono,created_at",
+                cols: ["name", "first_name", "last_name", "email", "phone", "mobile_phone"],
+                select: "id,name,first_name,last_name,email,phone,created_at",
             },
             instalaciones: {
-                cols: ["folio", "cliente_nombre"],
-                select: "id,folio,estado,fecha_programada,created_at",
+                cols: ["efu", "nombre_cliente"],
+                select: "id,efu,status,fecha_instalacion,nombre_cliente,created_at",
             },
             projects: {
-                cols: ["nombre", "folio"],
-                select: "id,nombre,folio,etapa,created_at",
+                cols: ["description", "efu"],
+                select: "id,efu,description,etapa_tramite,created_at",
             },
         };
-        const sections = [];
-        let total = 0;
-        for (const t of targets) {
+        // Run all per-table searches in parallel.
+        const results = await Promise.all(targets.map(async (t) => {
             const cfg = fieldMap[t];
-            if (!cfg) {
-                sections.push(`### ${t}\n*Unknown table, skipped.*`);
-                continue;
-            }
+            if (!cfg)
+                return { t, section: `### ${t}\n*Unknown table, skipped.*`, count: 0 };
             // PostgREST OR clause: or=(col1.ilike.*kw*,col2.ilike.*kw*)
             const orClause = cfg.cols.map((c) => `${c}.ilike.${pattern}`).join(",");
             try {
                 const data = await sbApi(`/${t}?or=(${encodeURIComponent(orClause)})&select=${encodeURIComponent(cfg.select)}&limit=${lim}`);
                 const rows = Array.isArray(data) ? data : [data];
-                total += rows.length;
-                if (rows.length === 0) {
-                    sections.push(`### ${t}\n*No matches.*`);
-                }
-                else {
-                    sections.push(`### ${t} (${rows.length})\n\n${renderRecords(rows)}`);
-                }
+                return {
+                    t,
+                    section: rows.length === 0
+                        ? `### ${t}\n*No matches.*`
+                        : `### ${t} (${rows.length})\n\n${renderRecords(rows)}`,
+                    count: rows.length,
+                };
             }
             catch (err) {
-                sections.push(`### ${t}\n*Error: ${err.message}*`);
+                return { t, section: `### ${t}\n*Error: ${err.message}*`, count: 0 };
             }
-        }
+        }));
+        const sections = results.map((r) => r.section);
+        const total = results.reduce((s, r) => s + r.count, 0);
         return {
             content: [
                 {
@@ -886,7 +923,7 @@ server.tool("futurerp_instalacion_kpis", "Field installation KPIs: status breakd
     period: z
         .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
         .optional()
-        .describe("Period filter on fecha_programada. Default: this_month"),
+        .describe("Period filter on fecha_instalacion. Default: this_month"),
 }, async ({ period }) => {
     try {
         requireCredentials();
@@ -897,14 +934,14 @@ server.tool("futurerp_instalacion_kpis", "Field installation KPIs: status breakd
         if (range.lte)
             filters.push({ column: "fecha_instalacion", op: "lt", value: range.lte });
         const baseQs = filtersToQs(filters);
-        const rows = await sbApi(`/instalaciones?${baseQs ? baseQs + "&" : ""}select=id,folio,estado,cuadrilla_id,numero_paneles,fecha_instalacion&limit=5000`);
+        const rows = await sbApi(`/instalaciones?${baseQs ? baseQs + "&" : ""}select=id,efu,status,cuadrilla_id,numero_paneles,fecha_instalacion&limit=5000`);
         const total = rows.length;
         const byEstado = {};
         const byCuadrilla = {};
         let totalPanels = 0;
         let completedPanels = 0;
         for (const r of rows) {
-            const e = r.estado ?? "—";
+            const e = r.status ?? "—";
             byEstado[e] = (byEstado[e] ?? 0) + 1;
             const c = r.cuadrilla_id ?? "(sin cuadrilla)";
             const slot = (byCuadrilla[c] ??= { total: 0, completed: 0, panels: 0 });
@@ -1131,19 +1168,36 @@ server.tool("futurerp_get_lead", "Combined lead view: lead row + recent crm_acti
         // 2. Activities, history, project — fire in parallel
         const [activities, history, project] = await Promise.all([
             sbApi(`/crm_activities?entity_type=eq.lead&entity_id=eq.${encodeURIComponent(lead_id)}&select=id,activity_type,category,subject,description,performed_by,created_at&order=created_at.desc&limit=${aLim}`).catch(() => []),
-            sbApi(`/lead_stage_history?lead_id=eq.${encodeURIComponent(lead_id)}&select=*&order=changed_at.desc&limit=20`).catch(() => []),
+            sbApi(`/lead_stage_history?lead_id=eq.${encodeURIComponent(lead_id)}&select=*&order=entered_at.desc&limit=20`).catch(() => []),
             lead.converted_project_id
                 ? sbApi(`/projects?id=eq.${encodeURIComponent(lead.converted_project_id)}&select=*&limit=1`).catch(() => [])
                 : Promise.resolve([]),
         ]);
         const projectRows = Array.isArray(project) ? project : [project];
+        // Resolve all referenced user uuids to names in one batch.
+        const userIds = new Set();
+        if (lead.assigned_to)
+            userIds.add(lead.assigned_to);
+        if (lead.co_owner_id)
+            userIds.add(lead.co_owner_id);
+        if (lead.created_by)
+            userIds.add(lead.created_by);
+        for (const a of Array.isArray(activities) ? activities : [])
+            if (a.performed_by)
+                userIds.add(a.performed_by);
+        const profileMap = await resolveProfiles([...userIds]);
+        const fmtUser = (u) => (u && profileMap.get(u)) || u || "—";
+        const enrichedActivities = (Array.isArray(activities) ? activities : []).map((a) => ({
+            ...a,
+            performed_by: fmtUser(a.performed_by),
+        }));
         return {
             content: [
                 {
                     type: "text",
                     text: [
                         `# Lead: ${lead.first_name ?? ""} ${lead.last_name ?? ""} (\`${lead.id}\`)`,
-                        `**Status:** ${LEAD_STATUS_LABELS[lead.status] ?? lead.status}  •  **Owner:** ${lead.assigned_to ?? "(unassigned)"}  •  **Source:** ${lead.lead_source ?? "—"}`,
+                        `**Status:** ${LEAD_STATUS_LABELS[lead.status] ?? lead.status}  •  **Owner:** ${fmtUser(lead.assigned_to) || "(unassigned)"}  •  **Co-owner:** ${fmtUser(lead.co_owner_id) || "—"}  •  **Source:** ${lead.lead_source ?? "—"}`,
                         `**Created:** ${lead.created_at}  •  **Converted:** ${lead.is_converted ? `yes (${lead.converted_at})` : "no"}`,
                         "",
                         `## Lead row`,
@@ -1156,9 +1210,9 @@ server.tool("futurerp_get_lead", "Combined lead view: lead row + recent crm_acti
                         "",
                         renderRecords(Array.isArray(history) ? history : []),
                         "",
-                        `## Recent CRM activities (${Array.isArray(activities) ? activities.length : 0})`,
+                        `## Recent CRM activities (${enrichedActivities.length})`,
                         "",
-                        renderRecords(Array.isArray(activities) ? activities : []),
+                        renderRecords(enrichedActivities),
                         "",
                         projectRows.length > 0
                             ? `## Converted project\n\n\`\`\`json\n${JSON.stringify(projectRows[0], null, 2)}\n\`\`\``
@@ -1296,6 +1350,7 @@ server.tool("futurerp_list_files", "List files/photos attached to a parent recor
             };
         }
         const lim = Math.min(limit ?? 50, 200);
+        const createdCol = spec.created ?? "created_at";
         const cols = [
             "id",
             spec.fk,
@@ -1308,11 +1363,11 @@ server.tool("futurerp_list_files", "List files/photos attached to a parent recor
             spec.category,
             spec.subcategory,
             spec.thumbnail,
-            "created_at",
+            createdCol,
         ]
             .filter(Boolean)
             .join(",");
-        const data = await sbApi(`/${spec.table}?${encodeURIComponent(spec.fk)}=eq.${encodeURIComponent(parent_id)}&select=${encodeURIComponent(cols)}&order=created_at.desc&limit=${lim}`);
+        const data = await sbApi(`/${spec.table}?${encodeURIComponent(spec.fk)}=eq.${encodeURIComponent(parent_id)}&select=${encodeURIComponent(cols)}&order=${createdCol}.desc&limit=${lim}`);
         const rows = Array.isArray(data) ? data : [data];
         if (rows.length === 0) {
             return {
@@ -1355,13 +1410,18 @@ server.tool("futurerp_download_file", "Download a file by its public URL (Fireba
             throw new Error(`Download ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
         }
         const buf = Buffer.from(await res.arrayBuffer());
-        // Infer filename: use override, then last path segment, fall back to timestamp
+        // Infer filename: use override, then last path segment, fall back to timestamp.
+        // Firebase URLs encode `/` as %2F in the path, so the last decoded segment can
+        // contain real slashes — split again after decoding and keep only the basename.
         let name = filename;
         if (!name) {
             try {
                 const u = new URL(url);
                 const last = u.pathname.split("/").pop() ?? "";
-                name = decodeURIComponent(last.replace(/^o\//, "").split("?")[0]) || `file-${Date.now()}`;
+                const decoded = decodeURIComponent(last.split("?")[0]);
+                const basename = decoded.split("/").pop() ?? "";
+                // Strip path-illegal chars (cross-platform safety, esp. Windows).
+                name = basename.replace(/[<>:"|?*\\]/g, "_").trim() || `file-${Date.now()}`;
             }
             catch {
                 name = `file-${Date.now()}`;
@@ -1397,7 +1457,7 @@ server.tool("futurerp_get_ticket", "Combined ticket view: ticket row + ticket_ac
         requireCredentials();
         const aLim = Math.min(activity_limit ?? 30, 100);
         // Accept either uuid or folio
-        const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(ticket_id);
+        const idLooksLikeUuid = UUID_RX.test(ticket_id);
         const lookupCol = idLooksLikeUuid ? "id" : "folio";
         const ticketRows = await sbApi(`/tickets?${lookupCol}=eq.${encodeURIComponent(ticket_id)}&select=*&limit=1`);
         if (!Array.isArray(ticketRows) || ticketRows.length === 0) {
@@ -1423,6 +1483,25 @@ server.tool("futurerp_get_ticket", "Combined ticket view: ticket row + ticket_ac
         const projectRow = Array.isArray(project) && project[0];
         const leadRow = Array.isArray(lead) && lead[0];
         const clienteRow = Array.isArray(cliente) && cliente[0];
+        // Resolve all referenced user uuids to names.
+        const userIds = new Set();
+        if (t.created_by)
+            userIds.add(t.created_by);
+        for (const u of t.responsables_ids ?? [])
+            if (u)
+                userIds.add(u);
+        for (const a of Array.isArray(activities) ? activities : [])
+            if (a.user_id)
+                userIds.add(a.user_id);
+        const profileMap = await resolveProfiles([...userIds]);
+        const fmtUser = (u) => (u && profileMap.get(u)) || u || "—";
+        const responsablesDisplay = Array.isArray(t.responsables_ids) && t.responsables_ids.length > 0
+            ? t.responsables_ids.map((u) => fmtUser(u)).join(", ")
+            : (t.responsables ?? []).join(", ") || t.responsable || "(sin asignar)";
+        const enrichedActivities = (Array.isArray(activities) ? activities : []).map((a) => ({
+            ...a,
+            user_id: fmtUser(a.user_id),
+        }));
         // SLA status
         const overdue = t.fecha_vencimiento && new Date(t.fecha_vencimiento).getTime() < Date.now() && t.estado !== "resuelto";
         return {
@@ -1432,7 +1511,7 @@ server.tool("futurerp_get_ticket", "Combined ticket view: ticket row + ticket_ac
                     text: [
                         `# Ticket ${t.folio}  (\`${t.id}\`)`,
                         `**Estado:** ${t.estado}  •  **Prioridad:** ${t.prioridad}  •  **Canal:** ${t.canal}  •  **Área:** ${t.area}`,
-                        `**Responsable(s):** ${(t.responsables ?? []).join(", ") || t.responsable || "(sin asignar)"}`,
+                        `**Responsable(s):** ${responsablesDisplay}  •  **Creado por:** ${fmtUser(t.created_by)}`,
                         `**Creado:** ${t.fecha_creacion}  •  **Vence:** ${t.fecha_vencimiento}${overdue ? "  ⚠️ **OVERDUE**" : ""}`,
                         "",
                         `## Asunto`,
@@ -1442,9 +1521,9 @@ server.tool("futurerp_get_ticket", "Combined ticket view: ticket row + ticket_ac
                         `${t.descripcion ?? "*(none)*"}`,
                         t.notas_internas ? `\n## Notas internas\n${t.notas_internas}` : "",
                         "",
-                        `## Activity (${Array.isArray(activities) ? activities.length : 0})`,
+                        `## Activity (${enrichedActivities.length})`,
                         "",
-                        renderRecords(Array.isArray(activities) ? activities : []),
+                        renderRecords(enrichedActivities),
                         "",
                         projectRow
                             ? `## Linked project\n\n\`\`\`json\n${JSON.stringify(projectRow, null, 2)}\n\`\`\``
@@ -1471,7 +1550,7 @@ server.tool("futurerp_get_project", "Combined project view: project row + projec
 }, async ({ project_id }) => {
     try {
         requireCredentials();
-        const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(project_id);
+        const idLooksLikeUuid = UUID_RX.test(project_id);
         const lookupCol = idLooksLikeUuid ? "id" : "efu";
         const projectRows = await sbApi(`/projects?${lookupCol}=eq.${encodeURIComponent(project_id)}&select=*&limit=1`);
         if (!Array.isArray(projectRows) || projectRows.length === 0) {
@@ -1555,8 +1634,9 @@ server.tool("futurerp_get_instalacion", "Combined instalacion view: instalacion 
 }, async ({ instalacion_id }) => {
     try {
         requireCredentials();
-        const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(instalacion_id);
-        const lookupCol = idLooksLikeUuid ? "id" : "folio";
+        const idLooksLikeUuid = UUID_RX.test(instalacion_id);
+        // instalaciones has no `folio` column — the human-readable identifier is `efu`.
+        const lookupCol = idLooksLikeUuid ? "id" : "efu";
         const rows = await sbApi(`/instalaciones?${lookupCol}=eq.${encodeURIComponent(instalacion_id)}&select=*&limit=1`);
         if (!Array.isArray(rows) || rows.length === 0) {
             return {
@@ -1571,20 +1651,26 @@ server.tool("futurerp_get_instalacion", "Combined instalacion view: instalacion 
             sbApi(`/installation_reports?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&order=created_at.desc&limit=20`).catch(() => []),
             sbApi(`/installation_visits?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&order=check_in_time.asc&limit=20`).catch(() => []),
             Array.isArray(inst.assigned_to) && inst.assigned_to.length > 0
-                ? sbApi(`/profiles?id=in.(${inst.assigned_to.map((u) => encodeURIComponent(u)).join(",")})&select=id,full_name,email,department`).catch(() => [])
+                ? sbApi(`/profiles?user_id=in.(${inst.assigned_to.map((u) => encodeURIComponent(u)).join(",")})&select=user_id,first_name,last_name,email,department`).catch(() => [])
                 : Promise.resolve([]),
         ]);
+        const crewRows = Array.isArray(crew) ? crew : [];
+        const crewWithNames = crewRows.map((p) => ({
+            ...p,
+            name: [p.first_name, p.last_name].filter(Boolean).join(" ") || p.email || p.id,
+        }));
         return {
             content: [
                 {
                     type: "text",
                     text: [
-                        `# Instalacion ${inst.folio ?? inst.id}  (\`${inst.id}\`)`,
-                        `**Estado:** ${inst.estado ?? "—"}  •  **Fecha:** ${inst.fecha_instalacion ?? "—"}  •  **Paneles:** ${inst.numero_paneles ?? "?"}  •  **Cuadrilla:** ${inst.cuadrilla_id ?? "(sin asignar)"}`,
+                        `# Instalacion ${inst.efu ?? inst.id}  (\`${inst.id}\`)`,
+                        `**Status:** ${inst.status ?? "—"}  •  **Fecha:** ${inst.fecha_instalacion ?? "—"}  •  **Paneles:** ${inst.numero_paneles ?? "?"}  •  **Cuadrilla:** ${inst.cuadrilla_id ?? "(sin asignar)"}`,
+                        `**Cliente:** ${inst.nombre_cliente ?? "—"}  •  **Check-in:** ${inst.check_in_time ?? "(no)"}  •  **Check-out:** ${inst.check_out_time ?? "(no)"}`,
                         "",
-                        `## Cuadrilla / installers (${Array.isArray(crew) ? crew.length : 0})`,
+                        `## Cuadrilla / installers (${crewWithNames.length})`,
                         "",
-                        renderRecords(Array.isArray(crew) ? crew : []),
+                        renderRecords(crewWithNames),
                         "",
                         `## Visits (check-in/out) (${Array.isArray(visits) ? visits.length : 0})`,
                         "",
@@ -1630,7 +1716,7 @@ server.tool("futurerp_get_project_financials", "Rolled-up project P&L: budget, t
 }, async ({ project_id }) => {
     try {
         requireCredentials();
-        const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(project_id);
+        const idLooksLikeUuid = UUID_RX.test(project_id);
         const lookupCol = idLooksLikeUuid ? "id" : "efu";
         const projectRows = await sbApi(`/projects?${lookupCol}=eq.${encodeURIComponent(project_id)}&select=id,efu,amount,comision_total,egreso_total,ingreso_total&limit=1`);
         if (!Array.isArray(projectRows) || projectRows.length === 0) {
@@ -1839,7 +1925,7 @@ server.prompt("lead_funnel_analysis", "Analyze the lead funnel: stage breakdown,
 2. Call \`futurerp_aggregate\` table=leads group_by=status to see the stage distribution.
 3. Call \`futurerp_aggregate\` table=leads group_by=assigned_to measure=count and again with measure=sum measure_column=project_amount to compare owners.
 4. Call \`futurerp_aggregate\` table=leads group_by=lead_qualification to see quality mix.
-5. Identify bottlenecks: which stages have the most stuck leads? Compare to the visual stage order (LEAD_PIPELINE_STAGES).
+5. Identify bottlenecks: which stages have the most stuck leads? Compare to the canonical pipeline order from \`futurerp_field_mappings mapping=lead_enums\`.
 6. Summarize with 3 actionable insights.`,
             },
         },
@@ -1866,7 +1952,7 @@ async function main() {
     const mode = hasCredentials() ? "DIRECT to Supabase" : "NO CREDENTIALS";
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error(`FuturERP MCP v1.1 (${mode})`);
+    console.error(`FuturERP MCP v1.2 (${mode})`);
 }
 main().catch((e) => {
     console.error("Fatal error:", e);

@@ -403,7 +403,7 @@ export const ACCOUNT_EMAIL_FIELDS = ["PersonEmail", "Email_Facturaci_n__c"];
 export const KEY_FIELDS = {
     tickets: {
         folio: "Human-readable ticket code, e.g. EFU-00514-1. Unique, sequentially assigned by RPC generate_ticket_folio.",
-        estado: "ticket_status enum. NB: Spanish 'estado' on Domain type but `status` on the DB row.",
+        estado: "ticket_status enum (the DB column is `estado`, mapped to `status` on the TypeScript Ticket type).",
         prioridad: "ticket_priority enum. Drives SLA via TICKET_PRIORITY_SLA_DAYS.",
         responsables_ids: "uuid[] — authoritative list of assignees. Display names live in `responsables` (text[]).",
         fecha_vencimiento: "Computed SLA deadline. Use this for overdue queries.",
@@ -422,12 +422,15 @@ export const KEY_FIELDS = {
         program: "mejoravit | pyme — drives which detail subtable applies.",
     },
     instalaciones: {
-        folio: "Human-readable installation code.",
+        efu: "Project EFU code (e.g. EFU-00514-1) — human-readable identifier. There is NO `folio` column on this table.",
         cuadrilla_id: "FK to the installing team.",
         assigned_to: "uuid[] of profile ids — installers (crew members) assigned to this job.",
-        estado: "Installation state (asignada/pendiente/en_proceso/completada/cancelada — text column, not a PG enum).",
+        status: "Installation state (asignada/pendiente/en_proceso/completada/cancelada — text column, NOT a PG enum, and NOT named `estado`).",
+        nombre_cliente: "Denormalized client display name (for fast list rendering).",
         fecha_instalacion: "Scheduled installation date (NOT 'fecha_programada' — that column does not exist).",
         numero_paneles: "Number of solar panels scheduled (NOT 'paneles').",
+        check_in_time: "GPS check-in timestamp at the instalacion level (denormalized; per-visit times live in installation_visits).",
+        check_out_time: "GPS check-out timestamp at the instalacion level.",
         project_id: "FK to the parent project.",
     },
     installation_visits: {
@@ -507,7 +510,8 @@ export const FILE_TABLES = {
         filename: "file_name",
         thumbnail: "thumbnail_url",
         category: "category",
-        notes: "Photos from technical site survey. Has thumbnail_url for previews.",
+        created: "uploaded_at",
+        notes: "Photos from technical site survey. Has thumbnail_url for previews. Uses uploaded_at instead of created_at.",
     },
     inventory_movement: {
         table: "inventory_movement_files",
@@ -532,8 +536,12 @@ export const FILE_TABLES = {
         table: "cantina_attachments",
         fk: "resource_id",
         url: "google_drive_web_view_link",
-        filename: "file_path",
-        notes: "Google Drive-backed via google_drive_file_id. Alternative FK: status_id.",
+        filename: "file_name",
+        size: "file_size",
+        mime: "content_type",
+        uploader: "uploaded_by_user_id",
+        created: "uploaded_at",
+        notes: "Google Drive-backed via google_drive_file_id. Alternative FK: status_id. Uses uploaded_at instead of created_at.",
     },
 };
 export const FILE_ENTITY_TYPES = Object.keys(FILE_TABLES);

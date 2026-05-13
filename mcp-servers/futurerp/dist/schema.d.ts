@@ -76,6 +76,8 @@ export interface FileTableSpec {
     category?: string;
     subcategory?: string;
     thumbnail?: string;
+    /** Timestamp column to ORDER BY (most tables use `created_at`; visita_tecnica_photos and cantina_attachments use `uploaded_at`). */
+    created?: string;
     /** Free-form notes about quirks (Google Drive vs Firebase, missing columns, etc.) */
     notes?: string;
 }

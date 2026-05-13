@@ -1,6 +1,6 @@
 {
   "name": "futurerp-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MCP server for querying Future Energy's internal ERP (pronto-resolver on Supabase) — tickets, leads, installations, drones, KPIs",
   "type": "module",
   "main": "dist/index.js",
