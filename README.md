@@ -48,8 +48,10 @@ Edit the `.env` files with the credentials Jonas sent you:
 
 ```bash
 nano mcp-servers/salesforce-futurenergy/.env   # SF_CLIENT_ID, SF_CLIENT_SECRET
-nano mcp-servers/futurerp/.env                  # SUPABASE_SERVICE_ROLE_KEY
+nano mcp-servers/futurerp/.env                  # SUPABASE_SERVICE_ROLE_KEY (or new sb_secret_*)
 ```
+
+> FuturERP accepts either a **new-style Supabase secret key** (`sb_secret_...`, recommended — create in Dashboard → Project Settings → API Keys → New secret key) or a **legacy `service_role` JWT**. Both bypass RLS and give the MCP full read access.
 
 Then **quit and reopen Claude Desktop** for the MCP servers to connect.
 
@@ -123,8 +125,22 @@ Future Energy's internal operations platform — **pronto-resolver-61** on Supab
 - **futurerp_drone_leaderboard** — User leaderboard + per-drone metrics (via existing RPCs)
 - **futurerp_aggregate** — Generic GROUP BY (count / sum / avg / min / max)
 
-### Context
-- **futurerp_get_lead** — Lead row + crm_activities + stage history + converted project, one call
+### Context dumps
+- **futurerp_get_lead** — Lead row + crm_activities + stage history + converted project
+- **futurerp_get_ticket** — Ticket + activities + linked project/lead/cliente (accepts folio or uuid)
+- **futurerp_get_project** — Project + files + tramites + scheduled_payments + instalaciones + expenses + client
+- **futurerp_get_instalacion** — Instalacion + photos + line items + visits + reports + cuadrilla profiles
+
+### Files & documents
+- **futurerp_list_files** — List files for any entity (project/lead/instalacion/visita/inventory_movement/announcement/cantina) with public download URLs
+- **futurerp_download_file** — Download a file by URL and save locally (mirrors salesforce_download_file)
+
+### Financials
+- **futurerp_get_project_financials** — Rolled-up P&L: budget vs expenses (approved/paid/pending), scheduled vs received payments, gross margin + status
+
+### Named RPC wrappers
+- **futurerp_sales_ranking** — Wraps `get_sales_ranking` RPC — vendor leaderboard
+- **futurerp_marketing_stats** — Wraps `get_marketing_lead_stats` RPC — lead source attribution
 
 ### Reference
 - **futurerp_field_mappings** — Lead/ticket enums, notification types, RPC catalog, SLA rules, key fields, Pronto↔Salesforce crosswalk

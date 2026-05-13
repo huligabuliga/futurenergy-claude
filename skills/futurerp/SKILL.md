@@ -63,14 +63,34 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 | Tool | Purpose |
 |---|---|
 | `futurerp_get_lead` | Combined lead view: row + crm_activities + stage history + converted project. |
+| `futurerp_get_ticket` | Ticket + activities + linked project / lead / cliente. Accepts uuid or folio. |
+| `futurerp_get_project` | Project row + files + tramites + scheduled_payments + instalaciones + expenses + client. Accepts uuid or EFU code. |
+| `futurerp_get_instalacion` | Instalacion + photos + line items + visits (check-in/out) + reports + cuadrilla profiles. |
 | `futurerp_field_mappings` | Static reference: lead_enums, ticket_enums, notification_types, rpc_catalog, sla_rules, key_fields, salesforce_crosswalk. |
+
+### Files & documents
+| Tool | Purpose |
+|---|---|
+| `futurerp_list_files` | List files for any entity (project, lead, instalacion, visita, inventory_movement, announcement, cantina). Returns metadata + public download URL. |
+| `futurerp_download_file` | Download a file by URL and save locally. Defaults to `~/Downloads/futurerp/`. |
+
+### Financials
+| Tool | Purpose |
+|---|---|
+| `futurerp_get_project_financials` | Rolled-up P&L: budget vs expenses (approved/paid/pending), payments (scheduled/received/overdue), gross margin + status. |
+
+### Named RPC wrappers
+| Tool | Purpose |
+|---|---|
+| `futurerp_sales_ranking` | Wraps `get_sales_ranking(p_period_start, p_period_end)`. Vendor leaderboard. |
+| `futurerp_marketing_stats` | Wraps `get_marketing_lead_stats(range_start?, range_end?)`. Lead source attribution + conversion. |
 
 ## Hard rules
 
 - **Read-only**: the MCP never mutates. No INSERT / UPDATE / DELETE. Mutating RPCs are catalogued for reference only.
-- **Service role bypasses RLS**: results are org-wide. Always filter by `assigned_to` / `responsable` if you want a single-user view.
+- **Service-role-equivalent key bypasses RLS**: results are org-wide. Always filter by `assigned_to` / `responsable` if you want a single-user view.
 - **Spanish UI / es-MX locale**: dates `dd/mm/yyyy`, currency MXN, labels in Spanish where rendered for humans.
-- **Service role key is sensitive**: lives in `~/.claude/mcp-servers/futurerp/.env` (gitignored). Never commit, never echo to user output.
+- **Auth key is sensitive**: lives in `~/.claude/mcp-servers/futurerp/.env` (gitignored). Never commit, never echo to user output. Either a new-style `sb_secret_*` key or the legacy `service_role` JWT works — both give the same access.
 
 ---
 
@@ -144,8 +164,14 @@ The MCP uses Supabase's **service_role** key (server-to-server, bypasses RLS). T
 |---|---|
 | "How are we doing this month?" | `futurerp_lead_kpis period=this_month` → `futurerp_ticket_kpis period=this_month` → `futurerp_instalacion_kpis period=this_month`. |
 | "What's overdue?" | `futurerp_ticket_kpis` (shows SLA-overdue count) → `futurerp_recent_records table=tickets filters=[{status, neq, resuelto}] order=fecha_vencimiento.asc`. |
-| "Show me ticket EFU-00514-1" | `futurerp_get_record table=tickets id=EFU-00514-1 id_column=folio` → `futurerp_get_related child_table=ticket_activities fk_column=ticket_id parent_id=<id>`. |
+| "Show me ticket EFU-00514-1" | `futurerp_get_ticket ticket_id=EFU-00514-1` — accepts folio or uuid, returns activities + linked records. |
+| "Show me project EFU-00514-1" | `futurerp_get_project project_id=EFU-00514-1` — files, tramites, payments, instalaciones in one call. |
 | "Show me lead X" | `futurerp_get_lead lead_id=<uuid>`. |
+| "Show me instalacion X" | `futurerp_get_instalacion instalacion_id=<folio-or-uuid>` — photos, visits, reports, BOM. |
+| "Get the photos / files for X" | `futurerp_list_files entity_type=<project\|lead\|instalacion\|visita\|...> parent_id=<uuid>` → optionally `futurerp_download_file url=<firebase_url>`. |
+| "Is project X profitable?" | `futurerp_get_project_financials project_id=<EFU-or-uuid>` — budget, expenses, payments, margin. |
+| "Top vendors in the last 90 days" | `futurerp_sales_ranking` (defaults: last 90 days). |
+| "Where are leads coming from?" | `futurerp_marketing_stats range_start=<iso> range_end=<iso>`. |
 | "Who's busiest?" | `futurerp_aggregate table=tickets group_by=responsable measure=count`. |
 | "What stages have leads stuck?" | `futurerp_aggregate table=leads group_by=status measure=count`. |
 | "Top vendors by closed amount" | `futurerp_aggregate table=leads group_by=assigned_to measure=sum measure_column=project_amount filters=[{is_converted, eq, true}]`. |

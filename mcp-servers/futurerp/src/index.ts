@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * FuturERP MCP Server v1.0
+ * FuturERP MCP Server v1.1
  *
  * Read-only MCP for Future Energy's internal ERP (pronto-resolver-61 on Supabase).
- * Connects directly via PostgREST + Supabase RPCs using the service role key
- * (bypasses RLS — full org read). Mirrors the Salesforce MCP's tool shape.
+ * Connects directly via PostgREST + Supabase RPCs using either a new-style secret key
+ * (sb_secret_*) or a legacy service_role JWT. Both bypass RLS — full org read.
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY   — service_role key from Supabase Dashboard → Project Settings → API
+ *   SUPABASE_SERVICE_ROLE_KEY   — sb_secret_* (preferred) OR legacy service_role JWT
  */
 
-import { readFileSync } from "fs";
-import { resolve, dirname } from "path";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { resolve, dirname, join } from "path";
+import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -52,6 +53,8 @@ import {
   VT_TO_SF_FIELD_MAP,
   ACCOUNT_EMAIL_FIELDS,
   KEY_FIELDS,
+  FILE_TABLES,
+  FILE_ENTITY_TYPES,
   getRpcsByCategory,
   type ProntoTable,
   type ProntoRpc,
@@ -263,7 +266,7 @@ function periodToRange(period: string): { gte?: string; lte?: string; label: str
 
 const server = new McpServer({
   name: "futurerp",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 // ────────────────────────────────────────────────────────────
@@ -936,25 +939,25 @@ server.tool(
 
       const baseQs = filtersToQs(filters);
       const tickets: any[] = await sbApi(
-        `/tickets?${baseQs ? baseQs + "&" : ""}select=id,folio,status,prioridad,canal,area,responsable,fecha_creacion,fecha_vencimiento&limit=5000`
+        `/tickets?${baseQs ? baseQs + "&" : ""}select=id,folio,estado,prioridad,canal,area,responsable,fecha_creacion,fecha_vencimiento&limit=5000`
       );
 
       const total = tickets.length;
       const now = Date.now();
-      const open = tickets.filter((t) => t.status !== "resuelto");
-      const resolved = tickets.filter((t) => t.status === "resuelto");
+      const open = tickets.filter((t) => t.estado !== "resuelto");
+      const resolved = tickets.filter((t) => t.estado === "resuelto");
       const overdue = open.filter(
         (t) => t.fecha_vencimiento && new Date(t.fecha_vencimiento).getTime() < now
       );
 
-      // by status
+      // by estado
       const byStatus: Record<string, number> = {};
       const byPriority: Record<string, number> = {};
       const byArea: Record<string, number> = {};
       const byChannel: Record<string, number> = {};
       const byResp: Record<string, number> = {};
       for (const t of tickets) {
-        byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
+        byStatus[t.estado] = (byStatus[t.estado] ?? 0) + 1;
         byPriority[t.prioridad] = (byPriority[t.prioridad] ?? 0) + 1;
         byArea[t.area ?? "—"] = (byArea[t.area ?? "—"] ?? 0) + 1;
         byChannel[t.canal ?? "—"] = (byChannel[t.canal ?? "—"] ?? 0) + 1;
@@ -1052,12 +1055,12 @@ server.tool(
       requireCredentials();
       const range = periodToRange(period ?? "this_month");
       const filters: RawFilter[] = [];
-      if (range.gte) filters.push({ column: "fecha_programada", op: "gte", value: range.gte });
-      if (range.lte) filters.push({ column: "fecha_programada", op: "lt", value: range.lte });
+      if (range.gte) filters.push({ column: "fecha_instalacion", op: "gte", value: range.gte });
+      if (range.lte) filters.push({ column: "fecha_instalacion", op: "lt", value: range.lte });
 
       const baseQs = filtersToQs(filters);
       const rows: any[] = await sbApi(
-        `/instalaciones?${baseQs ? baseQs + "&" : ""}select=id,folio,estado,cuadrilla_id,paneles,fecha_programada,checkin_at,checkout_at&limit=5000`
+        `/instalaciones?${baseQs ? baseQs + "&" : ""}select=id,folio,estado,cuadrilla_id,numero_paneles,fecha_instalacion&limit=5000`
       );
 
       const total = rows.length;
@@ -1074,7 +1077,7 @@ server.tool(
         const slot = (byCuadrilla[c] ??= { total: 0, completed: 0, panels: 0 });
         slot.total += 1;
         if (e === "completada") slot.completed += 1;
-        const p = Number(r.paneles) || 0;
+        const p = Number(r.numero_paneles) || 0;
         slot.panels += p;
         totalPanels += p;
         if (e === "completada") completedPanels += p;
@@ -1515,6 +1518,643 @@ server.tool(
 );
 
 // ────────────────────────────────────────────────────────────
+// FILES & DOCUMENTS
+// ────────────────────────────────────────────────────────────
+
+const FileEntityEnum = z.enum(FILE_ENTITY_TYPES as [string, ...string[]]);
+
+server.tool(
+  "futurerp_list_files",
+  "List files/photos attached to a parent record. Polymorphic across entity types: project, lead, instalacion, visita, inventory_movement, announcement, cantina. Returns metadata + the direct download URL (Firebase public URLs for most; Google Drive for announcements and cantina).",
+  {
+    entity_type: FileEntityEnum.describe(
+      "What the files are attached to. One of: project, lead, instalacion, visita, inventory_movement, announcement, cantina."
+    ),
+    parent_id: z.string().describe("Parent record uuid"),
+    limit: z.number().int().min(1).max(200).optional().describe("Max files (default 50, max 200)"),
+  },
+  async ({ entity_type, parent_id, limit }) => {
+    try {
+      requireCredentials();
+      const spec = FILE_TABLES[entity_type];
+      if (!spec) {
+        return {
+          content: [{ type: "text", text: `Unknown entity_type '${entity_type}'.` }],
+          isError: true,
+        };
+      }
+      const lim = Math.min(limit ?? 50, 200);
+      const cols = [
+        "id",
+        spec.fk,
+        spec.url,
+        spec.filename,
+        spec.size,
+        spec.mime,
+        spec.extension,
+        spec.uploader,
+        spec.category,
+        spec.subcategory,
+        spec.thumbnail,
+        "created_at",
+      ]
+        .filter(Boolean)
+        .join(",");
+
+      const data = await sbApi(
+        `/${spec.table}?${encodeURIComponent(spec.fk)}=eq.${encodeURIComponent(parent_id)}&select=${encodeURIComponent(cols)}&order=created_at.desc&limit=${lim}`
+      );
+      const rows: any[] = Array.isArray(data) ? data : [data];
+      if (rows.length === 0) {
+        return {
+          content: [
+            { type: "text", text: `No files in \`${spec.table}\` for ${spec.fk} = '${parent_id}'.` },
+          ],
+        };
+      }
+
+      const lines = rows.map((r) => {
+        const url = r[spec.url];
+        const name = r[spec.filename] ?? "(unnamed)";
+        const sizeKb = spec.size && r[spec.size] ? `${(r[spec.size] / 1024).toFixed(1)} KB` : "";
+        const mime = spec.mime && r[spec.mime] ? r[spec.mime] : "";
+        const cat = spec.category && r[spec.category] ? `[${r[spec.category]}${spec.subcategory && r[spec.subcategory] ? "/" + r[spec.subcategory] : ""}]` : "";
+        const meta = [mime, sizeKb, cat].filter(Boolean).join(" • ");
+        return `- ${cat ? cat + " " : ""}**${name}**${meta ? ` — ${meta}` : ""}\n  ${url ?? "*(no url)*"}`;
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `## Files for ${entity_type} \`${parent_id}\` (${rows.length})\n\n*Source table:* \`${spec.table}\`${spec.notes ? `  •  ${spec.notes}` : ""}\n\n${lines.join("\n")}`,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `List files failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "futurerp_download_file",
+  "Download a file by its public URL (Firebase Storage public URL or Google Drive web_content_link) and save it locally. Mirrors salesforce_download_file. Returns the local file path.",
+  {
+    url: z.string().url().describe("Direct download URL from futurerp_list_files (firebase_url / web_content_link / etc.)"),
+    save_dir: z.string().optional().describe("Directory to save to. Defaults to ~/Downloads/futurerp"),
+    filename: z.string().optional().describe("Override the filename (otherwise inferred from URL)"),
+  },
+  async ({ url, save_dir, filename }) => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Download ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+
+      // Infer filename: use override, then last path segment, fall back to timestamp
+      let name = filename;
+      if (!name) {
+        try {
+          const u = new URL(url);
+          const last = u.pathname.split("/").pop() ?? "";
+          name = decodeURIComponent(last.replace(/^o\//, "").split("?")[0]) || `file-${Date.now()}`;
+        } catch {
+          name = `file-${Date.now()}`;
+        }
+      }
+
+      const targetDir = save_dir ?? join(homedir(), "Downloads", "futurerp");
+      mkdirSync(targetDir, { recursive: true });
+      const filePath = join(targetDir, name);
+      writeFileSync(filePath, buf);
+
+      const sizeKB = (buf.length / 1024).toFixed(1);
+      const mime = res.headers.get("content-type") ?? "?";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `## File Downloaded\n\n- **File:** ${name}\n- **Size:** ${sizeKB} KB\n- **MIME:** ${mime}\n- **Saved to:** \`${filePath}\``,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Download failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ────────────────────────────────────────────────────────────
+// CONTEXT DUMPS (ticket / project / instalacion)
+// ────────────────────────────────────────────────────────────
+
+server.tool(
+  "futurerp_get_ticket",
+  "Combined ticket view: ticket row + ticket_activities (latest N) + linked project / lead / cliente. One-call context dump for analyzing a ticket.",
+  {
+    ticket_id: z.string().describe("Ticket id (uuid) or folio (e.g. EFU-00514-1)"),
+    activity_limit: z.number().int().min(1).max(100).optional().describe("Max activities (default 30)"),
+  },
+  async ({ ticket_id, activity_limit }) => {
+    try {
+      requireCredentials();
+      const aLim = Math.min(activity_limit ?? 30, 100);
+
+      // Accept either uuid or folio
+      const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(ticket_id);
+      const lookupCol = idLooksLikeUuid ? "id" : "folio";
+      const ticketRows: any[] = await sbApi(
+        `/tickets?${lookupCol}=eq.${encodeURIComponent(ticket_id)}&select=*&limit=1`
+      );
+      if (!Array.isArray(ticketRows) || ticketRows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No ticket where ${lookupCol} = '${ticket_id}'.` }],
+          isError: true,
+        };
+      }
+      const t = ticketRows[0];
+
+      // Parallel fan-out
+      const [activities, project, lead, cliente] = await Promise.all([
+        sbApi(
+          `/ticket_activities?ticket_id=eq.${encodeURIComponent(t.id)}&select=*&order=created_at.desc&limit=${aLim}`
+        ).catch(() => []),
+        t.project_id
+          ? sbApi(
+              `/projects?id=eq.${encodeURIComponent(t.project_id)}&select=id,efu,description,etapa_tramite,client_id,amount&limit=1`
+            ).catch(() => [])
+          : Promise.resolve([]),
+        t.lead_id
+          ? sbApi(
+              `/leads?id=eq.${encodeURIComponent(t.lead_id)}&select=id,first_name,last_name,status,assigned_to,phone,email&limit=1`
+            ).catch(() => [])
+          : Promise.resolve([]),
+        t.cliente_id
+          ? sbApi(
+              `/clients?id=eq.${encodeURIComponent(t.cliente_id)}&select=*&limit=1`
+            ).catch(() => [])
+          : Promise.resolve([]),
+      ]);
+
+      const projectRow = Array.isArray(project) && project[0];
+      const leadRow = Array.isArray(lead) && lead[0];
+      const clienteRow = Array.isArray(cliente) && cliente[0];
+
+      // SLA status
+      const overdue =
+        t.fecha_vencimiento && new Date(t.fecha_vencimiento).getTime() < Date.now() && t.estado !== "resuelto";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Ticket ${t.folio}  (\`${t.id}\`)`,
+              `**Estado:** ${t.estado}  •  **Prioridad:** ${t.prioridad}  •  **Canal:** ${t.canal}  •  **Área:** ${t.area}`,
+              `**Responsable(s):** ${(t.responsables ?? []).join(", ") || t.responsable || "(sin asignar)"}`,
+              `**Creado:** ${t.fecha_creacion}  •  **Vence:** ${t.fecha_vencimiento}${overdue ? "  ⚠️ **OVERDUE**" : ""}`,
+              "",
+              `## Asunto`,
+              `${t.asunto}`,
+              "",
+              `## Descripción`,
+              `${t.descripcion ?? "*(none)*"}`,
+              t.notas_internas ? `\n## Notas internas\n${t.notas_internas}` : "",
+              "",
+              `## Activity (${Array.isArray(activities) ? activities.length : 0})`,
+              "",
+              renderRecords(Array.isArray(activities) ? activities : []),
+              "",
+              projectRow
+                ? `## Linked project\n\n\`\`\`json\n${JSON.stringify(projectRow, null, 2)}\n\`\`\``
+                : "",
+              leadRow
+                ? `## Linked lead\n\n\`\`\`json\n${JSON.stringify(leadRow, null, 2)}\n\`\`\``
+                : "",
+              clienteRow
+                ? `## Linked cliente\n\n\`\`\`json\n${JSON.stringify(clienteRow, null, 2)}\n\`\`\``
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Get ticket failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "futurerp_get_project",
+  "Combined project view: project row + project_files + project_tramites + project_scheduled_payments + related instalaciones + recent expenses. One-call deep dive on a project.",
+  {
+    project_id: z.string().describe("Project uuid or EFU code (e.g. EFU-00514-1)"),
+  },
+  async ({ project_id }) => {
+    try {
+      requireCredentials();
+      const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(project_id);
+      const lookupCol = idLooksLikeUuid ? "id" : "efu";
+      const projectRows: any[] = await sbApi(
+        `/projects?${lookupCol}=eq.${encodeURIComponent(project_id)}&select=*&limit=1`
+      );
+      if (!Array.isArray(projectRows) || projectRows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No project where ${lookupCol} = '${project_id}'.` }],
+          isError: true,
+        };
+      }
+      const p = projectRows[0];
+
+      const [files, tramites, payments, instalaciones, expenses, client] = await Promise.all([
+        sbApi(
+          `/project_files?project_id=eq.${encodeURIComponent(p.id)}&select=id,file_name,mime_type,file_size,firebase_url,uploaded_by,created_at&order=created_at.desc&limit=50`
+        ).catch(() => []),
+        sbApi(
+          `/project_tramites?project_id=eq.${encodeURIComponent(p.id)}&select=*&order=created_at.desc&limit=50`
+        ).catch(() => []),
+        sbApi(
+          `/project_scheduled_payments?project_id=eq.${encodeURIComponent(p.id)}&select=*&order=fecha_comprometida.asc&limit=50`
+        ).catch(() => []),
+        sbApi(
+          `/instalaciones?project_id=eq.${encodeURIComponent(p.id)}&select=id,folio,estado,fecha_instalacion,cuadrilla_id,numero_paneles&order=fecha_instalacion.desc&limit=20`
+        ).catch(() => []),
+        sbApi(
+          `/project_expenses?project_id=eq.${encodeURIComponent(p.id)}&select=id,category,amount_total,status,approved_at,paid_at,created_at&order=created_at.desc&limit=50`
+        ).catch(() => []),
+        p.client_id
+          ? sbApi(
+              `/clients?id=eq.${encodeURIComponent(p.client_id)}&select=*&limit=1`
+            ).catch(() => [])
+          : Promise.resolve([]),
+      ]);
+
+      const clientRow = Array.isArray(client) && client[0];
+
+      const fileRows: any[] = Array.isArray(files) ? files : [];
+      const tramiteRows: any[] = Array.isArray(tramites) ? tramites : [];
+      const paymentRows: any[] = Array.isArray(payments) ? payments : [];
+      const instRows: any[] = Array.isArray(instalaciones) ? instalaciones : [];
+      const expRows: any[] = Array.isArray(expenses) ? expenses : [];
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Project ${p.efu ?? p.id}  (\`${p.id}\`)`,
+              `**Stage:** ${p.etapa_tramite ?? "—"}  •  **Amount:** ${p.amount ?? 0}  •  **Commission total:** ${p.comision_total ?? 0}`,
+              `**Created:** ${p.created_at}  •  **Close date:** ${p.close_date ?? "—"}`,
+              "",
+              `## Project row`,
+              "",
+              "```json",
+              JSON.stringify(p, null, 2),
+              "```",
+              "",
+              clientRow
+                ? `## Client\n\n\`\`\`json\n${JSON.stringify(clientRow, null, 2)}\n\`\`\``
+                : "",
+              "",
+              `## Instalaciones (${instRows.length})`,
+              "",
+              renderRecords(instRows),
+              "",
+              `## Trámites (${tramiteRows.length})`,
+              "",
+              renderRecords(tramiteRows),
+              "",
+              `## Scheduled payments (${paymentRows.length})`,
+              "",
+              renderRecords(paymentRows),
+              "",
+              `## Recent expenses (${expRows.length})`,
+              "",
+              renderRecords(expRows),
+              "",
+              `## Files (${fileRows.length})`,
+              "",
+              fileRows.length === 0
+                ? "*No files.*"
+                : fileRows
+                    .map(
+                      (f) =>
+                        `- **${f.file_name}** — ${f.mime_type ?? "?"} • ${f.file_size ? (f.file_size / 1024).toFixed(1) + " KB" : "?"}\n  ${f.firebase_url ?? "*(no url)*"}`
+                    )
+                    .join("\n"),
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Get project failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "futurerp_get_instalacion",
+  "Combined instalacion view: instalacion row + photos (instalacion_fotos) + line items + installation_reports + visit log (check-in/out) + assigned cuadrilla profiles.",
+  {
+    instalacion_id: z.string().describe("Instalacion uuid or folio"),
+  },
+  async ({ instalacion_id }) => {
+    try {
+      requireCredentials();
+      const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(instalacion_id);
+      const lookupCol = idLooksLikeUuid ? "id" : "folio";
+      const rows: any[] = await sbApi(
+        `/instalaciones?${lookupCol}=eq.${encodeURIComponent(instalacion_id)}&select=*&limit=1`
+      );
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No instalacion where ${lookupCol} = '${instalacion_id}'.` }],
+          isError: true,
+        };
+      }
+      const inst = rows[0];
+
+      const [fotos, lineItems, reports, visits, crew] = await Promise.all([
+        sbApi(
+          `/instalacion_fotos?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=id,url,file_name,category,subcategory,ai_validation_status,created_at&order=created_at.desc&limit=100`
+        ).catch(() => []),
+        sbApi(
+          `/instalacion_line_items?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&limit=100`
+        ).catch(() => []),
+        sbApi(
+          `/installation_reports?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&order=created_at.desc&limit=20`
+        ).catch(() => []),
+        sbApi(
+          `/installation_visits?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&order=check_in_time.asc&limit=20`
+        ).catch(() => []),
+        Array.isArray(inst.assigned_to) && inst.assigned_to.length > 0
+          ? sbApi(
+              `/profiles?id=in.(${inst.assigned_to.map((u: string) => encodeURIComponent(u)).join(",")})&select=id,full_name,email,department`
+            ).catch(() => [])
+          : Promise.resolve([]),
+      ]);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Instalacion ${inst.folio ?? inst.id}  (\`${inst.id}\`)`,
+              `**Estado:** ${inst.estado ?? "—"}  •  **Fecha:** ${inst.fecha_instalacion ?? "—"}  •  **Paneles:** ${inst.numero_paneles ?? "?"}  •  **Cuadrilla:** ${inst.cuadrilla_id ?? "(sin asignar)"}`,
+              "",
+              `## Cuadrilla / installers (${Array.isArray(crew) ? crew.length : 0})`,
+              "",
+              renderRecords(Array.isArray(crew) ? crew : []),
+              "",
+              `## Visits (check-in/out) (${Array.isArray(visits) ? visits.length : 0})`,
+              "",
+              renderRecords(Array.isArray(visits) ? visits : []),
+              "",
+              `## Photos (${Array.isArray(fotos) ? fotos.length : 0})`,
+              "",
+              Array.isArray(fotos) && fotos.length > 0
+                ? (fotos as any[])
+                    .map(
+                      (f) =>
+                        `- [${f.category}${f.subcategory ? "/" + f.subcategory : ""}] **${f.file_name ?? "(unnamed)"}** ${f.ai_validation_status ? `(AI: ${f.ai_validation_status})` : ""}\n  ${f.url}`
+                    )
+                    .join("\n")
+                : "*No photos.*",
+              "",
+              `## Line items / BOM (${Array.isArray(lineItems) ? lineItems.length : 0})`,
+              "",
+              renderRecords(Array.isArray(lineItems) ? lineItems : []),
+              "",
+              `## Installation reports (${Array.isArray(reports) ? reports.length : 0})`,
+              "",
+              renderRecords(Array.isArray(reports) ? reports : []),
+              "",
+              `## Instalacion row`,
+              "",
+              "```json",
+              JSON.stringify(inst, null, 2),
+              "```",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Get instalacion failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ────────────────────────────────────────────────────────────
+// PROJECT FINANCIALS
+// ────────────────────────────────────────────────────────────
+
+server.tool(
+  "futurerp_get_project_financials",
+  "Rolled-up project P&L: budget, total expenses (approved/paid/pending), scheduled vs received payments, overdue payments, gross margin. Numbers in MXN.",
+  {
+    project_id: z.string().describe("Project uuid or EFU code"),
+  },
+  async ({ project_id }) => {
+    try {
+      requireCredentials();
+      const idLooksLikeUuid = /^[0-9a-f-]{32,36}$/i.test(project_id);
+      const lookupCol = idLooksLikeUuid ? "id" : "efu";
+      const projectRows: any[] = await sbApi(
+        `/projects?${lookupCol}=eq.${encodeURIComponent(project_id)}&select=id,efu,amount,comision_total,egreso_total,ingreso_total&limit=1`
+      );
+      if (!Array.isArray(projectRows) || projectRows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No project where ${lookupCol} = '${project_id}'.` }],
+          isError: true,
+        };
+      }
+      const p = projectRows[0];
+
+      const [expenses, payments] = await Promise.all([
+        sbApi(
+          `/project_expenses?project_id=eq.${encodeURIComponent(p.id)}&select=category,amount_total,status,approved_at,paid_at&limit=500`
+        ).catch(() => []),
+        sbApi(
+          `/project_scheduled_payments?project_id=eq.${encodeURIComponent(p.id)}&select=monto,estado_pago,status,fecha_comprometida,fecha_pago_recibido&limit=500`
+        ).catch(() => []),
+      ]);
+
+      const expRows: any[] = Array.isArray(expenses) ? expenses : [];
+      const payRows: any[] = Array.isArray(payments) ? payments : [];
+
+      const expApproved = expRows.filter((e) => e.approved_at);
+      const expPaid = expRows.filter((e) => e.paid_at);
+      const expPending = expRows.filter((e) => !e.approved_at);
+
+      const sum = (arr: any[], k: string) => arr.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+
+      const expensesApproved = sum(expApproved, "amount_total");
+      const expensesPaid = sum(expPaid, "amount_total");
+      const expensesPending = sum(expPending, "amount_total");
+      const expensesTotal = sum(expRows, "amount_total");
+
+      const byCategory: Record<string, number> = {};
+      for (const e of expRows) byCategory[e.category ?? "—"] = (byCategory[e.category ?? "—"] ?? 0) + (Number(e.amount_total) || 0);
+
+      const now = Date.now();
+      const paymentsScheduled = sum(payRows, "monto");
+      const paymentsReceived = sum(
+        payRows.filter((p) => p.fecha_pago_recibido),
+        "monto"
+      );
+      const paymentsOverdue = payRows
+        .filter(
+          (p) =>
+            !p.fecha_pago_recibido &&
+            p.fecha_comprometida &&
+            new Date(p.fecha_comprometida).getTime() < now
+        )
+        .reduce((s, r) => s + (Number(r.monto) || 0), 0);
+
+      const revenue = Number(p.ingreso_total) || Number(p.amount) || 0;
+      const grossMargin = revenue - expensesTotal;
+      const marginPct = revenue > 0 ? (grossMargin / revenue) * 100 : 0;
+      const status =
+        grossMargin < 0 ? "negative" : marginPct < 10 ? "tight" : "healthy";
+
+      const fmt = (n: number) =>
+        n.toLocaleString("es-MX", { style: "currency", currency: "MXN", maximumFractionDigits: 0 });
+
+      const catRows = Object.entries(byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `| ${k} | ${fmt(v)} |`)
+        .join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Project Financials — ${p.efu ?? p.id}`,
+              "",
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Project amount (budget) | ${fmt(Number(p.amount) || 0)} |`,
+              `| Commission total | ${fmt(Number(p.comision_total) || 0)} |`,
+              `| Revenue (ingreso_total or amount) | ${fmt(revenue)} |`,
+              `| Recorded egreso_total | ${fmt(Number(p.egreso_total) || 0)} |`,
+              "",
+              `## Expenses (${expRows.length} rows)`,
+              "",
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Approved total | ${fmt(expensesApproved)} |`,
+              `| Paid total | ${fmt(expensesPaid)} |`,
+              `| Pending approval | ${fmt(expensesPending)} |`,
+              `| All expenses total | ${fmt(expensesTotal)} |`,
+              "",
+              `### By category`,
+              "",
+              `| Category | Total |`,
+              `|----------|-------|`,
+              catRows || "| — | — |",
+              "",
+              `## Payments (${payRows.length} rows)`,
+              "",
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Scheduled total | ${fmt(paymentsScheduled)} |`,
+              `| Received total | ${fmt(paymentsReceived)} |`,
+              `| Overdue (committed date < now, not received) | **${fmt(paymentsOverdue)}** |`,
+              "",
+              `## Margin`,
+              "",
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Gross margin (revenue − expenses) | ${fmt(grossMargin)} |`,
+              `| Margin % | ${marginPct.toFixed(1)}% |`,
+              `| Status | **${status}** |`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Financials failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ────────────────────────────────────────────────────────────
+// RPC WRAPPERS (named convenience tools)
+// ────────────────────────────────────────────────────────────
+
+server.tool(
+  "futurerp_sales_ranking",
+  "Sales leaderboard via `get_sales_ranking` RPC. Returns ranked users by closed amount + project count over a period.",
+  {
+    period_start: z.string().optional().describe("ISO date start (e.g. 2026-05-01). Defaults: 90 days ago"),
+    period_end: z.string().optional().describe("ISO date end. Defaults: now"),
+  },
+  async ({ period_start, period_end }) => {
+    try {
+      requireCredentials();
+      const start =
+        period_start ?? new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const end = period_end ?? new Date().toISOString().slice(0, 10);
+      const rows = await sbRpc("get_sales_ranking", { p_period_start: start, p_period_end: end });
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return { content: [{ type: "text", text: `No sales activity ${start} → ${end}.` }] };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `## Sales ranking ${start} → ${end} (${rows.length})\n\n${renderRecords(rows)}`,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Sales ranking failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "futurerp_marketing_stats",
+  "Marketing attribution via `get_marketing_lead_stats` RPC. Returns lead counts + conversion by source/program/status over a date range.",
+  {
+    range_start: z.string().optional().describe("ISO date start (defaults: 30 days ago)"),
+    range_end: z.string().optional().describe("ISO date end (defaults: now)"),
+  },
+  async ({ range_start, range_end }) => {
+    try {
+      requireCredentials();
+      const args: Record<string, any> = {};
+      if (range_start) args.range_start = range_start;
+      if (range_end) args.range_end = range_end;
+      const rows = await sbRpc("get_marketing_lead_stats", args);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return { content: [{ type: "text", text: `No marketing data for the range.` }] };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `## Marketing lead stats (${rows.length})\n\n${renderRecords(rows)}`,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Marketing stats failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ────────────────────────────────────────────────────────────
 // MCP PROMPTS
 // ────────────────────────────────────────────────────────────
 
@@ -1615,7 +2255,7 @@ async function main() {
   const mode = hasCredentials() ? "DIRECT to Supabase" : "NO CREDENTIALS";
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`FuturERP MCP v1.0 (${mode})`);
+  console.error(`FuturERP MCP v1.1 (${mode})`);
 }
 
 main().catch((e) => {

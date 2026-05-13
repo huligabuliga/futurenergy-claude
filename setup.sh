@@ -103,9 +103,11 @@ for mcp in "${MCP_SERVERS[@]}"; do
         echo "  Ask Jonas for the SF_CLIENT_ID and SF_CLIENT_SECRET values."
         ;;
       futurerp)
-        echo "  Get SUPABASE_SERVICE_ROLE_KEY from Supabase Dashboard:"
+        echo "  Get the Supabase key from:"
         echo "    https://supabase.com/dashboard/project/rczhnuurvcxtkfussmfj/settings/api"
-        echo "    Project Settings → API → Project API keys → service_role → reveal"
+        echo "  Either:"
+        echo "    - New secret key (recommended): Publishable and secret API keys → New secret key (sb_secret_*)"
+        echo "    - Legacy: Legacy anon, service_role API keys → service_role"
         ;;
     esac
     echo ""

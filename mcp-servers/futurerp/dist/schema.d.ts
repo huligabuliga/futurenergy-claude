@@ -56,3 +56,28 @@ export declare const VT_TO_SF_FIELD_MAP: Record<string, string>;
 /** Salesforce Account email field priority order. */
 export declare const ACCOUNT_EMAIL_FIELDS: string[];
 export declare const KEY_FIELDS: Record<string, Record<string, string>>;
+/**
+ * Maps an "entity type" (the thing files attach to) to the table that stores those files
+ * and the columns that hold url / filename / size / mime / uploader / category metadata.
+ *
+ * All blobs live in **Firebase Cloud Storage** (`firebase_url` columns) except announcement
+ * and cantina attachments, which use Google Drive. Firebase URLs are *permanent* public
+ * download URLs (Firebase mints them via getDownloadURL), so fetching them needs no auth.
+ */
+export interface FileTableSpec {
+    table: string;
+    fk: string;
+    url: string;
+    filename: string;
+    size?: string;
+    mime?: string;
+    extension?: string;
+    uploader?: string;
+    category?: string;
+    subcategory?: string;
+    thumbnail?: string;
+    /** Free-form notes about quirks (Google Drive vs Firebase, missing columns, etc.) */
+    notes?: string;
+}
+export declare const FILE_TABLES: Record<string, FileTableSpec>;
+export declare const FILE_ENTITY_TYPES: Array<keyof typeof FILE_TABLES>;
