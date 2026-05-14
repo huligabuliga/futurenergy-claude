@@ -129,17 +129,31 @@ if [ -z "$NODE_PATH" ]; then
 fi
 echo "  Node.js: $NODE_PATH"
 
+SF_MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
+ERP_MCP_PATH="$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"
+
 if [[ "$OSTYPE" == "darwin"* ]]; then
   CLAUDE_DESKTOP_DIR="$HOME/Library/Application Support/Claude"
   CLAUDE_DESKTOP_CONFIG="$CLAUDE_DESKTOP_DIR/claude_desktop_config.json"
-  SF_MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
-  ERP_MCP_PATH="$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"
-
   mkdir -p "$CLAUDE_DESKTOP_DIR"
+  CONFIG_TARGETS=("$CLAUDE_DESKTOP_CONFIG")
+else
+  CONFIG_TARGETS=()
+fi
 
-  if command -v python3 &>/dev/null; then
-    # Merge — preserves other MCP servers and creates the file if missing.
-    python3 - "$CLAUDE_DESKTOP_CONFIG" "$NODE_PATH" "$SF_MCP_PATH" "$ERP_MCP_PATH" <<'PYEOF'
+# Claude Code (Linux + macOS) keeps MCP config in ~/.claude.json
+if [ -f "$HOME/.claude.json" ] || [ ! -f "${CONFIG_TARGETS[0]:-/nonexistent}" ]; then
+  CONFIG_TARGETS+=("$HOME/.claude.json")
+fi
+
+if ! command -v python3 &>/dev/null; then
+  echo "  ⚠ python3 not found — cannot safely merge MCP config."
+  echo "  Manually add to mcpServers in your Claude config:"
+  echo "    \"salesforce\": { \"command\": \"$NODE_PATH\", \"args\": [\"$SF_MCP_PATH\"] }"
+  echo "    \"futurerp\":   { \"command\": \"$NODE_PATH\", \"args\": [\"$ERP_MCP_PATH\"] }"
+else
+  for target in "${CONFIG_TARGETS[@]}"; do
+    python3 - "$target" "$NODE_PATH" "$SF_MCP_PATH" "$ERP_MCP_PATH" <<'PYEOF'
 import json, os, sys
 config_path, node_path, sf_path, erp_path = sys.argv[1:5]
 config = {}
@@ -148,37 +162,23 @@ if os.path.exists(config_path):
         with open(config_path) as f:
             config = json.load(f)
     except json.JSONDecodeError:
-        print(f"  ⚠ Existing {config_path} is not valid JSON. Aborting merge — fix it manually.")
-        sys.exit(1)
+        print(f"  ⚠ {config_path} is not valid JSON. Skipping — fix it manually.")
+        sys.exit(0)
+# Claude Code's ~/.claude.json uses type:stdio; Claude Desktop omits the type field.
+is_claude_code = config_path.endswith('.claude.json')
+entry_sf  = {'type': 'stdio', 'command': node_path, 'args': [sf_path]}  if is_claude_code else {'command': node_path, 'args': [sf_path]}
+entry_erp = {'type': 'stdio', 'command': node_path, 'args': [erp_path]} if is_claude_code else {'command': node_path, 'args': [erp_path]}
 config.setdefault('mcpServers', {})
-config['mcpServers']['salesforce'] = {'command': node_path, 'args': [sf_path]}
-config['mcpServers']['futurerp']   = {'command': node_path, 'args': [erp_path]}
-with open(config_path, 'w') as f:
+config['mcpServers']['salesforce'] = entry_sf
+config['mcpServers']['futurerp']   = entry_erp
+# Atomic write — preserve everything else in the file.
+tmp = config_path + '.tmp'
+with open(tmp, 'w') as f:
     json.dump(config, f, indent=2)
+os.replace(tmp, config_path)
 print(f"  Wrote: {config_path}")
-print(f"  (existing MCP servers preserved)")
 PYEOF
-  else
-    echo "  ⚠ python3 not found — cannot safely merge into $CLAUDE_DESKTOP_CONFIG."
-    echo "  Manually add this to mcpServers:"
-    echo "    \"salesforce\": { \"command\": \"$NODE_PATH\", \"args\": [\"$SF_MCP_PATH\"] }"
-    echo "    \"futurerp\":   { \"command\": \"$NODE_PATH\", \"args\": [\"$ERP_MCP_PATH\"] }"
-  fi
-else
-  echo "  Not macOS. For Claude Code, add this to ~/.claude.json (under mcpServers):"
-  echo ""
-  cat <<EOF
-  "salesforce": {
-    "type": "stdio",
-    "command": "$NODE_PATH",
-    "args": ["$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"]
-  },
-  "futurerp": {
-    "type": "stdio",
-    "command": "$NODE_PATH",
-    "args": ["$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"]
-  }
-EOF
+  done
 fi
 
 # ── Done ──────────────────────────────────────────────────────
