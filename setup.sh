@@ -132,18 +132,29 @@ echo "  Node.js: $NODE_PATH"
 SF_MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
 ERP_MCP_PATH="$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"
 
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  CLAUDE_DESKTOP_DIR="$HOME/Library/Application Support/Claude"
-  CLAUDE_DESKTOP_CONFIG="$CLAUDE_DESKTOP_DIR/claude_desktop_config.json"
-  mkdir -p "$CLAUDE_DESKTOP_DIR"
-  CONFIG_TARGETS=("$CLAUDE_DESKTOP_CONFIG")
-else
-  CONFIG_TARGETS=()
-fi
+# Candidate config files. ~/.claude.json is Claude Code (cross-platform).
+# Claude Desktop's location is OS-specific — we only write there if its
+# parent directory already exists (i.e. Claude Desktop is/was installed).
+CONFIG_TARGETS=("$HOME/.claude.json")
 
-# Claude Code (Linux + macOS) keeps MCP config in ~/.claude.json
-if [ -f "$HOME/.claude.json" ] || [ ! -f "${CONFIG_TARGETS[0]:-/nonexistent}" ]; then
-  CONFIG_TARGETS+=("$HOME/.claude.json")
+case "$OSTYPE" in
+  darwin*)
+    CLAUDE_DESKTOP_DIR="$HOME/Library/Application Support/Claude"
+    ;;
+  linux*)
+    CLAUDE_DESKTOP_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
+    ;;
+  msys*|cygwin*|win32*)
+    CLAUDE_DESKTOP_DIR="${APPDATA:-$HOME/AppData/Roaming}/Claude"
+    ;;
+  *)
+    CLAUDE_DESKTOP_DIR=""
+    ;;
+esac
+
+if [ -n "$CLAUDE_DESKTOP_DIR" ] && [ -d "$CLAUDE_DESKTOP_DIR" ]; then
+  CONFIG_TARGETS+=("$CLAUDE_DESKTOP_DIR/claude_desktop_config.json")
+  echo "  Found Claude Desktop config dir: $CLAUDE_DESKTOP_DIR"
 fi
 
 if ! command -v python3 &>/dev/null; then
@@ -164,14 +175,18 @@ if os.path.exists(config_path):
     except json.JSONDecodeError:
         print(f"  ⚠ {config_path} is not valid JSON. Skipping — fix it manually.")
         sys.exit(0)
-# Claude Code's ~/.claude.json uses type:stdio; Claude Desktop omits the type field.
-is_claude_code = config_path.endswith('.claude.json')
-entry_sf  = {'type': 'stdio', 'command': node_path, 'args': [sf_path]}  if is_claude_code else {'command': node_path, 'args': [sf_path]}
-entry_erp = {'type': 'stdio', 'command': node_path, 'args': [erp_path]} if is_claude_code else {'command': node_path, 'args': [erp_path]}
+# Claude Code (~/.claude.json) requires type:stdio; Claude Desktop omits it.
+is_claude_code = os.path.basename(config_path) == '.claude.json'
+def entry(path):
+    e = {'command': node_path, 'args': [path]}
+    if is_claude_code:
+        e = {'type': 'stdio', **e}
+    return e
 config.setdefault('mcpServers', {})
-config['mcpServers']['salesforce'] = entry_sf
-config['mcpServers']['futurerp']   = entry_erp
+config['mcpServers']['salesforce'] = entry(sf_path)
+config['mcpServers']['futurerp']   = entry(erp_path)
 # Atomic write — preserve everything else in the file.
+os.makedirs(os.path.dirname(config_path) or '.', exist_ok=True)
 tmp = config_path + '.tmp'
 with open(tmp, 'w') as f:
     json.dump(config, f, indent=2)
