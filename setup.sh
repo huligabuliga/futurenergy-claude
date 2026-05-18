@@ -19,17 +19,73 @@ echo ""
 
 # ── Preflight checks ─────────────────────────────────────────
 
-if ! command -v node &>/dev/null; then
-  echo "✗ Node.js not found. Install from https://nodejs.org (LTS version)"
+MIN_NODE_MAJOR=18
+MISSING=()
+WRONG_VERSION=()
+
+# Detect OS + package manager for install hints
+OS_NAME="unknown"
+PM_INSTALL=""
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  OS_NAME="macOS"
+  if command -v brew >/dev/null 2>&1; then
+    PM_INSTALL="brew install"
+  else
+    PM_INSTALL="# Install Homebrew first: https://brew.sh"
+  fi
+elif [[ "$OSTYPE" == "linux"* ]]; then
+  OS_NAME="Linux"
+  if command -v apt-get >/dev/null 2>&1; then
+    PM_INSTALL="sudo apt-get install -y"
+  elif command -v dnf >/dev/null 2>&1; then
+    PM_INSTALL="sudo dnf install -y"
+  elif command -v pacman >/dev/null 2>&1; then
+    PM_INSTALL="sudo pacman -S --noconfirm"
+  elif command -v zypper >/dev/null 2>&1; then
+    PM_INSTALL="sudo zypper install -y"
+  else
+    PM_INSTALL="# Use your distro's package manager to install:"
+  fi
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  MISSING+=("git")
+fi
+if ! command -v node >/dev/null 2>&1; then
+  MISSING+=("node")
+else
+  NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
+  if [ "$NODE_MAJOR" -lt "$MIN_NODE_MAJOR" ]; then
+    WRONG_VERSION+=("node $(node -v) — need >= v${MIN_NODE_MAJOR}")
+  fi
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  MISSING+=("npm")
+fi
+
+if [ ${#MISSING[@]} -gt 0 ] || [ ${#WRONG_VERSION[@]} -gt 0 ]; then
+  echo "✗ Missing or outdated dependencies on $OS_NAME:"
+  for m in "${MISSING[@]}"; do echo "   - $m (not installed)"; done
+  for w in "${WRONG_VERSION[@]}"; do echo "   - $w"; done
+  echo ""
+  echo "Install with:"
+  if [[ "$OS_NAME" == "macOS" ]]; then
+    echo "  $PM_INSTALL git node"
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo "  $PM_INSTALL git nodejs npm"
+    echo "  # If apt's nodejs is < 18, use NodeSource:"
+    echo "  # curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+  else
+    echo "  $PM_INSTALL git nodejs npm"
+  fi
+  echo ""
+  echo "Then re-run: ./setup.sh"
   exit 1
 fi
 
-if ! command -v npm &>/dev/null; then
-  echo "✗ npm not found. Install Node.js from https://nodejs.org (includes npm)"
-  exit 1
-fi
-
-echo "Node.js: $(node --version) at $(which node)"
+echo "✓ git $(git --version | awk '{print $3}')"
+echo "✓ node $(node -v) at $(which node)"
+echo "✓ npm $(npm -v)"
 echo ""
 
 # ── 1. MCP servers ──────────────────────────────────────────

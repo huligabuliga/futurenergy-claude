@@ -19,8 +19,39 @@ futurenergy-claude/
 ## Quick Setup (Mac)
 
 ### Prerequisites
-- **Node.js** — [nodejs.org](https://nodejs.org) (LTS version, click the big green button)
-- **Claude Desktop** — [claude.ai/download](https://claude.ai/download)
+- **Node.js 18+** and **npm** — [nodejs.org](https://nodejs.org) (LTS version, click the big green button)
+- **Git** — optional if you download the ZIP instead of cloning
+- **Claude Desktop** — [claude.ai/download](https://claude.ai/download) (or Claude Code)
+
+`./setup.sh` checks for these and prints the right install command for your OS if anything's missing.
+
+<details>
+<summary>Install commands per OS</summary>
+
+**macOS** (Homebrew):
+```bash
+brew install git node
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install -y git nodejs npm
+# If apt's nodejs is < 18, use NodeSource:
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+**Arch / Manjaro:**
+```bash
+sudo pacman -S --noconfirm git nodejs npm
+```
+
+**Fedora / RHEL:**
+```bash
+sudo dnf install -y git nodejs npm
+```
+
+</details>
 
 ### Install
 
