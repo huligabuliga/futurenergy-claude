@@ -250,7 +250,7 @@ function periodToRange(period) {
 // ── Server ────────────────────────────────────────────────
 const server = new McpServer({
     name: "futurerp",
-    version: "1.2.0",
+    version: "1.3.0",
 });
 // ────────────────────────────────────────────────────────────
 // SCHEMA & METADATA TOOLS
@@ -338,6 +338,7 @@ server.tool("futurerp_list_tables", "List FuturERP tables, filter by keyword or 
         "catalog",
         "notification",
         "integration",
+        "whatsapp",
         "system",
         "junction",
     ])
@@ -357,11 +358,34 @@ server.tool("futurerp_list_tables", "List FuturERP tables, filter by keyword or 
     const sections = Object.entries(byCat).map(([cat, list]) => `### ${cat} (${list.length})\n\n${list
         .map((t) => `- \`${t.name}\` — ${t.purpose}`)
         .join("\n")}`);
+    // Live merge: any table in the DB but missing from the static catalog still shows up,
+    // so this tool always covers the entire database even before the catalog is refreshed.
+    let liveCount = 0;
+    if (!category && hasCredentials()) {
+        try {
+            const spec = await sbOpenApi();
+            const known = new Set(PRONTO_TABLES.map((t) => t.name));
+            let extras = Object.keys(spec.definitions ?? {})
+                .filter((n) => !known.has(n))
+                .sort();
+            if (filter)
+                extras = extras.filter((n) => n.toLowerCase().includes(filter.toLowerCase()));
+            if (extras.length) {
+                liveCount = extras.length;
+                sections.push(`### (uncatalogued — live from DB) (${extras.length})\n\n${extras
+                    .map((n) => `- \`${n}\` — use \`futurerp_describe_table\` for columns`)
+                    .join("\n")}`);
+            }
+        }
+        catch {
+            /* offline / spec fetch failed — static catalog only */
+        }
+    }
     return {
         content: [
             {
                 type: "text",
-                text: `## FuturERP Tables (${rows.length}/${PRONTO_TABLES.length})\n\n${sections.join("\n\n")}`,
+                text: `## FuturERP Tables (${rows.length + liveCount} shown, ${PRONTO_TABLES.length} catalogued)\n\n${sections.join("\n\n")}`,
             },
         ],
     };
@@ -1869,6 +1893,430 @@ server.tool("futurerp_marketing_stats", "Marketing attribution via `get_marketin
         return { content: [{ type: "text", text: `Marketing stats failed: ${e.message}` }], isError: true };
     }
 });
+const WA_CHANNEL_LABELS = {
+    whatsapp: "WhatsApp",
+    instagram: "Instagram",
+    facebook: "Messenger",
+    tiktok: "TikTok",
+};
+const WhatsAppChannelEnum = z.enum(["whatsapp", "instagram", "facebook", "tiktok"]);
+function pendingMsgCounts(messages) {
+    const arr = Array.isArray(messages) ? messages : [];
+    let inN = 0, outN = 0, last;
+    for (const m of arr) {
+        if (m?.dir === "in")
+            inN++;
+        else if (m?.dir === "out")
+            outN++;
+        if (m?.ts && (!last || m.ts > last))
+            last = m.ts;
+    }
+    return { in: inN, out: outN, last };
+}
+const fmtTs = (v) => (v ? String(v).slice(0, 16).replace("T", " ") : "—");
+const clip = (v, n = 60) => {
+    const s = String(v ?? "").replace(/\s+/g, " ").trim();
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+};
+server.tool("futurerp_whatsapp_chats", "Overview of WhatsApp/Messenger/Instagram/TikTok bot conversations: pre-lead pending contacts (with in/out message counts, triage, lifecycle status) and leads with recent bot activity (last inbound/outbound, escalation, intent). Use futurerp_whatsapp_conversation to open a full thread.", {
+    source: z.enum(["pending", "leads", "all"]).optional().describe("Which conversations to list. Default: all"),
+    channel: WhatsAppChannelEnum.optional().describe("Filter by bot channel"),
+    days: z.number().optional().describe("Only conversations with activity in the last N days. Default: 7"),
+    limit: z.number().optional().describe("Max rows per section (default 30, max 100)"),
+    only_escalated: z.boolean().optional().describe("Only leads the bot escalated to a human (bot_escalation_reason set)"),
+    status: z
+        .enum(["active", "lead", "discarded", "opted_out", "human_owned"])
+        .optional()
+        .describe("Filter pending contacts by lifecycle status"),
+}, async ({ source, channel, days, limit, only_escalated, status }) => {
+    try {
+        requireCredentials();
+        const src = source ?? "all";
+        const lim = Math.min(limit ?? 30, 100);
+        const since = new Date(Date.now() - (days ?? 7) * 24 * 60 * 60 * 1000).toISOString();
+        const sections = [];
+        if (src !== "leads") {
+            let qs = `updated_at=gte.${encodeURIComponent(since)}&order=updated_at.desc&limit=${lim}`;
+            qs += `&select=respond_contact_id,channel,phone,contact_name,tipo_contacto,status,status_reason,lead_id,messages,nudges,last_inbound_at,updated_at,created_at`;
+            if (channel)
+                qs += `&channel=eq.${channel}`;
+            if (status)
+                qs += `&status=eq.${status}`;
+            const rows = await sbApi(`/whatsapp_pending_contacts?${qs}`);
+            const table = rows.map((r) => {
+                const c = pendingMsgCounts(r.messages);
+                return {
+                    contacto: r.contact_name || r.phone || r.respond_contact_id,
+                    canal: WA_CHANNEL_LABELS[r.channel] ?? r.channel,
+                    in: c.in,
+                    out: c.out,
+                    tipo: r.tipo_contacto,
+                    status: r.status + (r.status_reason ? ` (${r.status_reason})` : ""),
+                    "última actividad": fmtTs(r.updated_at),
+                    respond_contact_id: r.respond_contact_id,
+                    lead_id: r.lead_id ?? "",
+                };
+            });
+            sections.push(renderRecords(table, `## Pending contacts (pre-lead) — ${rows.length}`, 9));
+        }
+        if (src !== "pending") {
+            let qs = `or=(whatsapp_last_inbound_at.gte.${since},whatsapp_last_outbound_at.gte.${since})`;
+            qs += `&order=whatsapp_last_inbound_at.desc.nullslast&limit=${lim}`;
+            qs += `&select=id,first_name,last_name,mobile_phone_e164,status,whatsapp_bot_active,whatsapp_last_inbound_at,whatsapp_last_outbound_at,bot_escalation_reason,intent_detected,interest_level`;
+            if (only_escalated)
+                qs += `&bot_escalation_reason=not.is.null`;
+            const rows = await sbApi(`/leads?${qs}`);
+            const table = rows.map((r) => ({
+                lead: [r.first_name, r.last_name].filter(Boolean).join(" ") || r.id,
+                tel: r.mobile_phone_e164 ?? "",
+                etapa: r.status,
+                bot: r.whatsapp_bot_active === false ? "off" : "on",
+                "últ. inbound": fmtTs(r.whatsapp_last_inbound_at),
+                "últ. outbound": fmtTs(r.whatsapp_last_outbound_at),
+                escalación: r.bot_escalation_reason ?? "",
+                "intent/interés": [r.intent_detected, r.interest_level].filter(Boolean).join(" / "),
+                lead_id: r.id,
+            }));
+            sections.push(renderRecords(table, `## Leads con actividad de bot — ${rows.length}`, 9));
+        }
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `# WhatsApp chats (últimos ${days ?? 7} días${channel ? `, ${WA_CHANNEL_LABELS[channel]}` : ""})\n\n${sections.join("\n\n")}`,
+                },
+            ],
+        };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `WhatsApp chats failed: ${e.message}` }], isError: true };
+    }
+});
+server.tool("futurerp_whatsapp_conversation", "Full message thread for one WhatsApp bot contact — capture-phase messages (whatsapp_pending_contacts) plus lead-phase messages (crm_activities), rendered chronologically with direction and sender (bot / agente / cliente). Identify the contact by lead_id, respond_contact_id, or phone.", {
+    lead_id: z.string().optional().describe("Lead uuid"),
+    respond_contact_id: z.string().optional().describe("whatsapp_pending_contacts PK (Respond.io contact id or phone:<e164>)"),
+    phone: z.string().optional().describe("Phone number (any format — matched against leads.mobile_phone_e164 and pending_contacts.phone)"),
+    limit: z.number().optional().describe("Max lead-phase activity rows (default 100, max 300)"),
+}, async ({ lead_id, respond_contact_id, phone, limit }) => {
+    try {
+        requireCredentials();
+        if (!lead_id && !respond_contact_id && !phone) {
+            throw new Error("Provide one of: lead_id, respond_contact_id, phone.");
+        }
+        const lim = Math.min(limit ?? 100, 300);
+        // ── Resolve to a lead row and/or a pending row ──
+        let lead = null;
+        let pending = null;
+        const pendingSelect = "select=respond_contact_id,channel,phone,contact_name,captured,tipo_contacto,status,status_reason,lead_id,messages,nudges,created_at,updated_at";
+        if (phone && !lead_id && !respond_contact_id) {
+            const digits = phone.replace(/\D/g, "").slice(-10); // last 10 digits — MX local
+            const leads = await sbApi(`/leads?mobile_phone_e164=ilike.${encodeURIComponent(`*${digits}*`)}&select=*&limit=2`);
+            lead = leads[0] ?? null;
+            if (!lead) {
+                const pend = await sbApi(`/whatsapp_pending_contacts?phone=ilike.${encodeURIComponent(`*${digits}*`)}&${pendingSelect}&limit=2`);
+                pending = pend[0] ?? null;
+            }
+            if (!lead && !pending)
+                throw new Error(`No lead or pending contact matches phone ${phone}.`);
+        }
+        if (respond_contact_id) {
+            const pend = await sbApi(`/whatsapp_pending_contacts?respond_contact_id=eq.${encodeURIComponent(respond_contact_id)}&${pendingSelect}`);
+            pending = pend[0] ?? null;
+            if (!pending)
+                throw new Error(`No pending contact ${respond_contact_id}.`);
+            if (pending.lead_id)
+                lead_id = pending.lead_id;
+        }
+        if (lead_id && !lead) {
+            const rows = await sbApi(`/leads?id=eq.${encodeURIComponent(lead_id)}&select=*`);
+            lead = rows[0] ?? null;
+            if (!lead)
+                throw new Error(`No lead ${lead_id}.`);
+        }
+        // A promoted lead's capture conversation lives on its pending row — merge it in.
+        if (lead && !pending) {
+            const pend = await sbApi(`/whatsapp_pending_contacts?lead_id=eq.${lead.id}&${pendingSelect}&limit=1`);
+            pending = pend[0] ?? null;
+        }
+        // ── Header ──
+        const header = [];
+        if (lead) {
+            header.push(`**Lead:** ${[lead.first_name, lead.last_name].filter(Boolean).join(" ") || lead.id} (\`${lead.id}\`)`, `**Tel:** ${lead.mobile_phone_e164 ?? lead.phone ?? "—"} · **Etapa:** ${lead.status} · **Bot:** ${lead.whatsapp_bot_active === false ? "apagado" : "activo"}`);
+            if (lead.intent_detected || lead.interest_level)
+                header.push(`**Intent:** ${lead.intent_detected ?? "—"} · **Interés:** ${lead.interest_level ?? "—"}`);
+            if (lead.bot_escalation_reason)
+                header.push(`**Escalado:** ${lead.bot_escalation_reason}`);
+            if (lead.bot_conversation_summary)
+                header.push(`**Resumen del bot:** ${lead.bot_conversation_summary}`);
+        }
+        if (pending) {
+            header.push(`**Pending contact:** ${pending.contact_name ?? pending.phone ?? pending.respond_contact_id} (\`${pending.respond_contact_id}\`) · **Canal:** ${WA_CHANNEL_LABELS[pending.channel] ?? pending.channel} · **Triage:** ${pending.tipo_contacto} · **Status:** ${pending.status}${pending.status_reason ? ` (${pending.status_reason})` : ""}`);
+            const capturedKeys = Object.keys(pending.captured ?? {});
+            if (capturedKeys.length)
+                header.push(`**Capturado:** ${capturedKeys.join(", ")}`);
+        }
+        // ── Thread ──
+        const lines = [];
+        // At promotion the capture messages are replayed onto the lead's crm_activities,
+        // so rendering both sections would duplicate the whole capture phase.
+        const capturaReplayed = !!(lead && pending?.lead_id === lead.id);
+        const pendMsgs = !capturaReplayed && Array.isArray(pending?.messages) ? pending.messages : [];
+        if (pendMsgs.length) {
+            lines.push(`### Fase de captura (${pendMsgs.length} mensajes)`);
+            for (const m of pendMsgs) {
+                lines.push(`- ${fmtTs(m.ts)} ${m.dir === "in" ? "⬅️ **cliente**" : "➡️ bot"}: ${clip(m.text, 500)}`);
+            }
+        }
+        if (lead) {
+            const acts = await sbApi(`/crm_activities?entity_type=eq.lead&entity_id=eq.${lead.id}&activity_type=eq.whatsapp&order=created_at.asc&select=id,description,metadata,created_at&limit=${lim}`);
+            if (acts.length) {
+                lines.push("", `### Conversación como lead (${acts.length} actividades)`);
+                for (const a of acts) {
+                    const meta = a.metadata ?? {};
+                    const ts = fmtTs(a.created_at);
+                    const emitted = !!(meta.mensaje_cliente || meta.mensaje_bot);
+                    if (meta.mensaje_cliente)
+                        lines.push(`- ${ts} ⬅️ **cliente**: ${clip(meta.mensaje_cliente, 500)}`);
+                    if (meta.mensaje_bot) {
+                        const sender = meta.status === "agente" ? "**agente**" : "bot";
+                        lines.push(`- ${ts} ➡️ ${sender}: ${clip(meta.mensaje_bot, 500)}`);
+                    }
+                    if (!emitted) {
+                        const dir = meta.direccion === "inbound" ? "⬅️" : "➡️";
+                        lines.push(`- ${ts} ${dir} ${clip(a.description, 500)}`);
+                    }
+                }
+                if (acts.length === lim)
+                    lines.push("", `*Truncado a ${lim} actividades — sube \`limit\` para ver más.*`);
+            }
+        }
+        if (!lines.length)
+            lines.push("*Sin mensajes.*");
+        return {
+            content: [{ type: "text", text: `# Conversación WhatsApp\n\n${header.join("\n")}\n\n${lines.join("\n")}` }],
+        };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `WhatsApp conversation failed: ${e.message}` }], isError: true };
+    }
+});
+server.tool("futurerp_whatsapp_stats", "Inbound vs outbound WhatsApp bot message stats for reporting: totals (in / out-bot / out-agente), breakdown by channel and by day/week, active conversations, new contacts, promotions to lead, triage mix, and escalations. Combines lead-phase crm_activities with capture-phase pending-contact messages.", {
+    period: z
+        .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
+        .optional()
+        .describe("Period. Default: this_month"),
+    channel: WhatsAppChannelEnum.optional().describe("Filter by bot channel"),
+    group_by: z.enum(["day", "week"]).optional().describe("Time bucket for the trend table. Default: day"),
+}, async ({ period, channel, group_by }) => {
+    try {
+        requireCredentials();
+        const range = periodToRange(period ?? "this_month");
+        const bucketOf = (ts) => {
+            const day = ts.slice(0, 10);
+            if ((group_by ?? "day") === "day")
+                return day;
+            const d = new Date(day + "T00:00:00Z");
+            d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); // Monday of week
+            return `sem. ${d.toISOString().slice(0, 10)}`;
+        };
+        const inRange = (ts) => !!ts && (!range.gte || ts >= range.gte) && (!range.lte || ts < range.lte);
+        // Tallies
+        let inbound = 0, outBot = 0, outAgente = 0;
+        const byChannel = {};
+        const byBucket = {};
+        const tally = (ch, dir, ts) => {
+            (byChannel[ch] ??= { in: 0, out: 0 })[dir]++;
+            (byBucket[bucketOf(ts)] ??= { in: 0, out: 0 })[dir]++;
+        };
+        // ── Lead phase (crm_activities) ──
+        let qs = `activity_type=eq.whatsapp&entity_type=eq.lead&select=entity_id,created_at,metadata&order=created_at.asc&limit=10000`;
+        if (range.gte)
+            qs += `&created_at=gte.${range.gte}`;
+        if (range.lte)
+            qs += `&created_at=lt.${range.lte}`;
+        if (channel)
+            qs += `&metadata->>canal=eq.${channel}`;
+        const acts = await sbApi(`/crm_activities?${qs}`);
+        const activeLeads = new Set();
+        for (const a of acts) {
+            const meta = a.metadata ?? {};
+            const ch = meta.canal ?? "whatsapp";
+            activeLeads.add(a.entity_id);
+            if (meta.mensaje_cliente || meta.direccion === "inbound") {
+                inbound++;
+                tally(ch, "in", a.created_at);
+            }
+            if (meta.mensaje_bot || (meta.direccion === "outbound" && !meta.mensaje_cliente)) {
+                if (meta.status === "agente")
+                    outAgente++;
+                else
+                    outBot++;
+                tally(ch, "out", a.created_at);
+            }
+        }
+        // ── Capture phase (pending contacts) ──
+        let pqs = `select=respond_contact_id,channel,tipo_contacto,status,status_changed_at,messages,created_at&limit=5000&order=updated_at.desc`;
+        if (range.gte)
+            pqs += `&updated_at=gte.${range.gte}`;
+        if (channel)
+            pqs += `&channel=eq.${channel}`;
+        const pendings = await sbApi(`/whatsapp_pending_contacts?${pqs}`);
+        const activePending = new Set();
+        let newContacts = 0, promotions = 0;
+        const byTriage = {};
+        for (const p of pendings) {
+            const msgs = Array.isArray(p.messages) ? p.messages : [];
+            let touched = false;
+            for (const m of msgs) {
+                if (!m.ts || !inRange(m.ts))
+                    continue;
+                touched = true;
+                if (m.dir === "in")
+                    inbound++;
+                else
+                    outBot++;
+                tally(p.channel ?? "whatsapp", m.dir === "in" ? "in" : "out", m.ts);
+            }
+            if (touched)
+                activePending.add(p.respond_contact_id);
+            if (inRange(p.created_at)) {
+                newContacts++;
+                byTriage[p.tipo_contacto ?? "—"] = (byTriage[p.tipo_contacto ?? "—"] ?? 0) + 1;
+            }
+            if (p.status === "lead" && inRange(p.status_changed_at))
+                promotions++;
+        }
+        // ── Escalations (leads the bot handed to a human, active in period) ──
+        let escQs = `bot_escalation_reason=not.is.null`;
+        if (range.gte)
+            escQs += `&whatsapp_last_inbound_at=gte.${range.gte}`;
+        if (range.lte)
+            escQs += `&whatsapp_last_inbound_at=lt.${range.lte}`;
+        const escalations = await sbCount("leads", escQs).catch(() => 0);
+        const totalOut = outBot + outAgente;
+        const pct = (n, d) => (d > 0 ? ((n / d) * 100).toFixed(1) + "%" : "—");
+        const dirTable = (m) => Object.entries(m)
+            .sort()
+            .map(([k, v]) => `| ${k} | ${v.in} | ${v.out} | ${v.in + v.out} |`)
+            .join("\n");
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: [
+                        `# WhatsApp bot — estadísticas ${range.label}${channel ? ` (${WA_CHANNEL_LABELS[channel]})` : ""}`,
+                        "",
+                        `| Métrica | Valor |`,
+                        `|---------|-------|`,
+                        `| Mensajes inbound (clientes) | **${inbound}** |`,
+                        `| Mensajes outbound — bot | ${outBot} |`,
+                        `| Mensajes outbound — agente humano | ${outAgente} |`,
+                        `| Total outbound | ${totalOut} |`,
+                        `| Ratio inbound : outbound | ${totalOut > 0 ? (inbound / totalOut).toFixed(2) : "—"} |`,
+                        `| Conversaciones activas (leads) | ${activeLeads.size} |`,
+                        `| Conversaciones activas (pre-lead) | ${activePending.size} |`,
+                        "",
+                        `## Embudo del período`,
+                        "",
+                        `| Métrica | Valor |`,
+                        `|---------|-------|`,
+                        `| Contactos nuevos (pending) | ${newContacts} |`,
+                        `| Promovidos a lead | ${promotions} |`,
+                        `| Escalados a humano | ${escalations} |`,
+                        Object.keys(byTriage).length
+                            ? `\n### Triage de contactos nuevos\n\n| Tipo | Count | % |\n|------|-------|---|\n${Object.entries(byTriage)
+                                .sort((a, b) => b[1] - a[1])
+                                .map(([k, v]) => `| ${k} | ${v} | ${pct(v, newContacts)} |`)
+                                .join("\n")}`
+                            : "",
+                        "",
+                        `## Por canal`,
+                        "",
+                        `| Canal | In | Out | Total |`,
+                        `|-------|----|-----|-------|`,
+                        dirTable(byChannel) || "| — | 0 | 0 | 0 |",
+                        "",
+                        `## Por ${(group_by ?? "day") === "day" ? "día" : "semana"}`,
+                        "",
+                        `| Fecha | In | Out | Total |`,
+                        `|-------|----|-----|-------|`,
+                        dirTable(byBucket) || "| — | 0 | 0 | 0 |",
+                        "",
+                        acts.length === 10000 || pendings.length === 5000
+                            ? "*Nota: se alcanzó el tope de muestreo (10k actividades / 5k contactos) — acota el período para cifras exactas.*"
+                            : "",
+                    ]
+                        .filter(Boolean)
+                        .join("\n"),
+                },
+            ],
+        };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `WhatsApp stats failed: ${e.message}` }], isError: true };
+    }
+});
+server.tool("futurerp_whatsapp_health", "WhatsApp bot error & pipeline health report: bot_error_log grouped by fase × tipo with recent errors, webhook_outbox (target=whatsapp) status counts + recent failures with last_error, and stuck inbound-buffer rows (unprocessed >10 min).", {
+    days: z.number().optional().describe("Lookback window in days. Default: 7"),
+    limit: z.number().optional().describe("Max recent error rows to show (default 15, max 50)"),
+}, async ({ days, limit }) => {
+    try {
+        requireCredentials();
+        const lim = Math.min(limit ?? 15, 50);
+        const since = new Date(Date.now() - (days ?? 7) * 24 * 60 * 60 * 1000).toISOString();
+        const stuckBefore = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        const [errors, outboxFailed, stuck] = await Promise.all([
+            sbApi(`/bot_error_log?created_at=gte.${since}&order=created_at.desc&select=created_at,contact_key,fase,tipo,detalle&limit=1000`),
+            sbApi(`/webhook_outbox?target=eq.whatsapp&status=eq.failed&created_at=gte.${since}&order=created_at.desc&select=created_at,event_type,attempts,last_error&limit=${lim}`),
+            sbApi(`/whatsapp_inbound_buffer?processed=eq.false&created_at=lt.${encodeURIComponent(stuckBefore)}&order=created_at.asc&select=contact_key,created_at&limit=50`),
+        ]);
+        const outboxCounts = {};
+        await Promise.all(["pending", "sent", "failed", "skipped"].map(async (s) => {
+            outboxCounts[s] = await sbCount("webhook_outbox", `target=eq.whatsapp&status=eq.${s}&created_at=gte.${since}`).catch(() => 0);
+        }));
+        const byFaseTipo = {};
+        for (const e of errors)
+            byFaseTipo[`${e.fase} / ${e.tipo}`] = (byFaseTipo[`${e.fase} / ${e.tipo}`] ?? 0) + 1;
+        const verdict = (bad, warnAt = 1) => (bad === 0 ? "✅" : bad < warnAt ? "⚠️" : "🔴");
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: [
+                        `# WhatsApp bot — salud (últimos ${days ?? 7} días)`,
+                        "",
+                        `${errors.length === 0 ? "✅" : errors.length < 10 ? "⚠️" : "🔴"} **bot_error_log:** ${errors.length} errores`,
+                        `${verdict(outboxCounts.failed, 3)} **webhook_outbox (whatsapp):** ${outboxCounts.failed} failed / ${outboxCounts.pending} pending / ${outboxCounts.sent} sent / ${outboxCounts.skipped} skipped`,
+                        `${verdict(stuck.length)} **Buffer atorado:** ${stuck.length} mensajes sin procesar >10 min${stuck.length ? ` (el más viejo: ${fmtTs(stuck[0].created_at)})` : ""}`,
+                        "",
+                        Object.keys(byFaseTipo).length
+                            ? `## Errores por fase / tipo\n\n| Fase / Tipo | Count |\n|-------------|-------|\n${Object.entries(byFaseTipo)
+                                .sort((a, b) => b[1] - a[1])
+                                .map(([k, v]) => `| ${k} | ${v} |`)
+                                .join("\n")}`
+                            : "",
+                        errors.length
+                            ? `\n## Errores recientes (${Math.min(errors.length, lim)})\n\n| Fecha | Fase | Tipo | Contacto | Detalle |\n|-------|------|------|----------|---------|\n${errors
+                                .slice(0, lim)
+                                .map((e) => `| ${fmtTs(e.created_at)} | ${e.fase} | ${e.tipo} | ${clip(e.contact_key, 24)} | ${clip(e.detalle, 90)} |`)
+                                .join("\n")}`
+                            : "",
+                        outboxFailed.length
+                            ? `\n## Outbox fallidos recientes\n\n| Fecha | Evento | Intentos | Error |\n|-------|--------|----------|-------|\n${outboxFailed
+                                .map((o) => `| ${fmtTs(o.created_at)} | ${o.event_type} | ${o.attempts} | ${clip(o.last_error, 90)} |`)
+                                .join("\n")}`
+                            : "",
+                    ]
+                        .filter(Boolean)
+                        .join("\n"),
+                },
+            ],
+        };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `WhatsApp health failed: ${e.message}` }], isError: true };
+    }
+});
 // ────────────────────────────────────────────────────────────
 // MCP PROMPTS
 // ────────────────────────────────────────────────────────────
@@ -1893,12 +2341,15 @@ server.prompt("futurerp_context", "Essential context about FuturERP (pronto-reso
 - **Cantina**: break-room resource queue (water/ice/milk/coffee).
 - **Projects**: post-conversion customer projects. Stage history audited.
 - **Reports & dashboards**: user-defined custom queries with sharing/folders.
+- **WhatsApp bot ("Nancy")**: inbound sales bot on WhatsApp/Instagram/Messenger/TikTok. Pre-lead capture lives in whatsapp_pending_contacts (messages jsonb, triage, lifecycle status); lead-phase conversations are crm_activities rows (activity_type='whatsapp', metadata.direccion/canal/mensaje_cliente/mensaje_bot; metadata.status='agente' = human-sent). Errors land in bot_error_log.
 
 ## Key tools for common questions
 - "How are we doing this month?" → \`futurerp_lead_kpis\` then \`futurerp_ticket_kpis\`
 - "What's stuck?" → \`futurerp_ticket_kpis\` (SLA-overdue) and \`futurerp_aggregate\` on \`tickets\` grouped by \`status\` or \`responsable\`.
 - "Show me lead X" → \`futurerp_get_lead\` for full context (row + stage history + activities + converted project).
 - "Who's busiest with drones?" → \`futurerp_drone_leaderboard\`.
+- "How is the WhatsApp bot doing?" → \`futurerp_whatsapp_stats\` (inbound/outbound report), \`futurerp_whatsapp_health\` (errors).
+- "Show me the chats / this conversation" → \`futurerp_whatsapp_chats\` then \`futurerp_whatsapp_conversation\`.
 - "What's available?" → \`futurerp_list_tables\`, \`futurerp_list_enums\`, \`futurerp_list_rpcs\`.
 - Field semantics → \`futurerp_field_mappings\` mapping=key_fields.
 
@@ -1952,7 +2403,7 @@ async function main() {
     const mode = hasCredentials() ? "DIRECT to Supabase" : "NO CREDENTIALS";
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error(`FuturERP MCP v1.2 (${mode})`);
+    console.error(`FuturERP MCP v1.3 (${mode})`);
 }
 main().catch((e) => {
     console.error("Fatal error:", e);

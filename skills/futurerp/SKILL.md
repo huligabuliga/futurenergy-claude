@@ -137,14 +137,29 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 - Queue advances via RPC `advance_cantina_queue_on_completion`.
 
 ### Notifications
-- 24 types in PG enum `notification_type` (ticket_*, lead_*, instalacion_*, gps_override_*, hitos_pago_*, anticipo1_*, system, etc.).
+- 25 types in PG enum `notification_type` (ticket_*, lead_*, instalacion_*, gps_override_*, hitos_pago_*, anticipo1_*, `egresos_reales_validation_request`, system, etc.).
 - `resource_type` (PG enum `notification_resource_type`) + `resource_id` say what the notification points at.
 - Browser push subscriptions in `push_subscriptions`. Personal reminders in `reminders`.
+
+### Approver workflows (server-enforced)
+Three configurable email allowlists in `system_config`, each gating a `SECURITY DEFINER` RPC:
+- `hitos_pago_approvers` → RPC `approve_hitos_pago(p_project_id)` — gates custom hitos when a project picks "Otro" in `hitos_pago`.
+- `finanzas_approvers` → RPC `approve_anticipo1(p_project_id)` — gates a project leaving stage "Anticipo 1 Pagado".
+- `egresos_reales_approvers` → RPC `approve_project_expense(p_expense_id)` — gates per-expense `draft → approved` on `project_expenses`. A `BEFORE INSERT OR UPDATE` trigger on `project_expenses` blocks direct status transitions into `approved`; the RPC bypasses via the `app.bypass_approve` GUC.
+
+Each project (for hitos/anticipo) or expense row (for egresos) tracks `validation_requested_by`, `validation_requested_at`, `*validated_by` (or `approved_by`), `*validated_at` (or `approved_at`). Requesting validation fires a notification of the matching type (`hitos_pago_validation_request`, `anticipo1_validation_request`, `egresos_reales_validation_request`).
 
 ### Reports & dashboards
 - Custom reports: definition in `reports`, executed via RPC `run_report(p_report_id, p_filters)`.
 - Snapshots cached in `report_snapshots`. Subscriptions emailed by `process_report_subscriptions`.
-- Dashboards = collections of `dashboard_widgets`. Visibility checked by `user_has_dashboard_permission`.
+- User-built dashboards = collections of `dashboard_widgets`. Visibility checked by `user_has_dashboard_permission`.
+- Hardcoded **Dirección Comercial** dashboard at `/dashboards/direccion-comercial`. Gated by RBAC permission `dashboards.direccion_comercial.view` (seeded for Director Comercial + Director General). Six dedicated `SECURITY INVOKER` RPCs all check `has_crm_permission(auth.uid(), 'dashboards.direccion_comercial.view')`:
+  - `dashboard_dc_kpis_month(p_month_start date)` — top KPI strip (ingreso, paneles, leads, cierre%, unassigned-projects)
+  - `dashboard_dc_pipeline()` — 3 rows for mes/trim/anio (forecast/won/new-open/cierre%)
+  - `dashboard_dc_sales_by_person(p_month_start date)` — per-rep ventas table
+  - `dashboard_dc_funnel_by_person(p_period text)` — `'mes'|'trim'`, per-rep lead funnel by stage
+  - `dashboard_dc_activity_by_person(p_month_start date)` — Llamada (`activity_type='call'`) + Cita (`'meeting'`) counts per rep
+  - `dashboard_dc_alltime_totals()` — paneles + proyectos vendidos siempre
 
 ---
 

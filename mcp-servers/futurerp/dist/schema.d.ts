@@ -13,7 +13,7 @@ export interface ProntoTable {
     category: TableCategory;
     purpose: string;
 }
-export type TableCategory = "lead" | "ticket" | "project" | "instalacion" | "drone" | "cantina" | "report" | "user" | "finance" | "catalog" | "notification" | "integration" | "system" | "junction";
+export type TableCategory = "lead" | "ticket" | "project" | "instalacion" | "drone" | "cantina" | "report" | "user" | "finance" | "catalog" | "notification" | "integration" | "whatsapp" | "system" | "junction";
 export interface ProntoEnum {
     name: string;
     values: string[];

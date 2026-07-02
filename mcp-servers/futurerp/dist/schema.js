@@ -120,6 +120,13 @@ export const PRONTO_TABLES = [
     { name: "google_calendar_tokens", category: "integration", purpose: "Per-user Google Calendar OAuth tokens." },
     { name: "chat_assignment_state", category: "integration", purpose: "Routing state for installer-report chat handlers." },
     { name: "ai_chat_messages", category: "integration", purpose: "Gemini AI chat thread messages (lead/project assistant)." },
+    { name: "webhook_outbox", category: "integration", purpose: "Outbound event queue (targets: tickets/leads/incidencias/whatsapp). status pending|sent|failed|skipped, attempts, last_error." },
+    // WhatsApp bot ("Nancy")
+    { name: "whatsapp_pending_contacts", category: "whatsapp", purpose: "Pre-lead capture conversations, keyed by respond_contact_id. messages jsonb [{dir:'in'|'out',text,ts}], captured fields, tipo_contacto, status (active|lead|discarded|opted_out|human_owned), lead_id when promoted." },
+    { name: "whatsapp_inbound_buffer", category: "whatsapp", purpose: "Debounce buffer for inbound message bursts. processed=false rows older than ~10 min signal a stuck drainer." },
+    { name: "whatsapp_processed_messages", category: "whatsapp", purpose: "Webhook idempotency ledger (message_id PK). Pruned after 7 days." },
+    { name: "whatsapp_processing_locks", category: "whatsapp", purpose: "Per-contact turn serialization locks (table-based, TTL via locked_until)." },
+    { name: "bot_error_log", category: "whatsapp", purpose: "Bot pipeline error sink: fase (drain|captura|inbound|followup|outbound) × tipo, detalle, contact_key. 30-day retention." },
     // System
     { name: "system_config", category: "system", purpose: "Global config key-value store." },
     { name: "short_links", category: "system", purpose: "Short link redirects." },
@@ -154,6 +161,32 @@ export const PRONTO_ENUMS = [
         name: "activity_type",
         values: ["comment", "status_change", "priority_change", "assignment_change", "created", "updated", "transfer"],
         description: "Event type on a ticket_activities row.",
+    },
+    {
+        name: "whatsapp.channel",
+        values: ["whatsapp", "instagram", "facebook", "tiktok"],
+        labels: { whatsapp: "WhatsApp", instagram: "Instagram", facebook: "Messenger", tiktok: "TikTok" },
+        description: "Bot channel. Stored in whatsapp_pending_contacts.channel and crm_activities.metadata->>canal (canal key present ⇒ bot-logged message).",
+    },
+    {
+        name: "whatsapp.direccion",
+        values: ["inbound", "outbound"],
+        description: "Message direction in crm_activities.metadata->>direccion. One activity row can carry BOTH mensaje_cliente (inbound) and mensaje_bot (the reply). metadata->>status='agente' ⇒ a human vendor sent it, not the bot.",
+    },
+    {
+        name: "pending_contacts.status",
+        values: ["active", "lead", "discarded", "opted_out", "human_owned"],
+        description: "Durable lifecycle of a whatsapp_pending_contacts row (rows are never deleted). 'lead' = promoted (lead_id set).",
+    },
+    {
+        name: "pending_contacts.tipo_contacto",
+        values: ["prospecto", "cliente_existente", "no_prospecto"],
+        description: "Bot triage of a pre-lead contact. Only 'prospecto' rows get nudges/promotion.",
+    },
+    {
+        name: "bot_error_log.fase",
+        values: ["drain", "captura", "inbound", "followup", "outbound", "lead"],
+        description: "Bot pipeline phase where the error occurred. Open vocabulary — tipo values include entrega_fallida, turn_failed, telefono_invalido, send_failed, etc.",
     },
     {
         name: "app_role",
