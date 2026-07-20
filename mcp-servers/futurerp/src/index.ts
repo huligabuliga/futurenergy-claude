@@ -2762,6 +2762,197 @@ server.tool(
 );
 
 // ────────────────────────────────────────────────────────────
+// SALES INBOX FOLLOW-UP AUDIT (OpenWA per-vendor inbox)
+//
+// Data model: whatsapp_channels (one linked phone → one vendor) →
+// whatsapp_conversations (1:1 chats, lead_id when linked) →
+// whatsapp_messages (direction inbound|outbound, sent_at).
+// Distinct from the Nancy bot tables above.
+// ────────────────────────────────────────────────────────────
+
+server.tool(
+  "futurerp_whatsapp_seguimientos",
+  "Audit the SALES team's WhatsApp inbox (per-vendor OpenWA sessions, not the bot) for bad follow-ups: conversations where the client's last message is unanswered past a threshold, and lead-linked chats gone cold. Groups by vendedor with response stats. Pass conversation_id to fetch one full thread for qualitative chat analysis.",
+  {
+    days: z.number().optional().describe("Lookback window in days for message activity. Default: 7"),
+    stale_hours: z.number().optional().describe("Hours an inbound client message may wait unanswered before flagging. Default: 12"),
+    cold_days: z.number().optional().describe("Days of total silence on a lead-linked chat before flagging as cold. Default: 5"),
+    vendedor: z.string().optional().describe("Filter channels by vendor name / label / session name (substring, case-insensitive)"),
+    limit: z.number().optional().describe("Max flagged conversations per section (default 30, max 100)"),
+    conversation_id: z.string().optional().describe("whatsapp_conversations uuid — render that full thread instead of the audit"),
+    thread_limit: z.number().optional().describe("Max messages when rendering a thread (default 200, max 500)"),
+  },
+  async ({ days, stale_hours, cold_days, vendedor, limit, conversation_id, thread_limit }) => {
+    try {
+      requireCredentials();
+
+      // ── Thread mode ──
+      if (conversation_id) {
+        const convos: any[] = await sbApi(
+          `/whatsapp_conversations?id=eq.${encodeURIComponent(conversation_id)}&select=*,whatsapp_channels(label,session_name,phone,vendor_user_id)`
+        );
+        const c = convos[0];
+        if (!c) throw new Error(`No conversation ${conversation_id}.`);
+        const ch = c.whatsapp_channels ?? {};
+        const names = await resolveProfiles([ch.vendor_user_id].filter(Boolean));
+        const vendorName = names.get(ch.vendor_user_id) ?? ch.label ?? ch.session_name ?? "—";
+        const lim = Math.min(thread_limit ?? 200, 500);
+        const msgs: any[] = await sbApi(
+          `/whatsapp_messages?conversation_id=eq.${encodeURIComponent(conversation_id)}&order=sent_at.desc&select=direction,body,media_type,status,sent_at&limit=${lim}`
+        );
+        msgs.reverse();
+        const header = [
+          `**Contacto:** ${c.name_override ?? c.contact_name ?? c.contact_phone ?? c.chat_id}`,
+          `**Vendedor:** ${vendorName} · **Tel contacto:** ${c.contact_phone ?? "—"} · **Lead:** ${c.lead_id ? `\`${c.lead_id}\`` : "sin vincular"}`,
+          `**Último mensaje:** ${fmtTs(c.last_message_at)}`,
+        ];
+        const lines = msgs.map(
+          (m) =>
+            `- ${fmtTs(m.sent_at)} ${m.direction === "inbound" ? "⬅️ **cliente**" : "➡️ vendedor"}: ${
+              m.body ? clip(m.body, 500) : `[${m.media_type ?? "media"}]`
+            }`
+        );
+        if (msgs.length === lim) lines.push("", `*Truncado a ${lim} mensajes — sube \`thread_limit\`.*`);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `# Conversación de ventas\n\n${header.join("\n")}\n\n${lines.length ? lines.join("\n") : "*Sin mensajes.*"}`,
+            },
+          ],
+        };
+      }
+
+      // ── Audit mode ──
+      const lim = Math.min(limit ?? 30, 100);
+      const staleMs = (stale_hours ?? 12) * 3600_000;
+      const coldMs = (cold_days ?? 5) * 86400_000;
+      const now = Date.now();
+      const since = new Date(now - (days ?? 7) * 86400_000).toISOString();
+
+      const channels: any[] = await sbApi(
+        `/whatsapp_channels?active=eq.true&select=id,label,session_name,phone,vendor_user_id,connection_status`
+      );
+      const names = await resolveProfiles(channels.map((c) => c.vendor_user_id).filter(Boolean));
+      const chanName = (c: any) => names.get(c.vendor_user_id) ?? c.label ?? c.session_name;
+      const filtered = vendedor
+        ? channels.filter((c) =>
+            [chanName(c), c.label, c.session_name].some((s) => s?.toLowerCase().includes(vendedor.toLowerCase()))
+          )
+        : channels;
+      if (!filtered.length) throw new Error(`No active sales channels${vendedor ? ` matching "${vendedor}"` : ""}.`);
+      const chanById = new Map(filtered.map((c) => [c.id, c]));
+      const chanIds = filtered.map((c) => c.id).join(",");
+
+      const [convos, msgs] = await Promise.all([
+        sbApi(
+          `/whatsapp_conversations?channel_id=in.(${chanIds})&is_group=eq.false&select=id,channel_id,contact_phone,contact_name,name_override,lead_id,last_message_at,last_message_preview&order=last_message_at.desc.nullslast&limit=2000`
+        ) as Promise<any[]>,
+        sbApi(
+          // ponytail: one bulk fetch reduced in JS beats N+1 last-message queries; 10k cap matches the stats tool
+          `/whatsapp_messages?sent_at=gte.${encodeURIComponent(since)}&select=conversation_id,direction,sent_at&order=sent_at.desc&limit=10000`
+        ) as Promise<any[]>,
+      ]);
+
+      const agg = new Map<string, { in: number; out: number; lastIn?: string; lastOut?: string }>();
+      for (const m of msgs) {
+        let a = agg.get(m.conversation_id);
+        if (!a) agg.set(m.conversation_id, (a = { in: 0, out: 0 }));
+        if (m.direction === "inbound") {
+          a.in++;
+          if (!a.lastIn || m.sent_at > a.lastIn) a.lastIn = m.sent_at;
+        } else {
+          a.out++;
+          if (!a.lastOut || m.sent_at > a.lastOut) a.lastOut = m.sent_at;
+        }
+      }
+
+      const hrs = (iso: string) => (now - new Date(iso).getTime()) / 3600_000;
+      const label = (c: any) => c.name_override ?? c.contact_name ?? c.contact_phone ?? "—";
+      const unanswered: any[] = [];
+      const cold: any[] = [];
+      const perVendor = new Map<string, { convos: number; in: number; out: number; sinResp: number; frías: number }>();
+      const bump = (chId: string) => {
+        const v = chanName(chanById.get(chId));
+        let s = perVendor.get(v);
+        if (!s) perVendor.set(v, (s = { convos: 0, in: 0, out: 0, sinResp: 0, frías: 0 }));
+        return s;
+      };
+
+      for (const c of convos) {
+        if (!chanById.has(c.channel_id)) continue;
+        const a = agg.get(c.id);
+        const active = a && (a.in || a.out);
+        const s = bump(c.channel_id);
+        if (active) {
+          s.convos++;
+          s.in += a!.in;
+          s.out += a!.out;
+        }
+        // Unanswered: client spoke last and has waited past the threshold.
+        if (a?.lastIn && (!a.lastOut || a.lastIn > a.lastOut) && now - new Date(a.lastIn).getTime() > staleMs) {
+          s.sinResp++;
+          unanswered.push({
+            vendedor: chanName(chanById.get(c.channel_id)),
+            contacto: label(c),
+            "esperando (h)": Math.round(hrs(a.lastIn)),
+            "último mensaje": clip(c.last_message_preview, 60),
+            lead_id: c.lead_id ?? "",
+            conversation_id: c.id,
+          });
+        }
+        // Cold: linked to a lead but nobody has said anything in cold_days.
+        else if (c.lead_id && c.last_message_at && now - new Date(c.last_message_at).getTime() > coldMs) {
+          s.frías++;
+          cold.push({
+            vendedor: chanName(chanById.get(c.channel_id)),
+            contacto: label(c),
+            "días en silencio": Math.round(hrs(c.last_message_at) / 24),
+            "último mensaje": clip(c.last_message_preview, 60),
+            lead_id: c.lead_id,
+            conversation_id: c.id,
+          });
+        }
+      }
+      unanswered.sort((x, y) => y["esperando (h)"] - x["esperando (h)"]);
+      cold.sort((x, y) => y["días en silencio"] - x["días en silencio"]);
+
+      const vendorTable = [...perVendor.entries()].map(([v, s]) => ({
+        vendedor: v,
+        "convos activas": s.convos,
+        recibidos: s.in,
+        enviados: s.out,
+        "sin responder": s.sinResp,
+        "leads fríos": s.frías,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Seguimientos de ventas — WhatsApp (últimos ${days ?? 7} días)`,
+              "",
+              `${unanswered.length ? "🔴" : "✅"} **${unanswered.length} conversaciones con cliente esperando >${stale_hours ?? 12}h** · ${cold.length ? "⚠️" : "✅"} **${cold.length} leads fríos >${cold_days ?? 5} días**`,
+              "",
+              renderRecords(vendorTable, "## Por vendedor", 7),
+              "",
+              renderRecords(unanswered.slice(0, lim), `## 🔴 Cliente sin respuesta — ${unanswered.length}`, 7),
+              "",
+              renderRecords(cold.slice(0, lim), `## ⚠️ Leads fríos (sin actividad) — ${cold.length}`, 7),
+              "",
+              "*Para analizar la calidad de un chat, vuelve a llamar esta tool con su `conversation_id`.*",
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `WhatsApp seguimientos failed: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ────────────────────────────────────────────────────────────
 // MCP PROMPTS
 // ────────────────────────────────────────────────────────────
 
@@ -2790,6 +2981,7 @@ server.prompt(
 - **Projects**: post-conversion customer projects. Stage history audited.
 - **Reports & dashboards**: user-defined custom queries with sharing/folders.
 - **WhatsApp bot ("Nancy")**: inbound sales bot on WhatsApp/Instagram/Messenger/TikTok. Pre-lead capture lives in whatsapp_pending_contacts (messages jsonb, triage, lifecycle status); lead-phase conversations are crm_activities rows (activity_type='whatsapp', metadata.direccion/canal/mensaje_cliente/mensaje_bot; metadata.status='agente' = human-sent). Errors land in bot_error_log.
+- **Sales WhatsApp inbox** (separate from the bot): each vendor links their own phone via OpenWA — whatsapp_channels (session → vendor) → whatsapp_conversations (lead_id when linked) → whatsapp_messages (direction inbound/outbound).
 
 ## Key tools for common questions
 - "How are we doing this month?" → \`futurerp_lead_kpis\` then \`futurerp_ticket_kpis\`
@@ -2798,6 +2990,7 @@ server.prompt(
 - "Who's busiest with drones?" → \`futurerp_drone_leaderboard\`.
 - "How is the WhatsApp bot doing?" → \`futurerp_whatsapp_stats\` (inbound/outbound report), \`futurerp_whatsapp_health\` (errors).
 - "Show me the chats / this conversation" → \`futurerp_whatsapp_chats\` then \`futurerp_whatsapp_conversation\`.
+- "¿Cómo van los seguimientos de ventas?" / bad follow-ups / chat quality of the SALES team → \`futurerp_whatsapp_seguimientos\` (audit, then pass conversation_id for the thread).
 - "What's available?" → \`futurerp_list_tables\`, \`futurerp_list_enums\`, \`futurerp_list_rpcs\`.
 - Field semantics → \`futurerp_field_mappings\` mapping=key_fields.
 
@@ -2839,6 +3032,28 @@ server.prompt(
 );
 
 server.prompt(
+  "sales_followup_review",
+  "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.",
+  { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") },
+  ({ vendedor }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `Review the sales team's WhatsApp follow-ups${vendedor ? ` for ${vendedor}` : ""}.
+
+1. Call \`futurerp_whatsapp_seguimientos\`${vendedor ? ` vendedor=${vendedor}` : ""} to get the per-vendor audit (unanswered clients, cold leads).
+2. For the 3–5 worst flagged conversations (longest wait / most days silent), call the same tool with each \`conversation_id\` to read the full thread.
+3. Rate each thread 1–5 on: response speed, whether questions were answered, whether the vendor pushed toward a next step (cita, cotización, cierre), and tone.
+4. Summarize per vendedor: what they do well, the specific bad habits found (with quoted examples), and the top 3 conversations that need a follow-up TODAY (contacto, tel/lead_id, suggested message in Spanish).`,
+        },
+      },
+    ],
+  })
+);
+
+server.prompt(
   "ticket_health_check",
   "Quick ticket-health dashboard: open count, SLA breaches, top responsables, top areas.",
   () => ({
@@ -2865,7 +3080,7 @@ async function main() {
   const mode = hasCredentials() ? "DIRECT to Supabase" : "NO CREDENTIALS";
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`FuturERP MCP v1.3 (${mode})`);
+  console.error(`FuturERP MCP v1.4 (${mode})`);
 }
 
 main().catch((e) => {
