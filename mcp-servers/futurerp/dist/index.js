@@ -22,7 +22,7 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { z } from "zod";
 // Load .env from server root (fallback if env vars not passed by MCP client)
@@ -2741,7 +2741,20 @@ async function main() {
             console.error(`Cannot load OAuth metadata from ${metaUrls.join(" or ")}. Supabase OAuth server disabled? Enable it under Authentication → OAuth Server.`);
             process.exit(1);
         }
-        app.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl: MCP_PUBLIC_URL, resourceName: "FuturERP" }));
+        // RFC 9728 protected-resource metadata only. We deliberately do NOT mirror Supabase's
+        // authorization-server metadata on this origin (the SDK's mcpAuthMetadataRouter does): clients
+        // must follow `authorization_servers` to Supabase, and a second AS document on our host gave
+        // claude.ai two parallel flows (double client registration, token bound to the wrong one).
+        const prm = {
+            resource: MCP_PUBLIC_URL.href,
+            authorization_servers: [oauthMetadata.issuer ?? `${SUPABASE_URL}/auth/v1`],
+            bearer_methods_supported: ["header"],
+            resource_name: "FuturERP",
+        };
+        const prmPath = `/.well-known/oauth-protected-resource${MCP_PUBLIC_URL.pathname}`;
+        for (const path of [prmPath, `${prmPath}/`, "/.well-known/oauth-protected-resource"]) {
+            app.get(path, (_req, res) => { res.json(prm); });
+        }
     }
     const bearer = requireBearerAuth({
         verifier: tokenVerifier,
