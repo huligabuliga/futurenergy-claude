@@ -3,7 +3,7 @@
  * FuturERP MCP Server v2 — remote Streamable HTTP + OAuth.
  *
  * Read-only MCP for Future Energy's internal ERP (pronto-resolver-61 on Supabase).
- * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
+ * Data reads forward the CALLER's token (their JWT + publishable key), so PostgREST/RLS returns
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
  * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
@@ -485,7 +485,8 @@ export function buildServer(auth) {
             .map((t) => `- \`${t.name}\` — ${t.purpose}`)
             .join("\n")}`);
         // Live merge: any table in the DB but missing from the static catalog still shows up,
-        // so this tool always covers the entire database even before the catalog is refreshed.
+        // so this tool lists every table the schema exposes even before the catalog is refreshed
+        // (row visibility within each table is still RLS-scoped to the signed-in user).
         let liveCount = 0;
         if (!category && hasCredentials()) {
             try {
@@ -882,7 +883,7 @@ export function buildServer(auth) {
     // ────────────────────────────────────────────────────────────
     // KPI & ANALYTICS TOOLS
     // ────────────────────────────────────────────────────────────
-    server.tool("futurerp_lead_kpis", "Lead pipeline KPIs (org-wide). Returns total leads, closed amount, close rate, average ticket, projects sold, average sales cycle (days), open pipeline value, and breakdown by status. Mirrors the `useMyPipelineKPIs` widget on VentasHome but org-scoped (service role bypasses RLS).", {
+    server.tool("futurerp_lead_kpis", "Lead pipeline KPIs scoped to what YOU can see (RLS): total leads, closed amount, close rate, average ticket, projects sold, average sales cycle (days), open pipeline value, and breakdown by status. A vendedor gets their own leads; someone with leads.view_all (or admin) gets the whole company.", {
         period: z
             .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
             .optional()
@@ -962,7 +963,7 @@ export function buildServer(auth) {
             return { content: [{ type: "text", text: `Lead KPIs failed: ${e.message}` }], isError: true };
         }
     });
-    server.tool("futurerp_ticket_kpis", "Ticket health KPIs: open vs resolved counts, SLA breaches (priority drives deadline: alta=1d, media=2d, baja=3d laborales), breakdown by area, by status, and by responsable.", {
+    server.tool("futurerp_ticket_kpis", "Ticket health KPIs over the tickets YOU can see (RLS-scoped): open vs resolved counts, SLA breaches (priority drives deadline: alta=1d, media=2d, baja=3d laborales), breakdown by area, by status, and by responsable.", {
         period: z
             .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
             .optional()
@@ -1069,7 +1070,7 @@ export function buildServer(auth) {
             return { content: [{ type: "text", text: `Ticket KPIs failed: ${e.message}` }], isError: true };
         }
     });
-    server.tool("futurerp_instalacion_kpis", "Field installation KPIs: status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts.", {
+    server.tool("futurerp_instalacion_kpis", "Field installation KPIs over the instalaciones YOU can see (RLS-scoped): status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts.", {
         period: z
             .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
             .optional()
@@ -2048,6 +2049,96 @@ export function buildServer(auth) {
         const s = String(v ?? "").replace(/\s+/g, " ").trim();
         return s.length > n ? s.slice(0, n - 1) + "…" : s;
     };
+    const CALLABLE_RPCS = {
+        dashboard_dc_kpis_month: { perm: "dashboards.direccion_comercial.view", desc: "DC KPIs for a month (p_month_start: 'YYYY-MM-01')" },
+        dashboard_dc_pipeline: { perm: "dashboards.direccion_comercial.view", desc: "DC pipeline snapshot (no args)" },
+        dashboard_dc_sales_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Sales by person for a month (p_month_start)" },
+        dashboard_dc_funnel_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Funnel by person (p_period: 'month'|'quarter'|'year')" },
+        dashboard_dc_activity_by_person: { perm: "dashboards.direccion_comercial.view", desc: "CRM activity by person for a month (p_month_start)" },
+        dashboard_dc_alltime_totals: { perm: "dashboards.direccion_comercial.view", desc: "DC all-time totals (no args)" },
+        dashboard_dc_annual_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Annual sales by person (p_year: int)" },
+        dashboard_dc_leads_conversion: { perm: "dashboards.direccion_comercial.view", desc: "Lead conversion by year (p_year)" },
+        dashboard_dc_top_prospectos: { perm: "dashboards.direccion_comercial.view", desc: "Top prospects (p_limit: int)" },
+        dashboard_dc_commissions: { perm: "dashboards.direccion_comercial.view", desc: "Commissions for a month (p_month_start)" },
+        dashboard_dc_commissions_annual: { perm: "dashboards.direccion_comercial.view", desc: "Commissions for a year (p_year)" },
+        dashboard_dc_ventas_por_vendedor: { perm: "dashboards.direccion_comercial.view", desc: "Sales by vendor between dates (p_start, p_end: ISO)" },
+        get_marketing_kpis: { perm: "marketing.view", desc: "Marketing KPIs for a date range" },
+        get_marketing_funnel: { perm: "marketing.view", desc: "Marketing funnel for a date range" },
+        get_marketing_trend: { perm: "marketing.view", desc: "Marketing trend for a date range" },
+        get_marketing_geo: { perm: "marketing.view", desc: "Marketing leads by geography" },
+        get_marketing_quality_and_source: { perm: "marketing.view", desc: "Lead quality + source breakdown" },
+        get_marketing_vendor_performance: { perm: "marketing.view", desc: "Vendor performance for a date range" },
+        get_marketing_top_ads: { perm: "marketing.view", desc: "Top ads (range_start, range_end, p_limit)" },
+        get_marketing_active_ads: { perm: "marketing.view", desc: "Active ads for a date range" },
+        get_marketing_alerts: { perm: "marketing.view", desc: "Marketing alerts (no date range)" },
+        get_marketing_lead_stats: { perm: "marketing.view", desc: "Lead counts + conversion by source/program/status (range_start, range_end)" },
+        get_unread_notification_count: { desc: "Your unread notification count (no args)" },
+        get_announcements_with_read_status: { desc: "Announcements with your read status (no args)" },
+        get_lead_assignable_users: { desc: "Users that leads can be assigned to (no args)" },
+        get_users_by_department: { desc: "Users in a department (p_department: text)" },
+        dashboard_operativo_projects: { perm: "operaciones.access", desc: "Operational projects board (no args)" },
+        dashboard_operativo_stage_avg: { perm: "operaciones.access", desc: "Avg time per project stage (no args)" },
+        dashboard_operativo_mtto_pendientes: { perm: "operaciones.access", desc: "Pending maintenance (no args)" },
+        dashboard_bot_ventas: { perm: "dashboards.citas_bot.view", desc: "Bot-attributed sales (p_from, p_to ISO optional)" },
+        dashboard_citas_bot: { perm: "dashboards.citas_bot.view", desc: "Citas-bot dashboard (no args)" },
+        dashboard_citas_bot_escalations: { perm: "dashboards.citas_bot.view", desc: "Citas-bot escalations (no args)" },
+        dashboard_nancy_funnel: { perm: "dashboards.citas_bot.view", desc: "Nancy funnel (p_dias int, default 30)" },
+        dashboard_nancy_citas_por_tipo: { perm: "dashboards.citas_bot.view", desc: "Nancy citas by type (p_dias, default 90)" },
+        dashboard_nancy_primer_contacto: { perm: "dashboards.citas_bot.view", desc: "Nancy first-contact timing (p_dias, default 30)" },
+        get_gasolina_summary: { perm: "gasolina.view_all", desc: "Fuel summary between dates (p_start, p_end ISO)" },
+        get_gasolina_details: { perm: "gasolina.view_all", desc: "Fuel detail rows (p_start, p_end ISO)" },
+        get_rh_citas: { perm: "rrhh.view_all", desc: "HR appointments between dates (p_start, p_end ISO)" },
+        get_user_response_times: { perm: "leads.view_all", desc: "Per-user ticket response times (no args)" },
+        get_announcement_statistics: { perm: "announcements.manage", desc: "Announcement read stats (no args)" },
+        landing_stats: { perm: "marketing.view", desc: "Landing-page lead stats (no args)" },
+        get_cantina_user_metrics: { desc: "Cantina per-user metrics (no args)" },
+        get_cantina_resource_metrics: { desc: "Cantina per-resource metrics (no args)" },
+        get_cantina_time_series: { desc: "Cantina time series (days_back int, default 30)" },
+    };
+    const CALLABLE_LIST = Object.entries(CALLABLE_RPCS)
+        .map(([n, sp]) => `- ${n}${sp.perm ? ` [needs ${sp.perm}]` : ""} — ${sp.desc}`)
+        .join("\n");
+    server.tool("futurerp_call_rpc", "Call a whitelisted READ-ONLY analytics/dashboard RPC (the same functions the FuturERP dashboards use) and get its JSON result. Scoped to your permissions: most self-scope via RLS; org-wide ones require the noted permission. No mutating RPC is reachable. Available RPCs:\n" +
+        CALLABLE_LIST, {
+        name: z.string().describe("RPC name — must be one from the list in this tool's description"),
+        args: z
+            .record(z.string(), z.any())
+            .optional()
+            .describe("Named args, e.g. { p_month_start: '2026-08-01' } or { range_start: '2026-08-01T00:00:00Z', range_end: '2026-08-31T23:59:59Z' }. Omit for no-arg RPCs."),
+    }, async ({ name, args }) => {
+        const spec = CALLABLE_RPCS[name];
+        if (!spec) {
+            return { content: [{ type: "text", text: `RPC "${name}" is not callable. See this tool's description for the whitelist.` }], isError: true };
+        }
+        if (spec.perm) {
+            const userId = auth.extra?.userId ?? "";
+            const okPerm = userId ? await hasCrmPermission(userId, spec.perm).catch(() => false) : false;
+            if (!okPerm) {
+                return { content: [{ type: "text", text: `No tienes permiso para ${name} (requiere ${spec.perm}).` }], isError: true };
+            }
+        }
+        try {
+            const res = await fetch(`${REST_BASE}/rpc/${name}`, {
+                method: "POST",
+                headers: authHeaders(),
+                body: JSON.stringify(args ?? {}),
+            });
+            const text = await res.text();
+            if (!res.ok) {
+                return { content: [{ type: "text", text: `RPC ${name} failed ${res.status}: ${text.slice(0, 400)}` }], isError: true };
+            }
+            let pretty = text;
+            try {
+                pretty = JSON.stringify(JSON.parse(text), null, 2);
+            }
+            catch { }
+            const clipped = pretty.length > 20000 ? pretty.slice(0, 20000) + "\n… (truncated)" : pretty;
+            return { content: [{ type: "text", text: "## " + name + "\n\n```json\n" + clipped + "\n```" }] };
+        }
+        catch (e) {
+            return { content: [{ type: "text", text: `RPC ${name} error: ${e.message}` }], isError: true };
+        }
+    });
     if (isAdmin) {
         server.tool("futurerp_whatsapp_chats", "Overview of WhatsApp/Messenger/Instagram/TikTok bot conversations: pre-lead pending contacts (with in/out message counts, triage, lifecycle status) and leads with recent bot activity (last inbound/outbound, escalation, intent). Use futurerp_whatsapp_conversation to open a full thread.", {
             source: z.enum(["pending", "leads", "all"]).optional().describe("Which conversations to list. Default: all"),
@@ -2661,7 +2752,7 @@ export function buildServer(auth) {
 ## Constraints
 - Read-only. No INSERT/UPDATE/DELETE. Mutating RPCs are catalogued but not invoked.
 - Spanish UI (Mexico market) — labels in es-MX, dates dd/mm/yyyy when rendered for humans.
-- Service role key bypasses RLS, so results are org-wide. Filter by \`assigned_to\`/\`responsable\` if you want a single-user view.
+- Results are RLS-scoped to the signed-in user: a vendedor sees their own leads/projects/tickets, someone with *.view_all (or admin) sees the whole company. Counts and KPIs reflect that per-user view — they are NOT necessarily org-wide.
 
 ## Tip
 Before guessing column names, call \`futurerp_describe_table\`. Before guessing enum values, call \`futurerp_list_enums\`. The schema is large — don't memorize it.`,

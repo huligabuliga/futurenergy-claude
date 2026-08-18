@@ -3,7 +3,7 @@
  * FuturERP MCP Server v2 — remote Streamable HTTP + OAuth.
  *
  * Read-only MCP for Future Energy's internal ERP (pronto-resolver-61 on Supabase).
- * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
+ * Data reads forward the CALLER's token (their JWT + publishable key), so PostgREST/RLS returns
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
  * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
