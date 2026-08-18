@@ -4,10 +4,12 @@
  * FuturERP MCP Server v2 — remote Streamable HTTP + OAuth.
  *
  * Read-only MCP for Future Energy's internal ERP (pronto-resolver-61 on Supabase).
- * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
+ * Data reads forward the CALLER's token (their JWT + publishable key), so PostgREST/RLS returns
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
- * app's RBAC (`has_crm_permission`): `mcp.access` (everything) + `mcp.whatsapp` (WhatsApp tools).
+ * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
+ * returns exactly what the person can see in FuturERP. Org-wide SECURITY DEFINER tools and bot-only
+ * tables are gated by permission (see buildServer).
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co
@@ -21,6 +23,7 @@ import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import express from "express";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -97,7 +100,24 @@ function requireCredentials() {
   }
 }
 
+// Per-request data-access identity. When a user token is in the async store, PostgREST runs the
+// query AS that user and RLS applies — the MCP mirrors exactly what the person can see in FuturERP.
+// No store token (schema introspection, the auth gate, admin-only bot tools) → service key.
+const reqCtx = new AsyncLocalStorage<{ token?: string }>();
+
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const userToken = reqCtx.getStore()?.token;
+  return {
+    apikey: userToken ? SUPABASE_PUBLISHABLE_KEY : SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${userToken ?? SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...extra,
+  };
+}
+
+/** Force service-role headers regardless of the async store (schema/catalog + the auth gate). */
+function serviceHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return {
     apikey: SUPABASE_SERVICE_ROLE_KEY,
     Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
@@ -315,13 +335,12 @@ function periodToRange(period: string): { gte?: string; lte?: string; label: str
 // HS256 today and asymmetric keys later — then map the user to MCP scopes via the app's
 // `has_crm_permission` RPC. Cached 60 s per token.
 
-const MCP_SCOPES = ["mcp.access", "mcp.whatsapp"] as const;
 const authCache = new Map<string, { info: AuthInfo; until: number }>();
 
 async function hasCrmPermission(userId: string, key: string): Promise<boolean> {
   const res = await fetch(`${REST_BASE}/rpc/has_crm_permission`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: serviceHeaders(),
     body: JSON.stringify({ _user_id: userId, _permission: key }),
   });
   if (!res.ok) throw new Error(`has_crm_permission ${res.status}: ${await res.text()}`);
@@ -355,15 +374,29 @@ async function resolveAuthInfo(token: string): Promise<AuthInfo> {
     claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
   } catch {}
 
-  const scopes: string[] = [];
-  for (const key of MCP_SCOPES) if (await hasCrmPermission(user.id, key)) scopes.push(key);
+  // Gate = a real, active FuturERP account. Everything the user can then see is decided by RLS
+  // (their token is forwarded on every data read). A couple of org-wide SECURITY DEFINER tools
+  // bypass RLS, so precompute the permissions that gate them (has_crm_permission is true for admins).
+  const profRes = await fetch(
+    `${REST_BASE}/profiles?user_id=eq.${user.id}&select=is_active,is_admin&limit=1`,
+    { headers: serviceHeaders() },
+  );
+  const profRow = profRes.ok ? (await profRes.json())[0] : null;
+  if (!profRow || profRow.is_active === false) {
+    throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
+  }
+  const isAdmin = profRow.is_admin === true;
+  const [leadsViewAll, dronesManage] = await Promise.all([
+    hasCrmPermission(user.id, "leads.view_all"),
+    hasCrmPermission(user.id, "drones.manage"),
+  ]);
 
   const info: AuthInfo = {
     token,
     clientId: claims.client_id ?? "session",
-    scopes,
+    scopes: [],
     expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-    extra: { userId: user.id, email: user.email ?? "" },
+    extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage },
   };
   if (authCache.size > 500) authCache.clear();
   authCache.set(token, { info, until: now + 60_000 });
@@ -378,13 +411,10 @@ const tokenVerifier: OAuthTokenVerifier = {
     } catch (e) {
       // The SDK middleware turns anything that isn't an OAuth error into a bare 500 without logging.
       // Make Supabase/RPC outages visible in Railway logs (never log the token itself).
-      if (!(e instanceof InvalidTokenError)) console.error("auth backend error:", (e as Error).message ?? e);
+      if (!(e instanceof InvalidTokenError) && !(e instanceof InsufficientScopeError)) {
+        console.error("auth backend error:", (e as Error).message ?? e);
+      }
       throw e;
-    }
-    // Enforced here (not via requireBearerAuth.requiredScopes) so the 401/403 WWW-Authenticate
-    // header never advertises a `scope=` that clients would forward to Supabase's authorize endpoint.
-    if (!info.scopes.includes("mcp.access")) {
-      throw new InsufficientScopeError("Sin acceso al MCP de FuturERP (falta el permiso mcp.access)");
     }
     return info;
   },
@@ -392,13 +422,15 @@ const tokenVerifier: OAuthTokenVerifier = {
 
 // ── Server factory ────────────────────────────────────────
 //
-// One McpServer per request (stateless Streamable HTTP). Tools are registered per caller:
-// everything below requires `mcp.access` (already enforced by the middleware); the WhatsApp
-// block is registered only when the caller also holds `mcp.whatsapp`.
-// (Body intentionally not re-indented — it is the v1 tool code, moved inside the factory.)
+// One McpServer per request (stateless Streamable HTTP). Any authenticated FuturERP user can call
+// the row/read tools — RLS (the forwarded token) scopes what comes back. Tools that bypass RLS
+// (SECURITY DEFINER ranking RPCs, bot-only whatsapp tables) are registered only for the permission
+// that unlocks them. (Body not re-indented — v1 tool code moved inside the factory.)
 
 export function buildServer(auth: AuthInfo): McpServer {
-const can = (scope: (typeof MCP_SCOPES)[number]) => auth.scopes.includes(scope);
+const isAdmin = auth.extra?.isAdmin === true;
+const canSalesRanking = auth.extra?.leadsViewAll === true;   // get_sales_ranking is SECURITY DEFINER (org-wide)
+const canDrones = auth.extra?.dronesManage === true;         // get_user_drone_rankings is SECURITY DEFINER
 const server = new McpServer({
   name: "futurerp",
   version: VERSION,
@@ -530,7 +562,8 @@ server.tool(
     );
 
     // Live merge: any table in the DB but missing from the static catalog still shows up,
-    // so this tool always covers the entire database even before the catalog is refreshed.
+    // so this tool lists every table the schema exposes even before the catalog is refreshed
+    // (row visibility within each table is still RLS-scoped to the signed-in user).
     let liveCount = 0;
     if (!category && hasCredentials()) {
       try {
@@ -998,7 +1031,7 @@ server.tool(
 
 server.tool(
   "futurerp_lead_kpis",
-  "Lead pipeline KPIs (org-wide). Returns total leads, closed amount, close rate, average ticket, projects sold, average sales cycle (days), open pipeline value, and breakdown by status. Mirrors the `useMyPipelineKPIs` widget on VentasHome but org-scoped (service role bypasses RLS).",
+  "Lead pipeline KPIs scoped to what YOU can see (RLS): total leads, closed amount, close rate, average ticket, projects sold, average sales cycle (days), open pipeline value, and breakdown by status. A vendedor gets their own leads; someone with leads.view_all (or admin) gets the whole company.",
   {
     period: z
       .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
@@ -1094,7 +1127,7 @@ server.tool(
 
 server.tool(
   "futurerp_ticket_kpis",
-  "Ticket health KPIs: open vs resolved counts, SLA breaches (priority drives deadline: alta=1d, media=2d, baja=3d laborales), breakdown by area, by status, and by responsable.",
+  "Ticket health KPIs over the tickets YOU can see (RLS-scoped): open vs resolved counts, SLA breaches (priority drives deadline: alta=1d, media=2d, baja=3d laborales), breakdown by area, by status, and by responsable.",
   {
     period: z
       .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
@@ -1215,7 +1248,7 @@ server.tool(
 
 server.tool(
   "futurerp_instalacion_kpis",
-  "Field installation KPIs: status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts.",
+  "Field installation KPIs over the instalaciones YOU can see (RLS-scoped): status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts.",
   {
     period: z
       .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
@@ -1316,6 +1349,7 @@ server.tool(
   }
 );
 
+if (canDrones) {
 server.tool(
   "futurerp_drone_leaderboard",
   "Drone usage leaderboard. Calls the get_user_drone_rankings RPC for the user leaderboard, and optionally get_drone_kpis for a single drone.",
@@ -1361,6 +1395,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_drone_leaderboard — SECURITY DEFINER, org-wide; gated by drones.manage
 
 server.tool(
   "futurerp_aggregate",
@@ -2307,6 +2343,7 @@ server.tool(
 // RPC WRAPPERS (named convenience tools)
 // ────────────────────────────────────────────────────────────
 
+if (canSalesRanking) {
 server.tool(
   "futurerp_sales_ranking",
   "Sales leaderboard via `get_sales_ranking` RPC. Returns ranked users by closed amount + project count over a period.",
@@ -2337,6 +2374,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_sales_ranking — SECURITY DEFINER, org-wide; gated by leads.view_all
 
 server.tool(
   "futurerp_marketing_stats",
@@ -2415,7 +2454,108 @@ const clip = (v: any, n = 60) => {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 };
 
-if (can("mcp.whatsapp")) {
+// ── Analytics RPCs (read-only) ────────────────────────────
+// The app powers its dashboards with purpose-built RPCs. Expose the READ-ONLY ones here through a
+// single tool, forwarding the caller's token: SECURITY INVOKER RPCs self-scope via RLS; SECURITY
+// DEFINER (org-wide) ones are gated by the matching FuturERP permission, checked per call. Only
+// whitelisted names run — no mutating RPC is reachable, so this stays strictly read-only.
+type RpcSpec = { perm?: string; desc: string };
+const CALLABLE_RPCS: Record<string, RpcSpec> = {
+  dashboard_dc_kpis_month: { perm: "dashboards.direccion_comercial.view", desc: "DC KPIs for a month (p_month_start: 'YYYY-MM-01')" },
+  dashboard_dc_pipeline: { perm: "dashboards.direccion_comercial.view", desc: "DC pipeline snapshot (no args)" },
+  dashboard_dc_sales_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Sales by person for a month (p_month_start)" },
+  dashboard_dc_funnel_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Funnel by person (p_period: 'month'|'quarter'|'year')" },
+  dashboard_dc_activity_by_person: { perm: "dashboards.direccion_comercial.view", desc: "CRM activity by person for a month (p_month_start)" },
+  dashboard_dc_alltime_totals: { perm: "dashboards.direccion_comercial.view", desc: "DC all-time totals (no args)" },
+  dashboard_dc_annual_by_person: { perm: "dashboards.direccion_comercial.view", desc: "Annual sales by person (p_year: int)" },
+  dashboard_dc_leads_conversion: { perm: "dashboards.direccion_comercial.view", desc: "Lead conversion by year (p_year)" },
+  dashboard_dc_top_prospectos: { perm: "dashboards.direccion_comercial.view", desc: "Top prospects (p_limit: int)" },
+  dashboard_dc_commissions: { perm: "dashboards.direccion_comercial.view", desc: "Commissions for a month (p_month_start)" },
+  dashboard_dc_commissions_annual: { perm: "dashboards.direccion_comercial.view", desc: "Commissions for a year (p_year)" },
+  dashboard_dc_ventas_por_vendedor: { perm: "dashboards.direccion_comercial.view", desc: "Sales by vendor between dates (p_start, p_end: ISO)" },
+  get_marketing_kpis: { perm: "marketing.view", desc: "Marketing KPIs for a date range" },
+  get_marketing_funnel: { perm: "marketing.view", desc: "Marketing funnel for a date range" },
+  get_marketing_trend: { perm: "marketing.view", desc: "Marketing trend for a date range" },
+  get_marketing_geo: { perm: "marketing.view", desc: "Marketing leads by geography" },
+  get_marketing_quality_and_source: { perm: "marketing.view", desc: "Lead quality + source breakdown" },
+  get_marketing_vendor_performance: { perm: "marketing.view", desc: "Vendor performance for a date range" },
+  get_marketing_top_ads: { perm: "marketing.view", desc: "Top ads (range_start, range_end, p_limit)" },
+  get_marketing_active_ads: { perm: "marketing.view", desc: "Active ads for a date range" },
+  get_marketing_alerts: { perm: "marketing.view", desc: "Marketing alerts (no date range)" },
+  get_marketing_lead_stats: { perm: "marketing.view", desc: "Lead counts + conversion by source/program/status (range_start, range_end)" },
+  get_unread_notification_count: { desc: "Your unread notification count (no args)" },
+  get_announcements_with_read_status: { desc: "Announcements with your read status (no args)" },
+  get_lead_assignable_users: { desc: "Users that leads can be assigned to (no args)" },
+  get_users_by_department: { desc: "Users in a department (p_department: text)" },
+  dashboard_operativo_projects: { perm: "operaciones.access", desc: "Operational projects board (no args)" },
+  dashboard_operativo_stage_avg: { perm: "operaciones.access", desc: "Avg time per project stage (no args)" },
+  dashboard_operativo_mtto_pendientes: { perm: "operaciones.access", desc: "Pending maintenance (no args)" },
+  dashboard_bot_ventas: { perm: "dashboards.citas_bot.view", desc: "Bot-attributed sales (p_from, p_to ISO optional)" },
+  dashboard_citas_bot: { perm: "dashboards.citas_bot.view", desc: "Citas-bot dashboard (no args)" },
+  dashboard_citas_bot_escalations: { perm: "dashboards.citas_bot.view", desc: "Citas-bot escalations (no args)" },
+  dashboard_nancy_funnel: { perm: "dashboards.citas_bot.view", desc: "Nancy funnel (p_dias int, default 30)" },
+  dashboard_nancy_citas_por_tipo: { perm: "dashboards.citas_bot.view", desc: "Nancy citas by type (p_dias, default 90)" },
+  dashboard_nancy_primer_contacto: { perm: "dashboards.citas_bot.view", desc: "Nancy first-contact timing (p_dias, default 30)" },
+  get_gasolina_summary: { perm: "gasolina.view_all", desc: "Fuel summary between dates (p_start, p_end ISO)" },
+  get_gasolina_details: { perm: "gasolina.view_all", desc: "Fuel detail rows (p_start, p_end ISO)" },
+  get_rh_citas: { perm: "rrhh.view_all", desc: "HR appointments between dates (p_start, p_end ISO)" },
+  get_user_response_times: { perm: "leads.view_all", desc: "Per-user ticket response times (no args)" },
+  get_announcement_statistics: { perm: "announcements.manage", desc: "Announcement read stats (no args)" },
+  landing_stats: { perm: "marketing.view", desc: "Landing-page lead stats (no args)" },
+  get_cantina_user_metrics: { desc: "Cantina per-user metrics (no args)" },
+  get_cantina_resource_metrics: { desc: "Cantina per-resource metrics (no args)" },
+  get_cantina_time_series: { desc: "Cantina time series (days_back int, default 30)" },
+};
+const CALLABLE_LIST = Object.entries(CALLABLE_RPCS)
+  .map(([n, sp]) => `- ${n}${sp.perm ? ` [needs ${sp.perm}]` : ""} — ${sp.desc}`)
+  .join("\n");
+
+server.tool(
+  "futurerp_call_rpc",
+  "Call a whitelisted READ-ONLY analytics/dashboard RPC (the same functions the FuturERP dashboards use) and get its JSON result. Scoped to your permissions: most self-scope via RLS; org-wide ones require the noted permission. No mutating RPC is reachable. Available RPCs:\n" +
+    CALLABLE_LIST,
+  {
+    name: z.string().describe("RPC name — must be one from the list in this tool's description"),
+    args: z
+      .record(z.string(), z.any())
+      .optional()
+      .describe("Named args, e.g. { p_month_start: '2026-08-01' } or { range_start: '2026-08-01T00:00:00Z', range_end: '2026-08-31T23:59:59Z' }. Omit for no-arg RPCs."),
+  },
+  async ({ name, args }) => {
+    const spec = CALLABLE_RPCS[name];
+    if (!spec) {
+      return { content: [{ type: "text", text: `RPC "${name}" is not callable. See this tool's description for the whitelist.` }], isError: true };
+    }
+    if (spec.perm) {
+      const userId = (auth.extra?.userId as string) ?? "";
+      const okPerm = userId ? await hasCrmPermission(userId, spec.perm).catch(() => false) : false;
+      if (!okPerm) {
+        return { content: [{ type: "text", text: `No tienes permiso para ${name} (requiere ${spec.perm}).` }], isError: true };
+      }
+    }
+    try {
+      const res = await fetch(`${REST_BASE}/rpc/${name}`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(args ?? {}),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `RPC ${name} failed ${res.status}: ${text.slice(0, 400)}` }], isError: true };
+      }
+      let pretty = text;
+      try {
+        pretty = JSON.stringify(JSON.parse(text), null, 2);
+      } catch {}
+      const clipped = pretty.length > 20000 ? pretty.slice(0, 20000) + "\n… (truncated)" : pretty;
+      return { content: [{ type: "text", text: "## " + name + "\n\n```json\n" + clipped + "\n```" }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `RPC ${name} error: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+if (isAdmin) {
 
 server.tool(
   "futurerp_whatsapp_chats",
@@ -2495,6 +2635,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_whatsapp_chats — bot-only tables (service key); admins only
 
 server.tool(
   "futurerp_whatsapp_conversation",
@@ -2622,6 +2764,8 @@ server.tool(
     }
   }
 );
+
+if (isAdmin) {
 
 server.tool(
   "futurerp_whatsapp_stats",
@@ -2871,6 +3015,8 @@ server.tool(
 // Distinct from the Nancy bot tables above.
 // ────────────────────────────────────────────────────────────
 
+} // futurerp_whatsapp_stats + _health — bot-only tables (service key); admins only
+
 server.tool(
   "futurerp_whatsapp_seguimientos",
   "Audit the SALES team's WhatsApp inbox (per-vendor OpenWA sessions, not the bot) for bad follow-ups: conversations where the client's last message is unanswered past a threshold, and lead-linked chats gone cold. Groups by vendedor with response stats. Pass conversation_id to fetch one full thread for qualitative chat analysis.",
@@ -3053,7 +3199,6 @@ server.tool(
   }
 );
 
-} // end if can("mcp.whatsapp")
 
 // ────────────────────────────────────────────────────────────
 // MCP PROMPTS
@@ -3100,7 +3245,7 @@ server.prompt(
 ## Constraints
 - Read-only. No INSERT/UPDATE/DELETE. Mutating RPCs are catalogued but not invoked.
 - Spanish UI (Mexico market) — labels in es-MX, dates dd/mm/yyyy when rendered for humans.
-- Service role key bypasses RLS, so results are org-wide. Filter by \`assigned_to\`/\`responsable\` if you want a single-user view.
+- Results are RLS-scoped to the signed-in user: a vendedor sees their own leads/projects/tickets, someone with *.view_all (or admin) sees the whole company. Counts and KPIs reflect that per-user view — they are NOT necessarily org-wide.
 
 ## Tip
 Before guessing column names, call \`futurerp_describe_table\`. Before guessing enum values, call \`futurerp_list_enums\`. The schema is large — don't memorize it.`,
@@ -3134,7 +3279,7 @@ server.prompt(
   })
 );
 
-if (can("mcp.whatsapp")) server.prompt(
+server.prompt(
   "sales_followup_review",
   "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.",
   { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") },
@@ -3271,10 +3416,25 @@ async function main() {
     next();
   }, bearer, async (req, res) => {
     const auth = req.auth!;
-    if (req.body?.method === "tools/call") {
+    const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
+    if (toolName) {
       // Audit line (Railway logs): who called what.
-      console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: req.body.params?.name }));
+      console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: toolName }));
     }
+    // Which identity runs the data reads for this request:
+    //  - bot-monitoring tools read service-only tables (whatsapp_pending_contacts USING(false), etc.) → service
+    //  - whatsapp_conversation for an admin also wants the bot capture buffer → service
+    //  - everything else → the caller's token, so Postgres RLS scopes the result to what they may see
+    const SERVICE_TOOLS = new Set([
+      "futurerp_whatsapp_chats",
+      "futurerp_whatsapp_stats",
+      "futurerp_whatsapp_health",
+    ]);
+    const runAsService =
+      (toolName != null && SERVICE_TOOLS.has(toolName)) ||
+      (toolName === "futurerp_whatsapp_conversation" && auth.extra?.isAdmin === true);
+    const store = { token: runAsService ? undefined : auth.token };
+
     const server = buildServer(auth);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
@@ -3282,8 +3442,10 @@ async function main() {
       void server.close().catch(() => {});
     });
     try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
+      await reqCtx.run(store, async () => {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      });
     } catch (e) {
       console.error("MCP request error:", e);
       if (!res.headersSent) {
