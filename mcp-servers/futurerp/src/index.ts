@@ -7,7 +7,9 @@
  * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
- * app's RBAC (`has_crm_permission`): `mcp.access` (everything) + `mcp.whatsapp` (WhatsApp tools).
+ * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
+ * returns exactly what the person can see in FuturERP. Org-wide SECURITY DEFINER tools and bot-only
+ * tables are gated by permission (see buildServer).
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co
@@ -21,6 +23,7 @@ import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import express from "express";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -97,7 +100,24 @@ function requireCredentials() {
   }
 }
 
+// Per-request data-access identity. When a user token is in the async store, PostgREST runs the
+// query AS that user and RLS applies — the MCP mirrors exactly what the person can see in FuturERP.
+// No store token (schema introspection, the auth gate, admin-only bot tools) → service key.
+const reqCtx = new AsyncLocalStorage<{ token?: string }>();
+
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const userToken = reqCtx.getStore()?.token;
+  return {
+    apikey: userToken ? SUPABASE_PUBLISHABLE_KEY : SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${userToken ?? SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...extra,
+  };
+}
+
+/** Force service-role headers regardless of the async store (schema/catalog + the auth gate). */
+function serviceHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return {
     apikey: SUPABASE_SERVICE_ROLE_KEY,
     Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
@@ -315,13 +335,12 @@ function periodToRange(period: string): { gte?: string; lte?: string; label: str
 // HS256 today and asymmetric keys later — then map the user to MCP scopes via the app's
 // `has_crm_permission` RPC. Cached 60 s per token.
 
-const MCP_SCOPES = ["mcp.access", "mcp.whatsapp"] as const;
 const authCache = new Map<string, { info: AuthInfo; until: number }>();
 
 async function hasCrmPermission(userId: string, key: string): Promise<boolean> {
   const res = await fetch(`${REST_BASE}/rpc/has_crm_permission`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: serviceHeaders(),
     body: JSON.stringify({ _user_id: userId, _permission: key }),
   });
   if (!res.ok) throw new Error(`has_crm_permission ${res.status}: ${await res.text()}`);
@@ -355,15 +374,29 @@ async function resolveAuthInfo(token: string): Promise<AuthInfo> {
     claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
   } catch {}
 
-  const scopes: string[] = [];
-  for (const key of MCP_SCOPES) if (await hasCrmPermission(user.id, key)) scopes.push(key);
+  // Gate = a real, active FuturERP account. Everything the user can then see is decided by RLS
+  // (their token is forwarded on every data read). A couple of org-wide SECURITY DEFINER tools
+  // bypass RLS, so precompute the permissions that gate them (has_crm_permission is true for admins).
+  const profRes = await fetch(
+    `${REST_BASE}/profiles?user_id=eq.${user.id}&select=is_active,is_admin&limit=1`,
+    { headers: serviceHeaders() },
+  );
+  const profRow = profRes.ok ? (await profRes.json())[0] : null;
+  if (!profRow || profRow.is_active === false) {
+    throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
+  }
+  const isAdmin = profRow.is_admin === true;
+  const [leadsViewAll, dronesManage] = await Promise.all([
+    hasCrmPermission(user.id, "leads.view_all"),
+    hasCrmPermission(user.id, "drones.manage"),
+  ]);
 
   const info: AuthInfo = {
     token,
     clientId: claims.client_id ?? "session",
-    scopes,
+    scopes: [],
     expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-    extra: { userId: user.id, email: user.email ?? "" },
+    extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage },
   };
   if (authCache.size > 500) authCache.clear();
   authCache.set(token, { info, until: now + 60_000 });
@@ -378,13 +411,10 @@ const tokenVerifier: OAuthTokenVerifier = {
     } catch (e) {
       // The SDK middleware turns anything that isn't an OAuth error into a bare 500 without logging.
       // Make Supabase/RPC outages visible in Railway logs (never log the token itself).
-      if (!(e instanceof InvalidTokenError)) console.error("auth backend error:", (e as Error).message ?? e);
+      if (!(e instanceof InvalidTokenError) && !(e instanceof InsufficientScopeError)) {
+        console.error("auth backend error:", (e as Error).message ?? e);
+      }
       throw e;
-    }
-    // Enforced here (not via requireBearerAuth.requiredScopes) so the 401/403 WWW-Authenticate
-    // header never advertises a `scope=` that clients would forward to Supabase's authorize endpoint.
-    if (!info.scopes.includes("mcp.access")) {
-      throw new InsufficientScopeError("Sin acceso al MCP de FuturERP (falta el permiso mcp.access)");
     }
     return info;
   },
@@ -392,13 +422,15 @@ const tokenVerifier: OAuthTokenVerifier = {
 
 // ── Server factory ────────────────────────────────────────
 //
-// One McpServer per request (stateless Streamable HTTP). Tools are registered per caller:
-// everything below requires `mcp.access` (already enforced by the middleware); the WhatsApp
-// block is registered only when the caller also holds `mcp.whatsapp`.
-// (Body intentionally not re-indented — it is the v1 tool code, moved inside the factory.)
+// One McpServer per request (stateless Streamable HTTP). Any authenticated FuturERP user can call
+// the row/read tools — RLS (the forwarded token) scopes what comes back. Tools that bypass RLS
+// (SECURITY DEFINER ranking RPCs, bot-only whatsapp tables) are registered only for the permission
+// that unlocks them. (Body not re-indented — v1 tool code moved inside the factory.)
 
 export function buildServer(auth: AuthInfo): McpServer {
-const can = (scope: (typeof MCP_SCOPES)[number]) => auth.scopes.includes(scope);
+const isAdmin = auth.extra?.isAdmin === true;
+const canSalesRanking = auth.extra?.leadsViewAll === true;   // get_sales_ranking is SECURITY DEFINER (org-wide)
+const canDrones = auth.extra?.dronesManage === true;         // get_user_drone_rankings is SECURITY DEFINER
 const server = new McpServer({
   name: "futurerp",
   version: VERSION,
@@ -1316,6 +1348,7 @@ server.tool(
   }
 );
 
+if (canDrones) {
 server.tool(
   "futurerp_drone_leaderboard",
   "Drone usage leaderboard. Calls the get_user_drone_rankings RPC for the user leaderboard, and optionally get_drone_kpis for a single drone.",
@@ -1361,6 +1394,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_drone_leaderboard — SECURITY DEFINER, org-wide; gated by drones.manage
 
 server.tool(
   "futurerp_aggregate",
@@ -2307,6 +2342,7 @@ server.tool(
 // RPC WRAPPERS (named convenience tools)
 // ────────────────────────────────────────────────────────────
 
+if (canSalesRanking) {
 server.tool(
   "futurerp_sales_ranking",
   "Sales leaderboard via `get_sales_ranking` RPC. Returns ranked users by closed amount + project count over a period.",
@@ -2337,6 +2373,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_sales_ranking — SECURITY DEFINER, org-wide; gated by leads.view_all
 
 server.tool(
   "futurerp_marketing_stats",
@@ -2415,7 +2453,7 @@ const clip = (v: any, n = 60) => {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 };
 
-if (can("mcp.whatsapp")) {
+if (isAdmin) {
 
 server.tool(
   "futurerp_whatsapp_chats",
@@ -2495,6 +2533,8 @@ server.tool(
     }
   }
 );
+
+} // futurerp_whatsapp_chats — bot-only tables (service key); admins only
 
 server.tool(
   "futurerp_whatsapp_conversation",
@@ -2622,6 +2662,8 @@ server.tool(
     }
   }
 );
+
+if (isAdmin) {
 
 server.tool(
   "futurerp_whatsapp_stats",
@@ -2871,6 +2913,8 @@ server.tool(
 // Distinct from the Nancy bot tables above.
 // ────────────────────────────────────────────────────────────
 
+} // futurerp_whatsapp_stats + _health — bot-only tables (service key); admins only
+
 server.tool(
   "futurerp_whatsapp_seguimientos",
   "Audit the SALES team's WhatsApp inbox (per-vendor OpenWA sessions, not the bot) for bad follow-ups: conversations where the client's last message is unanswered past a threshold, and lead-linked chats gone cold. Groups by vendedor with response stats. Pass conversation_id to fetch one full thread for qualitative chat analysis.",
@@ -3053,7 +3097,6 @@ server.tool(
   }
 );
 
-} // end if can("mcp.whatsapp")
 
 // ────────────────────────────────────────────────────────────
 // MCP PROMPTS
@@ -3134,7 +3177,7 @@ server.prompt(
   })
 );
 
-if (can("mcp.whatsapp")) server.prompt(
+server.prompt(
   "sales_followup_review",
   "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.",
   { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") },
@@ -3271,10 +3314,25 @@ async function main() {
     next();
   }, bearer, async (req, res) => {
     const auth = req.auth!;
-    if (req.body?.method === "tools/call") {
+    const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
+    if (toolName) {
       // Audit line (Railway logs): who called what.
-      console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: req.body.params?.name }));
+      console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: toolName }));
     }
+    // Which identity runs the data reads for this request:
+    //  - bot-monitoring tools read service-only tables (whatsapp_pending_contacts USING(false), etc.) → service
+    //  - whatsapp_conversation for an admin also wants the bot capture buffer → service
+    //  - everything else → the caller's token, so Postgres RLS scopes the result to what they may see
+    const SERVICE_TOOLS = new Set([
+      "futurerp_whatsapp_chats",
+      "futurerp_whatsapp_stats",
+      "futurerp_whatsapp_health",
+    ]);
+    const runAsService =
+      (toolName != null && SERVICE_TOOLS.has(toolName)) ||
+      (toolName === "futurerp_whatsapp_conversation" && auth.extra?.isAdmin === true);
+    const store = { token: runAsService ? undefined : auth.token };
+
     const server = buildServer(auth);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
@@ -3282,8 +3340,10 @@ async function main() {
       void server.close().catch(() => {});
     });
     try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
+      await reqCtx.run(store, async () => {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      });
     } catch (e) {
       console.error("MCP request error:", e);
       if (!res.headersSent) {

@@ -6,7 +6,9 @@
  * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
- * app's RBAC (`has_crm_permission`): `mcp.access` (everything) + `mcp.whatsapp` (WhatsApp tools).
+ * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
+ * returns exactly what the person can see in FuturERP. Org-wide SECURITY DEFINER tools and bot-only
+ * tables are gated by permission (see buildServer).
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co

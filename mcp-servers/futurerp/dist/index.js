@@ -6,7 +6,9 @@
  * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
  * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
  * (users log in with their FuturERP account); tool visibility is gated per user via the
- * app's RBAC (`has_crm_permission`): `mcp.access` (everything) + `mcp.whatsapp` (WhatsApp tools).
+ * app's RBAC via RLS: every data read forwards the caller's token, so Postgres row-level security
+ * returns exactly what the person can see in FuturERP. Org-wide SECURITY DEFINER tools and bot-only
+ * tables are gated by permission (see buildServer).
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co
@@ -19,6 +21,7 @@ import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import express from "express";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -64,7 +67,22 @@ function requireCredentials() {
         throw new Error("No Supabase credentials. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (Railway variables, or .env next to package.json for local runs).");
     }
 }
+// Per-request data-access identity. When a user token is in the async store, PostgREST runs the
+// query AS that user and RLS applies — the MCP mirrors exactly what the person can see in FuturERP.
+// No store token (schema introspection, the auth gate, admin-only bot tools) → service key.
+const reqCtx = new AsyncLocalStorage();
 function authHeaders(extra = {}) {
+    const userToken = reqCtx.getStore()?.token;
+    return {
+        apikey: userToken ? SUPABASE_PUBLISHABLE_KEY : SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${userToken ?? SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...extra,
+    };
+}
+/** Force service-role headers regardless of the async store (schema/catalog + the auth gate). */
+function serviceHeaders(extra = {}) {
     return {
         apikey: SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
@@ -265,12 +283,11 @@ function periodToRange(period) {
 // logs in to FuturERP). We validate it by asking Supabase (`/auth/v1/user`) — works with
 // HS256 today and asymmetric keys later — then map the user to MCP scopes via the app's
 // `has_crm_permission` RPC. Cached 60 s per token.
-const MCP_SCOPES = ["mcp.access", "mcp.whatsapp"];
 const authCache = new Map();
 async function hasCrmPermission(userId, key) {
     const res = await fetch(`${REST_BASE}/rpc/has_crm_permission`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: serviceHeaders(),
         body: JSON.stringify({ _user_id: userId, _permission: key }),
     });
     if (!res.ok)
@@ -305,16 +322,25 @@ async function resolveAuthInfo(token) {
         claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
     }
     catch { }
-    const scopes = [];
-    for (const key of MCP_SCOPES)
-        if (await hasCrmPermission(user.id, key))
-            scopes.push(key);
+    // Gate = a real, active FuturERP account. Everything the user can then see is decided by RLS
+    // (their token is forwarded on every data read). A couple of org-wide SECURITY DEFINER tools
+    // bypass RLS, so precompute the permissions that gate them (has_crm_permission is true for admins).
+    const profRes = await fetch(`${REST_BASE}/profiles?user_id=eq.${user.id}&select=is_active,is_admin&limit=1`, { headers: serviceHeaders() });
+    const profRow = profRes.ok ? (await profRes.json())[0] : null;
+    if (!profRow || profRow.is_active === false) {
+        throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
+    }
+    const isAdmin = profRow.is_admin === true;
+    const [leadsViewAll, dronesManage] = await Promise.all([
+        hasCrmPermission(user.id, "leads.view_all"),
+        hasCrmPermission(user.id, "drones.manage"),
+    ]);
     const info = {
         token,
         clientId: claims.client_id ?? "session",
-        scopes,
+        scopes: [],
         expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-        extra: { userId: user.id, email: user.email ?? "" },
+        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage },
     };
     if (authCache.size > 500)
         authCache.clear();
@@ -330,26 +356,24 @@ const tokenVerifier = {
         catch (e) {
             // The SDK middleware turns anything that isn't an OAuth error into a bare 500 without logging.
             // Make Supabase/RPC outages visible in Railway logs (never log the token itself).
-            if (!(e instanceof InvalidTokenError))
+            if (!(e instanceof InvalidTokenError) && !(e instanceof InsufficientScopeError)) {
                 console.error("auth backend error:", e.message ?? e);
+            }
             throw e;
-        }
-        // Enforced here (not via requireBearerAuth.requiredScopes) so the 401/403 WWW-Authenticate
-        // header never advertises a `scope=` that clients would forward to Supabase's authorize endpoint.
-        if (!info.scopes.includes("mcp.access")) {
-            throw new InsufficientScopeError("Sin acceso al MCP de FuturERP (falta el permiso mcp.access)");
         }
         return info;
     },
 };
 // ── Server factory ────────────────────────────────────────
 //
-// One McpServer per request (stateless Streamable HTTP). Tools are registered per caller:
-// everything below requires `mcp.access` (already enforced by the middleware); the WhatsApp
-// block is registered only when the caller also holds `mcp.whatsapp`.
-// (Body intentionally not re-indented — it is the v1 tool code, moved inside the factory.)
+// One McpServer per request (stateless Streamable HTTP). Any authenticated FuturERP user can call
+// the row/read tools — RLS (the forwarded token) scopes what comes back. Tools that bypass RLS
+// (SECURITY DEFINER ranking RPCs, bot-only whatsapp tables) are registered only for the permission
+// that unlocks them. (Body not re-indented — v1 tool code moved inside the factory.)
 export function buildServer(auth) {
-    const can = (scope) => auth.scopes.includes(scope);
+    const isAdmin = auth.extra?.isAdmin === true;
+    const canSalesRanking = auth.extra?.leadsViewAll === true; // get_sales_ranking is SECURITY DEFINER (org-wide)
+    const canDrones = auth.extra?.dronesManage === true; // get_user_drone_rankings is SECURITY DEFINER
     const server = new McpServer({
         name: "futurerp",
         version: VERSION,
@@ -1132,45 +1156,47 @@ export function buildServer(auth) {
             return { content: [{ type: "text", text: `Instalacion KPIs failed: ${e.message}` }], isError: true };
         }
     });
-    server.tool("futurerp_drone_leaderboard", "Drone usage leaderboard. Calls the get_user_drone_rankings RPC for the user leaderboard, and optionally get_drone_kpis for a single drone.", {
-        drone_id: z.string().optional().describe("If set, return per-drone metrics via get_drone_kpis"),
-    }, async ({ drone_id }) => {
-        try {
-            requireCredentials();
-            const sections = [];
-            // User leaderboard
+    if (canDrones) {
+        server.tool("futurerp_drone_leaderboard", "Drone usage leaderboard. Calls the get_user_drone_rankings RPC for the user leaderboard, and optionally get_drone_kpis for a single drone.", {
+            drone_id: z.string().optional().describe("If set, return per-drone metrics via get_drone_kpis"),
+        }, async ({ drone_id }) => {
             try {
-                const ranks = await sbRpc("get_user_drone_rankings");
-                if (Array.isArray(ranks) && ranks.length > 0) {
-                    sections.push(`## User leaderboard\n\n${renderRecords(ranks)}`);
-                }
-                else {
-                    sections.push(`## User leaderboard\n\n*No data.*`);
-                }
-            }
-            catch (err) {
-                sections.push(`## User leaderboard\n\n*Error calling get_user_drone_rankings: ${err.message}*`);
-            }
-            // Per-drone if requested
-            if (drone_id) {
+                requireCredentials();
+                const sections = [];
+                // User leaderboard
                 try {
-                    const kpis = await sbRpc("get_drone_kpis", { p_drone_id: drone_id });
-                    sections.push(`## Drone ${drone_id}\n\n\`\`\`json\n${JSON.stringify(kpis, null, 2)}\n\`\`\``);
+                    const ranks = await sbRpc("get_user_drone_rankings");
+                    if (Array.isArray(ranks) && ranks.length > 0) {
+                        sections.push(`## User leaderboard\n\n${renderRecords(ranks)}`);
+                    }
+                    else {
+                        sections.push(`## User leaderboard\n\n*No data.*`);
+                    }
                 }
                 catch (err) {
-                    sections.push(`## Drone ${drone_id}\n\n*Error calling get_drone_kpis: ${err.message}*`);
+                    sections.push(`## User leaderboard\n\n*Error calling get_user_drone_rankings: ${err.message}*`);
                 }
+                // Per-drone if requested
+                if (drone_id) {
+                    try {
+                        const kpis = await sbRpc("get_drone_kpis", { p_drone_id: drone_id });
+                        sections.push(`## Drone ${drone_id}\n\n\`\`\`json\n${JSON.stringify(kpis, null, 2)}\n\`\`\``);
+                    }
+                    catch (err) {
+                        sections.push(`## Drone ${drone_id}\n\n*Error calling get_drone_kpis: ${err.message}*`);
+                    }
+                }
+                return {
+                    content: [
+                        { type: "text", text: `# Drone KPIs\n\n${sections.join("\n\n")}` },
+                    ],
+                };
             }
-            return {
-                content: [
-                    { type: "text", text: `# Drone KPIs\n\n${sections.join("\n\n")}` },
-                ],
-            };
-        }
-        catch (e) {
-            return { content: [{ type: "text", text: `Drone leaderboard failed: ${e.message}` }], isError: true };
-        }
-    });
+            catch (e) {
+                return { content: [{ type: "text", text: `Drone leaderboard failed: ${e.message}` }], isError: true };
+            }
+        });
+    } // futurerp_drone_leaderboard — SECURITY DEFINER, org-wide; gated by drones.manage
     server.tool("futurerp_aggregate", "Group-by aggregate over any table. Useful for status histograms, owner breakdowns, monthly trends. Implements GROUP BY client-side over a fetched sample (PostgREST has no native GROUP BY) — for large tables, narrow with `filters` first.", {
         table: z.string().describe("Table to aggregate over"),
         group_by: z.string().describe("Column to group by (e.g. status, prioridad, area, assigned_to)"),
@@ -1942,31 +1968,33 @@ export function buildServer(auth) {
     // ────────────────────────────────────────────────────────────
     // RPC WRAPPERS (named convenience tools)
     // ────────────────────────────────────────────────────────────
-    server.tool("futurerp_sales_ranking", "Sales leaderboard via `get_sales_ranking` RPC. Returns ranked users by closed amount + project count over a period.", {
-        period_start: z.string().optional().describe("ISO date start (e.g. 2026-05-01). Defaults: 90 days ago"),
-        period_end: z.string().optional().describe("ISO date end. Defaults: now"),
-    }, async ({ period_start, period_end }) => {
-        try {
-            requireCredentials();
-            const start = period_start ?? new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-            const end = period_end ?? new Date().toISOString().slice(0, 10);
-            const rows = await sbRpc("get_sales_ranking", { p_period_start: start, p_period_end: end });
-            if (!Array.isArray(rows) || rows.length === 0) {
-                return { content: [{ type: "text", text: `No sales activity ${start} → ${end}.` }] };
+    if (canSalesRanking) {
+        server.tool("futurerp_sales_ranking", "Sales leaderboard via `get_sales_ranking` RPC. Returns ranked users by closed amount + project count over a period.", {
+            period_start: z.string().optional().describe("ISO date start (e.g. 2026-05-01). Defaults: 90 days ago"),
+            period_end: z.string().optional().describe("ISO date end. Defaults: now"),
+        }, async ({ period_start, period_end }) => {
+            try {
+                requireCredentials();
+                const start = period_start ?? new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+                const end = period_end ?? new Date().toISOString().slice(0, 10);
+                const rows = await sbRpc("get_sales_ranking", { p_period_start: start, p_period_end: end });
+                if (!Array.isArray(rows) || rows.length === 0) {
+                    return { content: [{ type: "text", text: `No sales activity ${start} → ${end}.` }] };
+                }
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `## Sales ranking ${start} → ${end} (${rows.length})\n\n${renderRecords(rows)}`,
+                        },
+                    ],
+                };
             }
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `## Sales ranking ${start} → ${end} (${rows.length})\n\n${renderRecords(rows)}`,
-                    },
-                ],
-            };
-        }
-        catch (e) {
-            return { content: [{ type: "text", text: `Sales ranking failed: ${e.message}` }], isError: true };
-        }
-    });
+            catch (e) {
+                return { content: [{ type: "text", text: `Sales ranking failed: ${e.message}` }], isError: true };
+            }
+        });
+    } // futurerp_sales_ranking — SECURITY DEFINER, org-wide; gated by leads.view_all
     server.tool("futurerp_marketing_stats", "Marketing attribution via `get_marketing_lead_stats` RPC. Returns lead counts + conversion by source/program/status over a date range.", {
         range_start: z.string().optional().describe("ISO date start (defaults: 30 days ago)"),
         range_end: z.string().optional().describe("ISO date end (defaults: now)"),
@@ -2020,7 +2048,7 @@ export function buildServer(auth) {
         const s = String(v ?? "").replace(/\s+/g, " ").trim();
         return s.length > n ? s.slice(0, n - 1) + "…" : s;
     };
-    if (can("mcp.whatsapp")) {
+    if (isAdmin) {
         server.tool("futurerp_whatsapp_chats", "Overview of WhatsApp/Messenger/Instagram/TikTok bot conversations: pre-lead pending contacts (with in/out message counts, triage, lifecycle status) and leads with recent bot activity (last inbound/outbound, escalation, intent). Use futurerp_whatsapp_conversation to open a full thread.", {
             source: z.enum(["pending", "leads", "all"]).optional().describe("Which conversations to list. Default: all"),
             channel: WhatsAppChannelEnum.optional().describe("Filter by bot channel"),
@@ -2095,114 +2123,116 @@ export function buildServer(auth) {
                 return { content: [{ type: "text", text: `WhatsApp chats failed: ${e.message}` }], isError: true };
             }
         });
-        server.tool("futurerp_whatsapp_conversation", "Full message thread for one WhatsApp bot contact — capture-phase messages (whatsapp_pending_contacts) plus lead-phase messages (crm_activities), rendered chronologically with direction and sender (bot / agente / cliente). Identify the contact by lead_id, respond_contact_id, or phone.", {
-            lead_id: z.string().optional().describe("Lead uuid"),
-            respond_contact_id: z.string().optional().describe("whatsapp_pending_contacts PK (Respond.io contact id or phone:<e164>)"),
-            phone: z.string().optional().describe("Phone number (any format — matched against leads.mobile_phone_e164 and pending_contacts.phone)"),
-            limit: z.number().optional().describe("Max lead-phase activity rows (default 100, max 300)"),
-        }, async ({ lead_id, respond_contact_id, phone, limit }) => {
-            try {
-                requireCredentials();
-                if (!lead_id && !respond_contact_id && !phone) {
-                    throw new Error("Provide one of: lead_id, respond_contact_id, phone.");
-                }
-                const lim = Math.min(limit ?? 100, 300);
-                // ── Resolve to a lead row and/or a pending row ──
-                let lead = null;
-                let pending = null;
-                const pendingSelect = "select=respond_contact_id,channel,phone,contact_name,captured,tipo_contacto,status,status_reason,lead_id,messages,nudges,created_at,updated_at";
-                if (phone && !lead_id && !respond_contact_id) {
-                    const digits = phone.replace(/\D/g, "").slice(-10); // last 10 digits — MX local
-                    const leads = await sbApi(`/leads?mobile_phone_e164=ilike.${encodeURIComponent(`*${digits}*`)}&select=*&limit=2`);
-                    lead = leads[0] ?? null;
-                    if (!lead) {
-                        const pend = await sbApi(`/whatsapp_pending_contacts?phone=ilike.${encodeURIComponent(`*${digits}*`)}&${pendingSelect}&limit=2`);
-                        pending = pend[0] ?? null;
-                    }
-                    if (!lead && !pending)
-                        throw new Error(`No lead or pending contact matches phone ${phone}.`);
-                }
-                if (respond_contact_id) {
-                    const pend = await sbApi(`/whatsapp_pending_contacts?respond_contact_id=eq.${encodeURIComponent(respond_contact_id)}&${pendingSelect}`);
-                    pending = pend[0] ?? null;
-                    if (!pending)
-                        throw new Error(`No pending contact ${respond_contact_id}.`);
-                    if (pending.lead_id)
-                        lead_id = pending.lead_id;
-                }
-                if (lead_id && !lead) {
-                    const rows = await sbApi(`/leads?id=eq.${encodeURIComponent(lead_id)}&select=*`);
-                    lead = rows[0] ?? null;
-                    if (!lead)
-                        throw new Error(`No lead ${lead_id}.`);
-                }
-                // A promoted lead's capture conversation lives on its pending row — merge it in.
-                if (lead && !pending) {
-                    const pend = await sbApi(`/whatsapp_pending_contacts?lead_id=eq.${lead.id}&${pendingSelect}&limit=1`);
+    } // futurerp_whatsapp_chats — bot-only tables (service key); admins only
+    server.tool("futurerp_whatsapp_conversation", "Full message thread for one WhatsApp bot contact — capture-phase messages (whatsapp_pending_contacts) plus lead-phase messages (crm_activities), rendered chronologically with direction and sender (bot / agente / cliente). Identify the contact by lead_id, respond_contact_id, or phone.", {
+        lead_id: z.string().optional().describe("Lead uuid"),
+        respond_contact_id: z.string().optional().describe("whatsapp_pending_contacts PK (Respond.io contact id or phone:<e164>)"),
+        phone: z.string().optional().describe("Phone number (any format — matched against leads.mobile_phone_e164 and pending_contacts.phone)"),
+        limit: z.number().optional().describe("Max lead-phase activity rows (default 100, max 300)"),
+    }, async ({ lead_id, respond_contact_id, phone, limit }) => {
+        try {
+            requireCredentials();
+            if (!lead_id && !respond_contact_id && !phone) {
+                throw new Error("Provide one of: lead_id, respond_contact_id, phone.");
+            }
+            const lim = Math.min(limit ?? 100, 300);
+            // ── Resolve to a lead row and/or a pending row ──
+            let lead = null;
+            let pending = null;
+            const pendingSelect = "select=respond_contact_id,channel,phone,contact_name,captured,tipo_contacto,status,status_reason,lead_id,messages,nudges,created_at,updated_at";
+            if (phone && !lead_id && !respond_contact_id) {
+                const digits = phone.replace(/\D/g, "").slice(-10); // last 10 digits — MX local
+                const leads = await sbApi(`/leads?mobile_phone_e164=ilike.${encodeURIComponent(`*${digits}*`)}&select=*&limit=2`);
+                lead = leads[0] ?? null;
+                if (!lead) {
+                    const pend = await sbApi(`/whatsapp_pending_contacts?phone=ilike.${encodeURIComponent(`*${digits}*`)}&${pendingSelect}&limit=2`);
                     pending = pend[0] ?? null;
                 }
-                // ── Header ──
-                const header = [];
-                if (lead) {
-                    header.push(`**Lead:** ${[lead.first_name, lead.last_name].filter(Boolean).join(" ") || lead.id} (\`${lead.id}\`)`, `**Tel:** ${lead.mobile_phone_e164 ?? lead.phone ?? "—"} · **Etapa:** ${lead.status} · **Bot:** ${lead.whatsapp_bot_active === false ? "apagado" : "activo"}`);
-                    if (lead.intent_detected || lead.interest_level)
-                        header.push(`**Intent:** ${lead.intent_detected ?? "—"} · **Interés:** ${lead.interest_level ?? "—"}`);
-                    if (lead.bot_escalation_reason)
-                        header.push(`**Escalado:** ${lead.bot_escalation_reason}`);
-                    if (lead.bot_conversation_summary)
-                        header.push(`**Resumen del bot:** ${lead.bot_conversation_summary}`);
+                if (!lead && !pending)
+                    throw new Error(`No lead or pending contact matches phone ${phone}.`);
+            }
+            if (respond_contact_id) {
+                const pend = await sbApi(`/whatsapp_pending_contacts?respond_contact_id=eq.${encodeURIComponent(respond_contact_id)}&${pendingSelect}`);
+                pending = pend[0] ?? null;
+                if (!pending)
+                    throw new Error(`No pending contact ${respond_contact_id}.`);
+                if (pending.lead_id)
+                    lead_id = pending.lead_id;
+            }
+            if (lead_id && !lead) {
+                const rows = await sbApi(`/leads?id=eq.${encodeURIComponent(lead_id)}&select=*`);
+                lead = rows[0] ?? null;
+                if (!lead)
+                    throw new Error(`No lead ${lead_id}.`);
+            }
+            // A promoted lead's capture conversation lives on its pending row — merge it in.
+            if (lead && !pending) {
+                const pend = await sbApi(`/whatsapp_pending_contacts?lead_id=eq.${lead.id}&${pendingSelect}&limit=1`);
+                pending = pend[0] ?? null;
+            }
+            // ── Header ──
+            const header = [];
+            if (lead) {
+                header.push(`**Lead:** ${[lead.first_name, lead.last_name].filter(Boolean).join(" ") || lead.id} (\`${lead.id}\`)`, `**Tel:** ${lead.mobile_phone_e164 ?? lead.phone ?? "—"} · **Etapa:** ${lead.status} · **Bot:** ${lead.whatsapp_bot_active === false ? "apagado" : "activo"}`);
+                if (lead.intent_detected || lead.interest_level)
+                    header.push(`**Intent:** ${lead.intent_detected ?? "—"} · **Interés:** ${lead.interest_level ?? "—"}`);
+                if (lead.bot_escalation_reason)
+                    header.push(`**Escalado:** ${lead.bot_escalation_reason}`);
+                if (lead.bot_conversation_summary)
+                    header.push(`**Resumen del bot:** ${lead.bot_conversation_summary}`);
+            }
+            if (pending) {
+                header.push(`**Pending contact:** ${pending.contact_name ?? pending.phone ?? pending.respond_contact_id} (\`${pending.respond_contact_id}\`) · **Canal:** ${WA_CHANNEL_LABELS[pending.channel] ?? pending.channel} · **Triage:** ${pending.tipo_contacto} · **Status:** ${pending.status}${pending.status_reason ? ` (${pending.status_reason})` : ""}`);
+                const capturedKeys = Object.keys(pending.captured ?? {});
+                if (capturedKeys.length)
+                    header.push(`**Capturado:** ${capturedKeys.join(", ")}`);
+            }
+            // ── Thread ──
+            const lines = [];
+            // At promotion the capture messages are replayed onto the lead's crm_activities,
+            // so rendering both sections would duplicate the whole capture phase.
+            const capturaReplayed = !!(lead && pending?.lead_id === lead.id);
+            const pendMsgs = !capturaReplayed && Array.isArray(pending?.messages) ? pending.messages : [];
+            if (pendMsgs.length) {
+                lines.push(`### Fase de captura (${pendMsgs.length} mensajes)`);
+                for (const m of pendMsgs) {
+                    lines.push(`- ${fmtTs(m.ts)} ${m.dir === "in" ? "⬅️ **cliente**" : "➡️ bot"}: ${clip(m.text, 500)}`);
                 }
-                if (pending) {
-                    header.push(`**Pending contact:** ${pending.contact_name ?? pending.phone ?? pending.respond_contact_id} (\`${pending.respond_contact_id}\`) · **Canal:** ${WA_CHANNEL_LABELS[pending.channel] ?? pending.channel} · **Triage:** ${pending.tipo_contacto} · **Status:** ${pending.status}${pending.status_reason ? ` (${pending.status_reason})` : ""}`);
-                    const capturedKeys = Object.keys(pending.captured ?? {});
-                    if (capturedKeys.length)
-                        header.push(`**Capturado:** ${capturedKeys.join(", ")}`);
-                }
-                // ── Thread ──
-                const lines = [];
-                // At promotion the capture messages are replayed onto the lead's crm_activities,
-                // so rendering both sections would duplicate the whole capture phase.
-                const capturaReplayed = !!(lead && pending?.lead_id === lead.id);
-                const pendMsgs = !capturaReplayed && Array.isArray(pending?.messages) ? pending.messages : [];
-                if (pendMsgs.length) {
-                    lines.push(`### Fase de captura (${pendMsgs.length} mensajes)`);
-                    for (const m of pendMsgs) {
-                        lines.push(`- ${fmtTs(m.ts)} ${m.dir === "in" ? "⬅️ **cliente**" : "➡️ bot"}: ${clip(m.text, 500)}`);
-                    }
-                }
-                if (lead) {
-                    const acts = await sbApi(`/crm_activities?entity_type=eq.lead&entity_id=eq.${lead.id}&activity_type=eq.whatsapp&order=created_at.asc&select=id,description,metadata,created_at&limit=${lim}`);
-                    if (acts.length) {
-                        lines.push("", `### Conversación como lead (${acts.length} actividades)`);
-                        for (const a of acts) {
-                            const meta = a.metadata ?? {};
-                            const ts = fmtTs(a.created_at);
-                            const emitted = !!(meta.mensaje_cliente || meta.mensaje_bot);
-                            if (meta.mensaje_cliente)
-                                lines.push(`- ${ts} ⬅️ **cliente**: ${clip(meta.mensaje_cliente, 500)}`);
-                            if (meta.mensaje_bot) {
-                                const sender = meta.status === "agente" ? "**agente**" : "bot";
-                                lines.push(`- ${ts} ➡️ ${sender}: ${clip(meta.mensaje_bot, 500)}`);
-                            }
-                            if (!emitted) {
-                                const dir = meta.direccion === "inbound" ? "⬅️" : "➡️";
-                                lines.push(`- ${ts} ${dir} ${clip(a.description, 500)}`);
-                            }
+            }
+            if (lead) {
+                const acts = await sbApi(`/crm_activities?entity_type=eq.lead&entity_id=eq.${lead.id}&activity_type=eq.whatsapp&order=created_at.asc&select=id,description,metadata,created_at&limit=${lim}`);
+                if (acts.length) {
+                    lines.push("", `### Conversación como lead (${acts.length} actividades)`);
+                    for (const a of acts) {
+                        const meta = a.metadata ?? {};
+                        const ts = fmtTs(a.created_at);
+                        const emitted = !!(meta.mensaje_cliente || meta.mensaje_bot);
+                        if (meta.mensaje_cliente)
+                            lines.push(`- ${ts} ⬅️ **cliente**: ${clip(meta.mensaje_cliente, 500)}`);
+                        if (meta.mensaje_bot) {
+                            const sender = meta.status === "agente" ? "**agente**" : "bot";
+                            lines.push(`- ${ts} ➡️ ${sender}: ${clip(meta.mensaje_bot, 500)}`);
                         }
-                        if (acts.length === lim)
-                            lines.push("", `*Truncado a ${lim} actividades — sube \`limit\` para ver más.*`);
+                        if (!emitted) {
+                            const dir = meta.direccion === "inbound" ? "⬅️" : "➡️";
+                            lines.push(`- ${ts} ${dir} ${clip(a.description, 500)}`);
+                        }
                     }
+                    if (acts.length === lim)
+                        lines.push("", `*Truncado a ${lim} actividades — sube \`limit\` para ver más.*`);
                 }
-                if (!lines.length)
-                    lines.push("*Sin mensajes.*");
-                return {
-                    content: [{ type: "text", text: `# Conversación WhatsApp\n\n${header.join("\n")}\n\n${lines.join("\n")}` }],
-                };
             }
-            catch (e) {
-                return { content: [{ type: "text", text: `WhatsApp conversation failed: ${e.message}` }], isError: true };
-            }
-        });
+            if (!lines.length)
+                lines.push("*Sin mensajes.*");
+            return {
+                content: [{ type: "text", text: `# Conversación WhatsApp\n\n${header.join("\n")}\n\n${lines.join("\n")}` }],
+            };
+        }
+        catch (e) {
+            return { content: [{ type: "text", text: `WhatsApp conversation failed: ${e.message}` }], isError: true };
+        }
+    });
+    if (isAdmin) {
         server.tool("futurerp_whatsapp_stats", "Inbound vs outbound WhatsApp bot message stats for reporting: totals (in / out-bot / out-agente), breakdown by channel and by day/week, active conversations, new contacts, promotions to lead, triage mix, and escalations. Combines lead-phase crm_activities with capture-phase pending-contact messages.", {
             period: z
                 .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
@@ -2428,168 +2458,168 @@ export function buildServer(auth) {
         // whatsapp_messages (direction inbound|outbound, sent_at).
         // Distinct from the Nancy bot tables above.
         // ────────────────────────────────────────────────────────────
-        server.tool("futurerp_whatsapp_seguimientos", "Audit the SALES team's WhatsApp inbox (per-vendor OpenWA sessions, not the bot) for bad follow-ups: conversations where the client's last message is unanswered past a threshold, and lead-linked chats gone cold. Groups by vendedor with response stats. Pass conversation_id to fetch one full thread for qualitative chat analysis.", {
-            days: z.number().optional().describe("Lookback window in days for message activity. Default: 7"),
-            stale_hours: z.number().optional().describe("Hours an inbound client message may wait unanswered before flagging. Default: 12"),
-            cold_days: z.number().optional().describe("Days of total silence on a lead-linked chat before flagging as cold. Default: 5"),
-            vendedor: z.string().optional().describe("Filter channels by vendor name / label / session name (substring, case-insensitive)"),
-            limit: z.number().optional().describe("Max flagged conversations per section (default 30, max 100)"),
-            conversation_id: z.string().optional().describe("whatsapp_conversations uuid — render that full thread instead of the audit"),
-            thread_limit: z.number().optional().describe("Max messages when rendering a thread (default 200, max 500)"),
-        }, async ({ days, stale_hours, cold_days, vendedor, limit, conversation_id, thread_limit }) => {
-            try {
-                requireCredentials();
-                // ── Thread mode ──
-                if (conversation_id) {
-                    const convos = await sbApi(`/whatsapp_conversations?id=eq.${encodeURIComponent(conversation_id)}&select=*,whatsapp_channels(label,session_name,phone,vendor_user_id)`);
-                    const c = convos[0];
-                    if (!c)
-                        throw new Error(`No conversation ${conversation_id}.`);
-                    const ch = c.whatsapp_channels ?? {};
-                    const names = await resolveProfiles([ch.vendor_user_id].filter(Boolean));
-                    const vendorName = names.get(ch.vendor_user_id) ?? ch.label ?? ch.session_name ?? "—";
-                    const lim = Math.min(thread_limit ?? 200, 500);
-                    const msgs = await sbApi(`/whatsapp_messages?conversation_id=eq.${encodeURIComponent(conversation_id)}&order=sent_at.desc&select=direction,body,media_type,status,sent_at&limit=${lim}`);
-                    msgs.reverse();
-                    const header = [
-                        `**Contacto:** ${c.name_override ?? c.contact_name ?? c.contact_phone ?? c.chat_id}`,
-                        `**Vendedor:** ${vendorName} · **Tel contacto:** ${c.contact_phone ?? "—"} · **Lead:** ${c.lead_id ? `\`${c.lead_id}\`` : "sin vincular"}`,
-                        `**Último mensaje:** ${fmtTs(c.last_message_at)}`,
-                    ];
-                    const lines = msgs.map((m) => `- ${fmtTs(m.sent_at)} ${m.direction === "inbound" ? "⬅️ **cliente**" : "➡️ vendedor"}: ${m.body ? clip(m.body, 500) : `[${m.media_type ?? "media"}]`}`);
-                    if (msgs.length === lim)
-                        lines.push("", `*Truncado a ${lim} mensajes — sube \`thread_limit\`.*`);
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `# Conversación de ventas\n\n${header.join("\n")}\n\n${lines.length ? lines.join("\n") : "*Sin mensajes.*"}`,
-                            },
-                        ],
-                    };
-                }
-                // ── Audit mode ──
-                const lim = Math.min(limit ?? 30, 100);
-                const staleMs = (stale_hours ?? 12) * 3600_000;
-                const coldMs = (cold_days ?? 5) * 86400_000;
-                const now = Date.now();
-                const since = new Date(now - (days ?? 7) * 86400_000).toISOString();
-                const channels = await sbApi(`/whatsapp_channels?active=eq.true&select=id,label,session_name,phone,vendor_user_id,connection_status`);
-                const names = await resolveProfiles(channels.map((c) => c.vendor_user_id).filter(Boolean));
-                const chanName = (c) => names.get(c.vendor_user_id) ?? c.label ?? c.session_name;
-                const filtered = vendedor
-                    ? channels.filter((c) => [chanName(c), c.label, c.session_name].some((s) => s?.toLowerCase().includes(vendedor.toLowerCase())))
-                    : channels;
-                if (!filtered.length)
-                    throw new Error(`No active sales channels${vendedor ? ` matching "${vendedor}"` : ""}.`);
-                const chanById = new Map(filtered.map((c) => [c.id, c]));
-                const chanIds = filtered.map((c) => c.id).join(",");
-                const [convos, msgs] = await Promise.all([
-                    sbApi(`/whatsapp_conversations?channel_id=in.(${chanIds})&is_group=eq.false&select=id,channel_id,contact_phone,contact_name,name_override,lead_id,last_message_at,last_message_preview&order=last_message_at.desc.nullslast&limit=2000`),
-                    sbApi(
-                    // ponytail: one bulk fetch reduced in JS beats N+1 last-message queries; 10k cap matches the stats tool
-                    `/whatsapp_messages?sent_at=gte.${encodeURIComponent(since)}&select=conversation_id,direction,sent_at&order=sent_at.desc&limit=10000`),
-                ]);
-                const agg = new Map();
-                for (const m of msgs) {
-                    let a = agg.get(m.conversation_id);
-                    if (!a)
-                        agg.set(m.conversation_id, (a = { in: 0, out: 0 }));
-                    if (m.direction === "inbound") {
-                        a.in++;
-                        if (!a.lastIn || m.sent_at > a.lastIn)
-                            a.lastIn = m.sent_at;
-                    }
-                    else {
-                        a.out++;
-                        if (!a.lastOut || m.sent_at > a.lastOut)
-                            a.lastOut = m.sent_at;
-                    }
-                }
-                const hrs = (iso) => (now - new Date(iso).getTime()) / 3600_000;
-                const label = (c) => c.name_override ?? c.contact_name ?? c.contact_phone ?? "—";
-                const unanswered = [];
-                const cold = [];
-                const perVendor = new Map();
-                const bump = (chId) => {
-                    const v = chanName(chanById.get(chId));
-                    let s = perVendor.get(v);
-                    if (!s)
-                        perVendor.set(v, (s = { convos: 0, in: 0, out: 0, sinResp: 0, frías: 0 }));
-                    return s;
-                };
-                for (const c of convos) {
-                    if (!chanById.has(c.channel_id))
-                        continue;
-                    const a = agg.get(c.id);
-                    const active = a && (a.in || a.out);
-                    const s = bump(c.channel_id);
-                    if (active) {
-                        s.convos++;
-                        s.in += a.in;
-                        s.out += a.out;
-                    }
-                    // Unanswered: client spoke last and has waited past the threshold.
-                    if (a?.lastIn && (!a.lastOut || a.lastIn > a.lastOut) && now - new Date(a.lastIn).getTime() > staleMs) {
-                        s.sinResp++;
-                        unanswered.push({
-                            vendedor: chanName(chanById.get(c.channel_id)),
-                            contacto: label(c),
-                            "esperando (h)": Math.round(hrs(a.lastIn)),
-                            "último mensaje": clip(c.last_message_preview, 60),
-                            lead_id: c.lead_id ?? "",
-                            conversation_id: c.id,
-                        });
-                    }
-                    // Cold: linked to a lead but nobody has said anything in cold_days.
-                    else if (c.lead_id && c.last_message_at && now - new Date(c.last_message_at).getTime() > coldMs) {
-                        s.frías++;
-                        cold.push({
-                            vendedor: chanName(chanById.get(c.channel_id)),
-                            contacto: label(c),
-                            "días en silencio": Math.round(hrs(c.last_message_at) / 24),
-                            "último mensaje": clip(c.last_message_preview, 60),
-                            lead_id: c.lead_id,
-                            conversation_id: c.id,
-                        });
-                    }
-                }
-                unanswered.sort((x, y) => y["esperando (h)"] - x["esperando (h)"]);
-                cold.sort((x, y) => y["días en silencio"] - x["días en silencio"]);
-                const vendorTable = [...perVendor.entries()].map(([v, s]) => ({
-                    vendedor: v,
-                    "convos activas": s.convos,
-                    recibidos: s.in,
-                    enviados: s.out,
-                    "sin responder": s.sinResp,
-                    "leads fríos": s.frías,
-                }));
+    } // futurerp_whatsapp_stats + _health — bot-only tables (service key); admins only
+    server.tool("futurerp_whatsapp_seguimientos", "Audit the SALES team's WhatsApp inbox (per-vendor OpenWA sessions, not the bot) for bad follow-ups: conversations where the client's last message is unanswered past a threshold, and lead-linked chats gone cold. Groups by vendedor with response stats. Pass conversation_id to fetch one full thread for qualitative chat analysis.", {
+        days: z.number().optional().describe("Lookback window in days for message activity. Default: 7"),
+        stale_hours: z.number().optional().describe("Hours an inbound client message may wait unanswered before flagging. Default: 12"),
+        cold_days: z.number().optional().describe("Days of total silence on a lead-linked chat before flagging as cold. Default: 5"),
+        vendedor: z.string().optional().describe("Filter channels by vendor name / label / session name (substring, case-insensitive)"),
+        limit: z.number().optional().describe("Max flagged conversations per section (default 30, max 100)"),
+        conversation_id: z.string().optional().describe("whatsapp_conversations uuid — render that full thread instead of the audit"),
+        thread_limit: z.number().optional().describe("Max messages when rendering a thread (default 200, max 500)"),
+    }, async ({ days, stale_hours, cold_days, vendedor, limit, conversation_id, thread_limit }) => {
+        try {
+            requireCredentials();
+            // ── Thread mode ──
+            if (conversation_id) {
+                const convos = await sbApi(`/whatsapp_conversations?id=eq.${encodeURIComponent(conversation_id)}&select=*,whatsapp_channels(label,session_name,phone,vendor_user_id)`);
+                const c = convos[0];
+                if (!c)
+                    throw new Error(`No conversation ${conversation_id}.`);
+                const ch = c.whatsapp_channels ?? {};
+                const names = await resolveProfiles([ch.vendor_user_id].filter(Boolean));
+                const vendorName = names.get(ch.vendor_user_id) ?? ch.label ?? ch.session_name ?? "—";
+                const lim = Math.min(thread_limit ?? 200, 500);
+                const msgs = await sbApi(`/whatsapp_messages?conversation_id=eq.${encodeURIComponent(conversation_id)}&order=sent_at.desc&select=direction,body,media_type,status,sent_at&limit=${lim}`);
+                msgs.reverse();
+                const header = [
+                    `**Contacto:** ${c.name_override ?? c.contact_name ?? c.contact_phone ?? c.chat_id}`,
+                    `**Vendedor:** ${vendorName} · **Tel contacto:** ${c.contact_phone ?? "—"} · **Lead:** ${c.lead_id ? `\`${c.lead_id}\`` : "sin vincular"}`,
+                    `**Último mensaje:** ${fmtTs(c.last_message_at)}`,
+                ];
+                const lines = msgs.map((m) => `- ${fmtTs(m.sent_at)} ${m.direction === "inbound" ? "⬅️ **cliente**" : "➡️ vendedor"}: ${m.body ? clip(m.body, 500) : `[${m.media_type ?? "media"}]`}`);
+                if (msgs.length === lim)
+                    lines.push("", `*Truncado a ${lim} mensajes — sube \`thread_limit\`.*`);
                 return {
                     content: [
                         {
                             type: "text",
-                            text: [
-                                `# Seguimientos de ventas — WhatsApp (últimos ${days ?? 7} días)`,
-                                "",
-                                `${unanswered.length ? "🔴" : "✅"} **${unanswered.length} conversaciones con cliente esperando >${stale_hours ?? 12}h** · ${cold.length ? "⚠️" : "✅"} **${cold.length} leads fríos >${cold_days ?? 5} días**`,
-                                "",
-                                renderRecords(vendorTable, "## Por vendedor", 7),
-                                "",
-                                renderRecords(unanswered.slice(0, lim), `## 🔴 Cliente sin respuesta — ${unanswered.length}`, 7),
-                                "",
-                                renderRecords(cold.slice(0, lim), `## ⚠️ Leads fríos (sin actividad) — ${cold.length}`, 7),
-                                "",
-                                "*Para analizar la calidad de un chat, vuelve a llamar esta tool con su `conversation_id`.*",
-                            ].join("\n"),
+                            text: `# Conversación de ventas\n\n${header.join("\n")}\n\n${lines.length ? lines.join("\n") : "*Sin mensajes.*"}`,
                         },
                     ],
                 };
             }
-            catch (e) {
-                return { content: [{ type: "text", text: `WhatsApp seguimientos failed: ${e.message}` }], isError: true };
+            // ── Audit mode ──
+            const lim = Math.min(limit ?? 30, 100);
+            const staleMs = (stale_hours ?? 12) * 3600_000;
+            const coldMs = (cold_days ?? 5) * 86400_000;
+            const now = Date.now();
+            const since = new Date(now - (days ?? 7) * 86400_000).toISOString();
+            const channels = await sbApi(`/whatsapp_channels?active=eq.true&select=id,label,session_name,phone,vendor_user_id,connection_status`);
+            const names = await resolveProfiles(channels.map((c) => c.vendor_user_id).filter(Boolean));
+            const chanName = (c) => names.get(c.vendor_user_id) ?? c.label ?? c.session_name;
+            const filtered = vendedor
+                ? channels.filter((c) => [chanName(c), c.label, c.session_name].some((s) => s?.toLowerCase().includes(vendedor.toLowerCase())))
+                : channels;
+            if (!filtered.length)
+                throw new Error(`No active sales channels${vendedor ? ` matching "${vendedor}"` : ""}.`);
+            const chanById = new Map(filtered.map((c) => [c.id, c]));
+            const chanIds = filtered.map((c) => c.id).join(",");
+            const [convos, msgs] = await Promise.all([
+                sbApi(`/whatsapp_conversations?channel_id=in.(${chanIds})&is_group=eq.false&select=id,channel_id,contact_phone,contact_name,name_override,lead_id,last_message_at,last_message_preview&order=last_message_at.desc.nullslast&limit=2000`),
+                sbApi(
+                // ponytail: one bulk fetch reduced in JS beats N+1 last-message queries; 10k cap matches the stats tool
+                `/whatsapp_messages?sent_at=gte.${encodeURIComponent(since)}&select=conversation_id,direction,sent_at&order=sent_at.desc&limit=10000`),
+            ]);
+            const agg = new Map();
+            for (const m of msgs) {
+                let a = agg.get(m.conversation_id);
+                if (!a)
+                    agg.set(m.conversation_id, (a = { in: 0, out: 0 }));
+                if (m.direction === "inbound") {
+                    a.in++;
+                    if (!a.lastIn || m.sent_at > a.lastIn)
+                        a.lastIn = m.sent_at;
+                }
+                else {
+                    a.out++;
+                    if (!a.lastOut || m.sent_at > a.lastOut)
+                        a.lastOut = m.sent_at;
+                }
             }
-        });
-    } // end if can("mcp.whatsapp")
+            const hrs = (iso) => (now - new Date(iso).getTime()) / 3600_000;
+            const label = (c) => c.name_override ?? c.contact_name ?? c.contact_phone ?? "—";
+            const unanswered = [];
+            const cold = [];
+            const perVendor = new Map();
+            const bump = (chId) => {
+                const v = chanName(chanById.get(chId));
+                let s = perVendor.get(v);
+                if (!s)
+                    perVendor.set(v, (s = { convos: 0, in: 0, out: 0, sinResp: 0, frías: 0 }));
+                return s;
+            };
+            for (const c of convos) {
+                if (!chanById.has(c.channel_id))
+                    continue;
+                const a = agg.get(c.id);
+                const active = a && (a.in || a.out);
+                const s = bump(c.channel_id);
+                if (active) {
+                    s.convos++;
+                    s.in += a.in;
+                    s.out += a.out;
+                }
+                // Unanswered: client spoke last and has waited past the threshold.
+                if (a?.lastIn && (!a.lastOut || a.lastIn > a.lastOut) && now - new Date(a.lastIn).getTime() > staleMs) {
+                    s.sinResp++;
+                    unanswered.push({
+                        vendedor: chanName(chanById.get(c.channel_id)),
+                        contacto: label(c),
+                        "esperando (h)": Math.round(hrs(a.lastIn)),
+                        "último mensaje": clip(c.last_message_preview, 60),
+                        lead_id: c.lead_id ?? "",
+                        conversation_id: c.id,
+                    });
+                }
+                // Cold: linked to a lead but nobody has said anything in cold_days.
+                else if (c.lead_id && c.last_message_at && now - new Date(c.last_message_at).getTime() > coldMs) {
+                    s.frías++;
+                    cold.push({
+                        vendedor: chanName(chanById.get(c.channel_id)),
+                        contacto: label(c),
+                        "días en silencio": Math.round(hrs(c.last_message_at) / 24),
+                        "último mensaje": clip(c.last_message_preview, 60),
+                        lead_id: c.lead_id,
+                        conversation_id: c.id,
+                    });
+                }
+            }
+            unanswered.sort((x, y) => y["esperando (h)"] - x["esperando (h)"]);
+            cold.sort((x, y) => y["días en silencio"] - x["días en silencio"]);
+            const vendorTable = [...perVendor.entries()].map(([v, s]) => ({
+                vendedor: v,
+                "convos activas": s.convos,
+                recibidos: s.in,
+                enviados: s.out,
+                "sin responder": s.sinResp,
+                "leads fríos": s.frías,
+            }));
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: [
+                            `# Seguimientos de ventas — WhatsApp (últimos ${days ?? 7} días)`,
+                            "",
+                            `${unanswered.length ? "🔴" : "✅"} **${unanswered.length} conversaciones con cliente esperando >${stale_hours ?? 12}h** · ${cold.length ? "⚠️" : "✅"} **${cold.length} leads fríos >${cold_days ?? 5} días**`,
+                            "",
+                            renderRecords(vendorTable, "## Por vendedor", 7),
+                            "",
+                            renderRecords(unanswered.slice(0, lim), `## 🔴 Cliente sin respuesta — ${unanswered.length}`, 7),
+                            "",
+                            renderRecords(cold.slice(0, lim), `## ⚠️ Leads fríos (sin actividad) — ${cold.length}`, 7),
+                            "",
+                            "*Para analizar la calidad de un chat, vuelve a llamar esta tool con su `conversation_id`.*",
+                        ].join("\n"),
+                    },
+                ],
+            };
+        }
+        catch (e) {
+            return { content: [{ type: "text", text: `WhatsApp seguimientos failed: ${e.message}` }], isError: true };
+        }
+    });
     // ────────────────────────────────────────────────────────────
     // MCP PROMPTS
     // ────────────────────────────────────────────────────────────
@@ -2657,23 +2687,22 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             },
         ],
     }));
-    if (can("mcp.whatsapp"))
-        server.prompt("sales_followup_review", "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.", { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") }, ({ vendedor }) => ({
-            messages: [
-                {
-                    role: "user",
-                    content: {
-                        type: "text",
-                        text: `Review the sales team's WhatsApp follow-ups${vendedor ? ` for ${vendedor}` : ""}.
+    server.prompt("sales_followup_review", "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.", { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") }, ({ vendedor }) => ({
+        messages: [
+            {
+                role: "user",
+                content: {
+                    type: "text",
+                    text: `Review the sales team's WhatsApp follow-ups${vendedor ? ` for ${vendedor}` : ""}.
 
 1. Call \`futurerp_whatsapp_seguimientos\`${vendedor ? ` vendedor=${vendedor}` : ""} to get the per-vendor audit (unanswered clients, cold leads).
 2. For the 3–5 worst flagged conversations (longest wait / most days silent), call the same tool with each \`conversation_id\` to read the full thread.
 3. Rate each thread 1–5 on: response speed, whether questions were answered, whether the vendor pushed toward a next step (cita, cotización, cierre), and tone.
 4. Summarize per vendedor: what they do well, the specific bad habits found (with quoted examples), and the top 3 conversations that need a follow-up TODAY (contacto, tel/lead_id, suggested message in Spanish).`,
-                    },
                 },
-            ],
-        }));
+            },
+        ],
+    }));
     server.prompt("ticket_health_check", "Quick ticket-health dashboard: open count, SLA breaches, top responsables, top areas.", () => ({
         messages: [
             {
@@ -2780,10 +2809,23 @@ async function main() {
         next();
     }, bearer, async (req, res) => {
         const auth = req.auth;
-        if (req.body?.method === "tools/call") {
+        const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
+        if (toolName) {
             // Audit line (Railway logs): who called what.
-            console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: req.body.params?.name }));
+            console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: toolName }));
         }
+        // Which identity runs the data reads for this request:
+        //  - bot-monitoring tools read service-only tables (whatsapp_pending_contacts USING(false), etc.) → service
+        //  - whatsapp_conversation for an admin also wants the bot capture buffer → service
+        //  - everything else → the caller's token, so Postgres RLS scopes the result to what they may see
+        const SERVICE_TOOLS = new Set([
+            "futurerp_whatsapp_chats",
+            "futurerp_whatsapp_stats",
+            "futurerp_whatsapp_health",
+        ]);
+        const runAsService = (toolName != null && SERVICE_TOOLS.has(toolName)) ||
+            (toolName === "futurerp_whatsapp_conversation" && auth.extra?.isAdmin === true);
+        const store = { token: runAsService ? undefined : auth.token };
         const server = buildServer(auth);
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => {
@@ -2791,8 +2833,10 @@ async function main() {
             void server.close().catch(() => { });
         });
         try {
-            await server.connect(transport);
-            await transport.handleRequest(req, res, req.body);
+            await reqCtx.run(store, async () => {
+                await server.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+            });
         }
         catch (e) {
             console.error("MCP request error:", e);
