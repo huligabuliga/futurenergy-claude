@@ -12,7 +12,7 @@ MCP_SERVERS=("salesforce-futurenergy")
 
 # FuturERP MCP is remote (Streamable HTTP + OAuth) — nothing to install locally.
 # Override with FUTURERP_MCP_URL=... if Jonas announces a different endpoint.
-FUTURERP_MCP_URL="${FUTURERP_MCP_URL:-https://mcp.futurenergy.mx/mcp}"
+FUTURERP_MCP_URL="${FUTURERP_MCP_URL:-https://futurerp-mcp-production.up.railway.app/mcp}"
 
 # Skills to symlink (directory name under skills/ in this repo)
 SKILLS=("salesforce-futurenergy" "futurerp")

@@ -87,10 +87,26 @@ Then **quit and reopen Claude Desktop** for the MCP servers to connect.
 
 FuturERP runs as a hosted MCP server. You log in with your **FuturERP account** (same as tickets.futurenergy.mx); what you can see follows your role there.
 
-- **Claude Code**: `setup.sh` already registers it. Run `/mcp` → `futurerp` → **Authenticate** → your browser opens FuturERP → **Autorizar**. (Manual: `claude mcp add --transport http futurerp https://mcp.futurenergy.mx/mcp`.)
-- **Claude Desktop / claude.ai / mobile**: Settings → Connectors → **Add custom connector** → URL `https://mcp.futurenergy.mx/mcp` → Connect → log in.
+- **Claude Code**: `setup.sh` already registers it. Run `/mcp` → `futurerp` → **Authenticate** → your browser opens FuturERP → **Autorizar**. (Manual: `claude mcp add --transport http futurerp https://futurerp-mcp-production.up.railway.app/mcp`.)
+- **Claude Desktop / claude.ai / mobile**: Settings → Connectors → **Add custom connector** → URL `https://futurerp-mcp-production.up.railway.app/mcp` → Connect → log in.
 
 The exact URL is announced by Jonas; nothing else to configure. Access is granted per user in FuturERP → Admin → Permisos (`MCP / Claude`).
+
+<details>
+<summary>Operating it (Jonas): Railway service <code>futurerp-mcp</code> in "Futurenergy Stack"</summary>
+
+```bash
+cd mcp-servers/futurerp
+railway link -p 68cd19f3-287d-4997-855c-41129a46e358 -e production -s futurerp-mcp   # once per machine
+# env (once): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (data reads), SUPABASE_PUBLISHABLE_KEY (token check),
+#             MCP_PUBLIC_URL=https://futurerp-mcp-production.up.railway.app/mcp
+railway variables --set "KEY=value" ...
+railway up --service futurerp-mcp        # build (npm ci + npm run build) and deploy this directory
+railway logs                             # audit lines: {"t":…,"email":…,"tool":…}
+```
+
+Prerequisites on the Supabase project (`rczhnuurvcxtkfussmfj`): Authentication → OAuth Server **enabled**, Authorization Path `/oauth/consent`, Dynamic Client Registration **on**; the consent page ships with pronto-resolver-61 (`/oauth/consent`). Roles `MCP Básico` / `MCP WhatsApp` come from its migration `20260818120000_mcp_permissions.sql`.
+</details>
 
 Test it by asking Claude:
 - Salesforce: **"Dame los KPIs de este mes"**
