@@ -2673,13 +2673,23 @@ async function main() {
         console.error("WARNING: MCP_SKIP_AS_METADATA=1 — OAuth discovery metadata not served (smoke-test only)");
     }
     else {
-        const metaUrl = `${SUPABASE_URL}/.well-known/oauth-authorization-server/auth/v1`;
-        const r = await fetch(metaUrl).catch((e) => ({ ok: false, status: String(e) }));
-        if (!r.ok) {
-            console.error(`Cannot load OAuth metadata from ${metaUrl} (${r.status}). Supabase OAuth server disabled? Enable it under Authentication → OAuth Server.`);
+        // Cloud serves RFC 8414's root form; the local CLI (Kong) only serves it under /auth/v1.
+        const metaUrls = [
+            `${SUPABASE_URL}/.well-known/oauth-authorization-server/auth/v1`,
+            `${SUPABASE_URL}/auth/v1/.well-known/oauth-authorization-server`,
+        ];
+        let oauthMetadata = null;
+        for (const metaUrl of metaUrls) {
+            const r = await fetch(metaUrl).catch(() => null);
+            if (r?.ok) {
+                oauthMetadata = await r.json();
+                break;
+            }
+        }
+        if (!oauthMetadata) {
+            console.error(`Cannot load OAuth metadata from ${metaUrls.join(" or ")}. Supabase OAuth server disabled? Enable it under Authentication → OAuth Server.`);
             process.exit(1);
         }
-        const oauthMetadata = await r.json();
         app.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl: MCP_PUBLIC_URL, resourceName: "FuturERP" }));
     }
     const bearer = requireBearerAuth({
