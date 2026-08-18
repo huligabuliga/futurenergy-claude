@@ -3190,6 +3190,20 @@ async function main() {
 
   const app = express();
   app.use(express.json({ limit: "4mb" }));
+  // One line per request in Railway logs: method, path, status, ms, and — for 401/403 — the reason
+  // (taken from the WWW-Authenticate header we set; never the token). Cheap, and the only way to see
+  // what a remote client (claude.ai) actually did.
+  app.use((req, res, next) => {
+    const t0 = Date.now();
+    res.on("finish", () => {
+      const line: Record<string, unknown> = { m: req.method, p: req.path, s: res.statusCode, ms: Date.now() - t0 };
+      if (req.path === "/mcp" && req.body?.method) line.rpc = req.body.method;
+      const wa = res.getHeader("www-authenticate");
+      if (typeof wa === "string") line.reason = wa.replace(/, resource_metadata=.*$/, "");
+      console.log(JSON.stringify(line));
+    });
+    next();
+  });
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, version: VERSION });
   });
