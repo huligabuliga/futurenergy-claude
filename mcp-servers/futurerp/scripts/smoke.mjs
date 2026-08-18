@@ -155,7 +155,7 @@ try {
     check("admin sees 30 tools", r.tools.length === 30, `count=${r.tools.length}`);
     check("admin sees futurerp_whatsapp_chats", r.tools.includes("futurerp_whatsapp_chats"));
     const call = await mcp(adminTok, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "futurerp_count", arguments: { table: "profiles" } } });
-    check("admin tools/call futurerp_count works", call.status === 200 && !call.json?.result?.isError, call.json?.result?.content?.[0]?.text?.slice(0, 80) ?? call.text.slice(0, 120));
+    check("admin tools/call futurerp_count works", call.status === 200 && call.json !== null && !call.json?.error && !call.json?.result?.isError, call.json?.result?.content?.[0]?.text?.slice(0, 80) ?? call.text.slice(0, 120));
   }
   // 4. role with only mcp.access
   {

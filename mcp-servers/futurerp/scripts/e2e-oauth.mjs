@@ -117,7 +117,7 @@ try {
   const toolsBasic = await listTools(tBasic);
   ok(toolsBasic.length > 0 && !toolsBasic.some((n) => n.startsWith("futurerp_whatsapp")), "MCP Básico user gets tools but NO whatsapp tools", `${toolsBasic.length} tools`);
   const call = await mcp(tBasic, "tools/call", { name: "futurerp_count", arguments: { table: "profiles" } }, 3);
-  ok(call.status === 200 && !call.data?.error && !call.data?.result?.isError, "MCP Básico can call futurerp_count", JSON.stringify(call.data).slice(0, 160));
+  ok(call.status === 200 && call.data && !call.data.error && !call.data.result?.isError, "MCP Básico can call futurerp_count", JSON.stringify(call.data).slice(0, 160));
 
   console.log("\n# user with no MCP role");
   const tNone = await oauthFlow(meta, clientId, await signIn(users.none));
@@ -130,7 +130,7 @@ try {
 } catch (e) {
   console.error("ERROR", e); failures++;
 } finally {
-  for (const id of created) await deleteUser(id);
+  for (const id of created) { try { await deleteUser(id); } catch (e) { console.error("cleanup failed for", id, e); } }
   console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
   process.exit(failures ? 1 : 0);
 }

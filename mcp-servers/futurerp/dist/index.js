@@ -61,7 +61,7 @@ function hasCredentials() {
 }
 function requireCredentials() {
     if (!hasCredentials()) {
-        throw new Error("No Supabase credentials. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .mcp.json env or in ~/.claude/mcp-servers/futurerp/.env.");
+        throw new Error("No Supabase credentials. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (Railway variables, or .env next to package.json for local runs).");
     }
 }
 function authHeaders(extra = {}) {
@@ -277,16 +277,28 @@ async function hasCrmPermission(userId, key) {
         throw new Error(`has_crm_permission ${res.status}: ${await res.text()}`);
     return (await res.json()) === true;
 }
+const invalidCache = new Map(); // token → until (negative cache: don't re-ask Supabase for 60 s)
 async function resolveAuthInfo(token) {
     const now = Date.now();
     const hit = authCache.get(token);
     if (hit && hit.until > now)
         return hit.info;
+    // Cheap rejects before any network call: must look like a JWT, and known-bad tokens stay bad for 60 s
+    // (bounds how hard an unauthenticated flood can make us hammer /auth/v1/user).
+    if (token.split(".").length !== 3 || token.length > 4096)
+        throw new InvalidTokenError("Token inválido");
+    const bad = invalidCache.get(token);
+    if (bad && bad > now)
+        throw new InvalidTokenError("Token inválido o expirado");
     const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
         headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${token}` },
     });
-    if (!res.ok)
+    if (!res.ok) {
+        if (invalidCache.size > 500)
+            invalidCache.clear();
+        invalidCache.set(token, now + 60_000);
         throw new InvalidTokenError("Token inválido o expirado");
+    }
     const user = await res.json();
     let claims = {};
     try {
@@ -311,7 +323,17 @@ async function resolveAuthInfo(token) {
 }
 const tokenVerifier = {
     async verifyAccessToken(token) {
-        const info = await resolveAuthInfo(token);
+        let info;
+        try {
+            info = await resolveAuthInfo(token);
+        }
+        catch (e) {
+            // The SDK middleware turns anything that isn't an OAuth error into a bare 500 without logging.
+            // Make Supabase/RPC outages visible in Railway logs (never log the token itself).
+            if (!(e instanceof InvalidTokenError))
+                console.error("auth backend error:", e.message ?? e);
+            throw e;
+        }
         // Enforced here (not via requireBearerAuth.requiredScopes) so the 401/403 WWW-Authenticate
         // header never advertises a `scope=` that clients would forward to Supabase's authorize endpoint.
         if (!info.scopes.includes("mcp.access")) {
@@ -1506,6 +1528,19 @@ export function buildServer(auth) {
         url: z.string().url().describe("Direct download URL from futurerp_list_files (firebase_url / web_content_link / etc.)"),
     }, async ({ url }) => {
         try {
+            // This runs on the server, not on your laptop: only fetch from the file hosts FuturERP actually uses
+            // (Firebase Storage, Google Drive/Docs, our Supabase project). Anything else is refused (SSRF guard).
+            const target = new URL(url);
+            const host = target.hostname.toLowerCase();
+            const allowed = target.protocol === "https:" &&
+                (host === "firebasestorage.googleapis.com" ||
+                    host === "storage.googleapis.com" ||
+                    host === "drive.google.com" ||
+                    host === "docs.google.com" ||
+                    host.endsWith(".googleusercontent.com") ||
+                    host === new URL(SUPABASE_URL).hostname.toLowerCase());
+            if (!allowed)
+                throw new Error(`Host not allowed: ${host} (only Firebase Storage / Google Drive / Supabase URLs)`);
             const res = await fetch(url);
             if (!res.ok) {
                 const text = await res.text().catch(() => "");
@@ -2705,8 +2740,8 @@ async function main() {
         const server = buildServer(auth);
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => {
-            transport.close();
-            server.close();
+            void transport.close().catch(() => { });
+            void server.close().catch(() => { });
         });
         try {
             await server.connect(transport);
