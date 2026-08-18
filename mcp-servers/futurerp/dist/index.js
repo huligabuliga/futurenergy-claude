@@ -2760,7 +2760,25 @@ async function main() {
         verifier: tokenVerifier,
         resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(MCP_PUBLIC_URL),
     });
-    app.post("/mcp", bearer, async (req, res) => {
+    // Discovery 401 (no Authorization header yet): advertise scope="email offline_access" so Claude
+    // requests exactly those and NOT `openid`. Supabase mints an OIDC ID token when `openid` is
+    // requested, which fails on this HS256 project ("HS256 is not supported for ID token signing")
+    // and takes the whole token response down with it — that was the claude.ai connect failure.
+    // offline_access still gets us a refresh token. (Fix the root cause later by moving the project's
+    // JWT signing key to ES256; then this scope pin can relax.)
+    const RESOURCE_METADATA_URL = getOAuthProtectedResourceMetadataUrl(MCP_PUBLIC_URL);
+    const discoveryChallenge = `Bearer error="invalid_token", error_description="Authentication required", ` +
+        `resource_metadata="${RESOURCE_METADATA_URL}", scope="email offline_access"`;
+    app.post("/mcp", (req, res, next) => {
+        if (!req.headers.authorization) {
+            res.status(401).set("WWW-Authenticate", discoveryChallenge).json({
+                error: "invalid_token",
+                error_description: "Authentication required",
+            });
+            return;
+        }
+        next();
+    }, bearer, async (req, res) => {
         const auth = req.auth;
         if (req.body?.method === "tools/call") {
             // Audit line (Railway logs): who called what.
