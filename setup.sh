@@ -8,7 +8,11 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 
 # MCP servers to install (directory name under mcp-servers/ in this repo)
-MCP_SERVERS=("salesforce-futurenergy" "futurerp")
+MCP_SERVERS=("salesforce-futurenergy")
+
+# FuturERP MCP is remote (Streamable HTTP + OAuth) — nothing to install locally.
+# Override with FUTURERP_MCP_URL=... if Jonas announces a different endpoint.
+FUTURERP_MCP_URL="${FUTURERP_MCP_URL:-https://mcp.futurenergy.mx/mcp}"
 
 # Skills to symlink (directory name under skills/ in this repo)
 SKILLS=("salesforce-futurenergy" "futurerp")
@@ -158,13 +162,6 @@ for mcp in "${MCP_SERVERS[@]}"; do
       salesforce-futurenergy)
         echo "  Ask Jonas for the SF_CLIENT_ID and SF_CLIENT_SECRET values."
         ;;
-      futurerp)
-        echo "  Get the Supabase key from:"
-        echo "    https://supabase.com/dashboard/project/rczhnuurvcxtkfussmfj/settings/api"
-        echo "  Either:"
-        echo "    - New secret key (recommended): Publishable and secret API keys → New secret key (sb_secret_*)"
-        echo "    - Legacy: Legacy anon, service_role API keys → service_role"
-        ;;
     esac
     echo ""
     needs_attention=1
@@ -186,7 +183,6 @@ fi
 echo "  Node.js: $NODE_PATH"
 
 SF_MCP_PATH="$CLAUDE_DIR/mcp-servers/salesforce-futurenergy/dist/index.js"
-ERP_MCP_PATH="$CLAUDE_DIR/mcp-servers/futurerp/dist/index.js"
 
 # Candidate config files. ~/.claude.json is Claude Code (cross-platform).
 # Claude Desktop's location is OS-specific — we only write there if its
@@ -217,12 +213,12 @@ if ! command -v python3 &>/dev/null; then
   echo "  ⚠ python3 not found — cannot safely merge MCP config."
   echo "  Manually add to mcpServers in your Claude config:"
   echo "    \"salesforce\": { \"command\": \"$NODE_PATH\", \"args\": [\"$SF_MCP_PATH\"] }"
-  echo "    \"futurerp\":   { \"command\": \"$NODE_PATH\", \"args\": [\"$ERP_MCP_PATH\"] }"
+  echo "    \"futurerp\":   { \"type\": \"http\", \"url\": \"$FUTURERP_MCP_URL\" }   (Claude Code only)"
 else
   for target in "${CONFIG_TARGETS[@]}"; do
-    python3 - "$target" "$NODE_PATH" "$SF_MCP_PATH" "$ERP_MCP_PATH" <<'PYEOF'
+    python3 - "$target" "$NODE_PATH" "$SF_MCP_PATH" "$FUTURERP_MCP_URL" <<'PYEOF'
 import json, os, sys
-config_path, node_path, sf_path, erp_path = sys.argv[1:5]
+config_path, node_path, sf_path, erp_url = sys.argv[1:5]
 config = {}
 if os.path.exists(config_path):
     try:
@@ -240,7 +236,13 @@ def entry(path):
     return e
 config.setdefault('mcpServers', {})
 config['mcpServers']['salesforce'] = entry(sf_path)
-config['mcpServers']['futurerp']   = entry(erp_path)
+if is_claude_code:
+    # Remote FuturERP MCP: OAuth login happens on first use (/mcp → Authenticate).
+    config['mcpServers']['futurerp'] = {'type': 'http', 'url': erp_url}
+else:
+    # Claude Desktop config has no HTTP entries — add FuturERP as a custom connector instead
+    # (Settings → Connectors → Add custom connector → URL). Drop any stale stdio entry.
+    config['mcpServers'].pop('futurerp', None)
 # Atomic write — preserve everything else in the file.
 os.makedirs(os.path.dirname(config_path) or '.', exist_ok=True)
 tmp = config_path + '.tmp'
@@ -261,12 +263,16 @@ echo "Next steps:"
 if [ "$needs_attention" -eq 1 ]; then
   echo "  1. Edit the .env files above with real credentials"
   echo "  2. Restart Claude Desktop (or reconnect MCPs in Claude Code)"
-  echo "  3. Test:"
+  echo "  3. FuturERP (remote): in Claude Code run /mcp → futurerp → Authenticate (log in with your FuturERP account)."
+  echo "     Claude Desktop / claude.ai: Settings → Connectors → Add custom connector → $FUTURERP_MCP_URL"
+  echo "  4. Test:"
   echo "     Salesforce → 'Dame los KPIs de este mes'"
   echo "     FuturERP   → '¿Cuántos tickets abiertos hay por área?'"
 else
   echo "  1. Restart Claude Desktop (or reconnect MCPs in Claude Code)"
-  echo "  2. Test:"
+  echo "  2. FuturERP (remote): in Claude Code run /mcp → futurerp → Authenticate (log in with your FuturERP account)."
+  echo "     Claude Desktop / claude.ai: Settings → Connectors → Add custom connector → $FUTURERP_MCP_URL"
+  echo "  3. Test:"
   echo "     Salesforce → 'Dame los KPIs de este mes'"
   echo "     FuturERP   → '¿Cuántos tickets abiertos hay por área?'"
 fi

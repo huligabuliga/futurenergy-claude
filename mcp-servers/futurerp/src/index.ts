@@ -1,23 +1,33 @@
 #!/usr/bin/env node
 
 /**
- * FuturERP MCP Server v1.1
+ * FuturERP MCP Server v2 — remote Streamable HTTP + OAuth.
  *
  * Read-only MCP for Future Energy's internal ERP (pronto-resolver-61 on Supabase).
- * Connects directly via PostgREST + Supabase RPCs using either a new-style secret key
- * (sb_secret_*) or a legacy service_role JWT. Both bypass RLS — full org read.
+ * Data reads go through PostgREST with the secret key (bypass RLS — full org read,
+ * unchanged from v1). Callers authenticate with a Supabase Auth OAuth 2.1 access token
+ * (users log in with their FuturERP account); tool visibility is gated per user via the
+ * app's RBAC (`has_crm_permission`): `mcp.access` (everything) + `mcp.whatsapp` (WhatsApp tools).
  *
  * Env vars:
  *   SUPABASE_URL                — https://<project>.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY   — sb_secret_* (preferred) OR legacy service_role JWT
+ *   SUPABASE_SERVICE_ROLE_KEY   — sb_secret_* (preferred) OR legacy service_role JWT (data reads)
+ *   SUPABASE_PUBLISHABLE_KEY    — sb_publishable_* / anon key (only used to validate user tokens)
+ *   MCP_PUBLIC_URL              — public URL of this endpoint, e.g. https://mcp.futurenergy.mx/mcp
+ *   PORT                        — listen port (default 3000)
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { resolve, dirname, join } from "path";
-import { homedir } from "os";
+import { readFileSync } from "fs";
+import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
@@ -66,6 +76,10 @@ const SUPABASE_URL = (process.env.SUPABASE_URL ?? "").replace(/\/+$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 
 const REST_BASE = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : "";
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.SUPABASE_ANON_KEY ?? "";
+const PORT = Number(process.env.PORT ?? 3000);
+const MCP_PUBLIC_URL = new URL(process.env.MCP_PUBLIC_URL ?? `http://localhost:${PORT}/mcp`);
+const VERSION = "2.0.0";
 
 // OpenAPI describe cache: schema doc TTL 2h (mirrors salesforce describe cache)
 let openApiCache: { data: any; fetchedAt: number } | null = null;
@@ -294,11 +308,81 @@ function periodToRange(period: string): { gte?: string; lte?: string; label: str
   }
 }
 
-// ── Server ────────────────────────────────────────────────
+// ── Auth: Supabase user token → AuthInfo with MCP scopes ─────
+//
+// The bearer token is a Supabase Auth JWT (issued by the OAuth 2.1 server after the user
+// logs in to FuturERP). We validate it by asking Supabase (`/auth/v1/user`) — works with
+// HS256 today and asymmetric keys later — then map the user to MCP scopes via the app's
+// `has_crm_permission` RPC. Cached 60 s per token.
 
+const MCP_SCOPES = ["mcp.access", "mcp.whatsapp"] as const;
+const authCache = new Map<string, { info: AuthInfo; until: number }>();
+
+async function hasCrmPermission(userId: string, key: string): Promise<boolean> {
+  const res = await fetch(`${REST_BASE}/rpc/has_crm_permission`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ _user_id: userId, _permission: key }),
+  });
+  if (!res.ok) throw new Error(`has_crm_permission ${res.status}: ${await res.text()}`);
+  return (await res.json()) === true;
+}
+
+async function resolveAuthInfo(token: string): Promise<AuthInfo> {
+  const now = Date.now();
+  const hit = authCache.get(token);
+  if (hit && hit.until > now) return hit.info;
+
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new InvalidTokenError("Token inválido o expirado");
+  const user: { id: string; email?: string } = await res.json();
+
+  let claims: any = {};
+  try {
+    claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+  } catch {}
+
+  const scopes: string[] = [];
+  for (const key of MCP_SCOPES) if (await hasCrmPermission(user.id, key)) scopes.push(key);
+
+  const info: AuthInfo = {
+    token,
+    clientId: claims.client_id ?? "session",
+    scopes,
+    expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
+    extra: { userId: user.id, email: user.email ?? "" },
+  };
+  if (authCache.size > 500) authCache.clear();
+  authCache.set(token, { info, until: now + 60_000 });
+  return info;
+}
+
+const tokenVerifier: OAuthTokenVerifier = {
+  async verifyAccessToken(token) {
+    const info = await resolveAuthInfo(token);
+    // Enforced here (not via requireBearerAuth.requiredScopes) so the 401/403 WWW-Authenticate
+    // header never advertises a `scope=` that clients would forward to Supabase's authorize endpoint.
+    if (!info.scopes.includes("mcp.access")) {
+      throw new InsufficientScopeError("Sin acceso al MCP de FuturERP (falta el permiso mcp.access)");
+    }
+    return info;
+  },
+};
+
+// ── Server factory ────────────────────────────────────────
+//
+// One McpServer per request (stateless Streamable HTTP). Tools are registered per caller:
+// everything below requires `mcp.access` (already enforced by the middleware); the WhatsApp
+// block is registered only when the caller also holds `mcp.whatsapp`.
+// (Body intentionally not re-indented — it is the v1 tool code, moved inside the factory.)
+
+export function buildServer(auth: AuthInfo): McpServer {
+const can = (scope: (typeof MCP_SCOPES)[number]) => auth.scopes.includes(scope);
 const server = new McpServer({
   name: "futurerp",
-  version: "1.3.0",
+  version: VERSION,
 });
 
 // ────────────────────────────────────────────────────────────
@@ -1684,13 +1768,11 @@ server.tool(
 
 server.tool(
   "futurerp_download_file",
-  "Download a file by its public URL (Firebase Storage public URL or Google Drive web_content_link) and save it locally. Mirrors salesforce_download_file. Returns the local file path.",
+  "Fetch a file by its public URL (Firebase Storage public URL or Google Drive web_content_link) and return its metadata (content type, size). For text-like files (text/*, JSON, XML) up to 200 KB the content is returned inline; for anything else use the returned URL directly (this server is remote and cannot write to your disk).",
   {
     url: z.string().url().describe("Direct download URL from futurerp_list_files (firebase_url / web_content_link / etc.)"),
-    save_dir: z.string().optional().describe("Directory to save to. Defaults to ~/Downloads/futurerp"),
-    filename: z.string().optional().describe("Override the filename (otherwise inferred from URL)"),
   },
-  async ({ url, save_dir, filename }) => {
+  async ({ url }) => {
     try {
       const res = await fetch(url);
       if (!res.ok) {
@@ -1698,39 +1780,24 @@ server.tool(
         throw new Error(`Download ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
       }
       const buf = Buffer.from(await res.arrayBuffer());
-
-      // Infer filename: use override, then last path segment, fall back to timestamp.
-      // Firebase URLs encode `/` as %2F in the path, so the last decoded segment can
-      // contain real slashes — split again after decoding and keep only the basename.
-      let name = filename;
-      if (!name) {
-        try {
-          const u = new URL(url);
-          const last = u.pathname.split("/").pop() ?? "";
-          const decoded = decodeURIComponent(last.split("?")[0]);
-          const basename = decoded.split("/").pop() ?? "";
-          // Strip path-illegal chars (cross-platform safety, esp. Windows).
-          name = basename.replace(/[<>:"|?*\\]/g, "_").trim() || `file-${Date.now()}`;
-        } catch {
-          name = `file-${Date.now()}`;
-        }
-      }
-
-      const targetDir = save_dir ?? join(homedir(), "Downloads", "futurerp");
-      mkdirSync(targetDir, { recursive: true });
-      const filePath = join(targetDir, name);
-      writeFileSync(filePath, buf);
-
+      const mime = res.headers.get("content-type") ?? "application/octet-stream";
+      const textLike = /^(text\/|application\/(json|xml|x-yaml|yaml))/i.test(mime);
       const sizeKB = (buf.length / 1024).toFixed(1);
-      const mime = res.headers.get("content-type") ?? "?";
-      return {
-        content: [
-          {
-            type: "text",
-            text: `## File Downloaded\n\n- **File:** ${name}\n- **Size:** ${sizeKB} KB\n- **MIME:** ${mime}\n- **Saved to:** \`${filePath}\``,
-          },
-        ],
-      };
+      const lines = [
+        `## File`,
+        ``,
+        `- **URL:** ${url}`,
+        `- **Size:** ${sizeKB} KB`,
+        `- **MIME:** ${mime}`,
+      ];
+      if (textLike && buf.length <= 200 * 1024) {
+        lines.push(``, "```", buf.toString("utf8"), "```");
+      } else if (textLike) {
+        lines.push(``, `_Text file larger than 200 KB — open the URL directly._`);
+      } else {
+        lines.push(``, `_Binary file — open the URL directly (Claude can't receive the bytes through this tool)._`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Download failed: ${e.message}` }], isError: true };
     }
@@ -2315,6 +2382,8 @@ const clip = (v: any, n = 60) => {
   const s = String(v ?? "").replace(/\s+/g, " ").trim();
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 };
+
+if (can("mcp.whatsapp")) {
 
 server.tool(
   "futurerp_whatsapp_chats",
@@ -2952,6 +3021,8 @@ server.tool(
   }
 );
 
+} // end if can("mcp.whatsapp")
+
 // ────────────────────────────────────────────────────────────
 // MCP PROMPTS
 // ────────────────────────────────────────────────────────────
@@ -3031,7 +3102,7 @@ server.prompt(
   })
 );
 
-server.prompt(
+if (can("mcp.whatsapp")) server.prompt(
   "sales_followup_review",
   "Review the sales team's WhatsApp follow-ups: find unanswered clients and cold leads, then rate the worst conversations.",
   { vendedor: z.string().optional().describe("Limit the review to one vendor (name substring)") },
@@ -3074,13 +3145,76 @@ server.prompt(
   })
 );
 
-// ── Start ──────────────────────────────────────────────────
+return server;
+} // end buildServer
+
+// ── HTTP entrypoint ───────────────────────────────────────
 
 async function main() {
-  const mode = hasCredentials() ? "DIRECT to Supabase" : "NO CREDENTIALS";
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(`FuturERP MCP v1.4 (${mode})`);
+  requireCredentials();
+  if (!SUPABASE_PUBLISHABLE_KEY) {
+    throw new Error("Set SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) — needed to validate user tokens.");
+  }
+
+  const app = express();
+  app.use(express.json({ limit: "4mb" }));
+  app.get("/healthz", (_req, res) => {
+    res.json({ ok: true, version: VERSION });
+  });
+
+  // RFC 9728 protected-resource metadata → points clients at Supabase Auth (the OAuth 2.1 AS).
+  if (process.env.MCP_SKIP_AS_METADATA === "1") {
+    console.error("WARNING: MCP_SKIP_AS_METADATA=1 — OAuth discovery metadata not served (smoke-test only)");
+  } else {
+    const metaUrl = `${SUPABASE_URL}/.well-known/oauth-authorization-server/auth/v1`;
+    const r = await fetch(metaUrl).catch((e) => ({ ok: false, status: String(e) } as any));
+    if (!r.ok) {
+      console.error(
+        `Cannot load OAuth metadata from ${metaUrl} (${r.status}). Supabase OAuth server disabled? Enable it under Authentication → OAuth Server.`
+      );
+      process.exit(1);
+    }
+    const oauthMetadata = await r.json();
+    app.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl: MCP_PUBLIC_URL, resourceName: "FuturERP" }));
+  }
+
+  const bearer = requireBearerAuth({
+    verifier: tokenVerifier,
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(MCP_PUBLIC_URL),
+  });
+
+  app.post("/mcp", bearer, async (req, res) => {
+    const auth = req.auth!;
+    if (req.body?.method === "tools/call") {
+      // Audit line (Railway logs): who called what.
+      console.log(JSON.stringify({ t: new Date().toISOString(), email: auth.extra?.email, tool: req.body.params?.name }));
+    }
+    const server = buildServer(auth);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (e) {
+      console.error("MCP request error:", e);
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+      }
+    }
+  });
+
+  const notAllowed = (_req: express.Request, res: express.Response) => {
+    res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+  };
+  app.get("/mcp", notAllowed);
+  app.delete("/mcp", notAllowed);
+
+  app.listen(PORT, () => {
+    console.error(`FuturERP MCP v${VERSION} listening on :${PORT} — public ${MCP_PUBLIC_URL.href}`);
+  });
 }
 
 main().catch((e) => {

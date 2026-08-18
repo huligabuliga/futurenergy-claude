@@ -8,7 +8,7 @@ Claude dotfiles for Future Energy. Contains MCP servers, skills, and an install 
 futurenergy-claude/
 ├── mcp-servers/
 │   ├── salesforce-futurenergy/   # Salesforce MCP (17 tools, KPIs, queries, documents)
-│   └── futurerp/                 # FuturERP MCP (17 tools, tickets/leads/instalaciones KPIs)
+│   └── futurerp/                 # FuturERP MCP (remote HTTP + OAuth; 30 tools — tickets/leads/instalaciones/WhatsApp)
 ├── skills/
 │   ├── salesforce-futurenergy/   # Salesforce org knowledge
 │   └── futurerp/                 # Pronto Resolver (internal ERP) knowledge
@@ -75,16 +75,22 @@ cd futurenergy-claude
 
 ### After setup
 
-Edit the `.env` files with the credentials Jonas sent you:
+Edit the Salesforce `.env` with the credentials Jonas sent you:
 
 ```bash
 nano mcp-servers/salesforce-futurenergy/.env   # SF_CLIENT_ID, SF_CLIENT_SECRET
-nano mcp-servers/futurerp/.env                  # SUPABASE_SERVICE_ROLE_KEY (or new sb_secret_*)
 ```
 
-> FuturERP accepts either a **new-style Supabase secret key** (`sb_secret_...`, recommended — create in Dashboard → Project Settings → API Keys → New secret key) or a **legacy `service_role` JWT**. Both bypass RLS and give the MCP full read access.
-
 Then **quit and reopen Claude Desktop** for the MCP servers to connect.
+
+### FuturERP MCP (remote — no install, no keys)
+
+FuturERP runs as a hosted MCP server. You log in with your **FuturERP account** (same as tickets.futurenergy.mx); what you can see follows your role there.
+
+- **Claude Code**: `setup.sh` already registers it. Run `/mcp` → `futurerp` → **Authenticate** → your browser opens FuturERP → **Autorizar**. (Manual: `claude mcp add --transport http futurerp https://mcp.futurenergy.mx/mcp`.)
+- **Claude Desktop / claude.ai / mobile**: Settings → Connectors → **Add custom connector** → URL `https://mcp.futurenergy.mx/mcp` → Connect → log in.
+
+The exact URL is announced by Jonas; nothing else to configure. Access is granted per user in FuturERP → Admin → Permisos (`MCP / Claude`).
 
 Test it by asking Claude:
 - Salesforce: **"Dame los KPIs de este mes"**
@@ -131,7 +137,7 @@ Future Energy's customer-facing CRM (Opportunities, Accounts, Leads, Documento__
 
 ## FuturERP MCP Tools
 
-Future Energy's internal operations platform — **pronto-resolver-61** on Supabase: tickets, leads (pronto-side), instalaciones, drones, cantina, reports, dashboards, financial milestones, notifications. Read-only — bypasses RLS via the service role key.
+Future Energy's internal operations platform — **pronto-resolver-61** on Supabase: tickets, leads (pronto-side), instalaciones, drones, cantina, reports, dashboards, financial milestones, notifications, WhatsApp. Read-only. Remote server (Streamable HTTP) with OAuth: you sign in with your FuturERP account; tools are visible per role — `mcp.access` (everything below) + `mcp.whatsapp` (the WhatsApp tools).
 
 ### Schema & Metadata
 - **futurerp_describe_table** — Live column list for any table (types, nullability, defaults, FK refs)
@@ -164,7 +170,7 @@ Future Energy's internal operations platform — **pronto-resolver-61** on Supab
 
 ### Files & documents
 - **futurerp_list_files** — List files for any entity (project/lead/instalacion/visita/inventory_movement/announcement/cantina) with public download URLs
-- **futurerp_download_file** — Download a file by URL and save locally (mirrors salesforce_download_file)
+- **futurerp_download_file** — Fetch a file by URL: metadata + inline text for small text/JSON files (remote server — binaries via the URL)
 
 ### Financials
 - **futurerp_get_project_financials** — Rolled-up P&L: budget vs expenses (approved/paid/pending), scheduled vs received payments, gross margin + status
@@ -172,6 +178,13 @@ Future Energy's internal operations platform — **pronto-resolver-61** on Supab
 ### Named RPC wrappers
 - **futurerp_sales_ranking** — Wraps `get_sales_ranking` RPC — vendor leaderboard
 - **futurerp_marketing_stats** — Wraps `get_marketing_lead_stats` RPC — lead source attribution
+
+### WhatsApp (requires `mcp.whatsapp`)
+- **futurerp_whatsapp_chats** — Bot conversations overview (pending contacts + leads with bot activity)
+- **futurerp_whatsapp_conversation** — Full thread for one contact (by lead_id / respond_contact_id / phone)
+- **futurerp_whatsapp_stats** — In/out message stats by channel/day + funnel
+- **futurerp_whatsapp_health** — Bot error log + webhook failures + stuck inbound buffer
+- **futurerp_whatsapp_seguimientos** — Sales inbox (OpenWA) follow-up audit: unanswered clients, cold leads, per-vendor stats
 
 ### Reference
 - **futurerp_field_mappings** — Lead/ticket enums, notification types, RPC catalog, SLA rules, key fields, Pronto↔Salesforce crosswalk
