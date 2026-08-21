@@ -32,6 +32,7 @@ import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
+import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
@@ -1823,7 +1824,7 @@ server.tool(
 
 server.tool(
   "futurerp_download_file",
-  "Fetch a file by its public URL (Firebase Storage public URL or Google Drive web_content_link) and return its metadata (content type, size). For text-like files (text/*, JSON, XML) up to 200 KB the content is returned inline; for anything else use the returned URL directly (this server is remote and cannot write to your disk).",
+  "Fetch a file by its public URL (Firebase Storage public URL or Google Drive web_content_link) and return its contents. Images (jpeg/png/gif/webp) and PDFs up to 3.5 MB come back inline so you can actually look at them; text/JSON/XML up to 200 KB comes back as text; anything bigger or of another type returns metadata + the URL.",
   {
     url: z.string().url().describe("Direct download URL from futurerp_list_files (firebase_url / web_content_link / etc.)"),
   },
@@ -1848,7 +1849,7 @@ server.tool(
         throw new Error(`Download ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
       }
       const buf = Buffer.from(await res.arrayBuffer());
-      const mime = res.headers.get("content-type") ?? "application/octet-stream";
+      const mime = sniffMime(buf, (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase());
       const textLike = /^(text\/|application\/(json|xml|x-yaml|yaml))/i.test(mime);
       const sizeKB = (buf.length / 1024).toFixed(1);
       const lines = [
@@ -1858,14 +1859,32 @@ server.tool(
         `- **Size:** ${sizeKB} KB`,
         `- **MIME:** ${mime}`,
       ];
+      const header = () => ({ type: "text" as const, text: lines.join("\n") });
+
       if (textLike && buf.length <= 200 * 1024) {
         lines.push(``, "```", buf.toString("utf8"), "```");
-      } else if (textLike) {
-        lines.push(``, `_Text file larger than 200 KB — open the URL directly._`);
-      } else {
-        lines.push(``, `_Binary file — open the URL directly (Claude can't receive the bytes through this tool)._`);
+        return { content: [header()] };
       }
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      if (buf.length <= MAX_INLINE_BYTES && INLINE_IMAGE_MIMES.has(mime)) {
+        return {
+          content: [header(), { type: "image" as const, data: buf.toString("base64"), mimeType: mime }],
+        };
+      }
+      if (buf.length <= MAX_INLINE_BYTES && mime === "application/pdf") {
+        return {
+          content: [
+            header(),
+            { type: "resource" as const, resource: { uri: url, mimeType: mime, blob: buf.toString("base64") } },
+          ],
+        };
+      }
+      lines.push(
+        ``,
+        buf.length > MAX_INLINE_BYTES
+          ? `_Too large to inline (>${(MAX_INLINE_BYTES / 1024 / 1024).toFixed(1)} MB) — open the URL directly._`
+          : `_Can't be inlined (${mime}) — open the URL directly._`
+      );
+      return { content: [header()] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Download failed: ${e.message}` }], isError: true };
     }
