@@ -519,7 +519,7 @@ server.tool(
 
 server.tool(
   "futurerp_list_tables",
-  "List FuturERP tables, filter by keyword or category. Annotates each table with its domain category (lead, ticket, instalacion, drone, cantina, finance, report, user, notification, integration, system, junction) and one-line purpose.",
+  "List FuturERP tables, filter by keyword or category. Annotates each table with its domain category (lead, ticket, instalacion, drone, cantina, finance, report, user, notification, integration, rrhh, system, junction) and one-line purpose.",
   {
     filter: z.string().optional().describe("Keyword to filter on name or purpose (e.g. 'lead', 'drone', 'pago')"),
     category: z
@@ -537,6 +537,7 @@ server.tool(
         "notification",
         "integration",
         "whatsapp",
+        "rrhh",
         "system",
         "junction",
       ])
