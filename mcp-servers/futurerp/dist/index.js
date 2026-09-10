@@ -449,7 +449,7 @@ export function buildServer(auth) {
             return { content: [{ type: "text", text: `Describe failed: ${e.message}` }], isError: true };
         }
     });
-    server.tool("futurerp_list_tables", "List FuturERP tables, filter by keyword or category. Annotates each table with its domain category (lead, ticket, instalacion, drone, cantina, finance, report, user, notification, integration, system, junction) and one-line purpose.", {
+    server.tool("futurerp_list_tables", "List FuturERP tables, filter by keyword or category. Annotates each table with its domain category (lead, ticket, instalacion, drone, cantina, finance, report, user, notification, integration, rrhh, system, junction) and one-line purpose.", {
         filter: z.string().optional().describe("Keyword to filter on name or purpose (e.g. 'lead', 'drone', 'pago')"),
         category: z
             .enum([
@@ -466,6 +466,7 @@ export function buildServer(auth) {
             "notification",
             "integration",
             "whatsapp",
+            "rrhh",
             "system",
             "junction",
         ])

@@ -127,6 +127,12 @@ export const PRONTO_TABLES = [
     { name: "whatsapp_processed_messages", category: "whatsapp", purpose: "Webhook idempotency ledger (message_id PK). Pruned after 7 days." },
     { name: "whatsapp_processing_locks", category: "whatsapp", purpose: "Per-contact turn serialization locks (table-based, TTL via locked_until)." },
     { name: "bot_error_log", category: "whatsapp", purpose: "Bot pipeline error sink: fase (drain|captura|inbound|followup|outbound) × tipo, detalle, contact_key. 30-day retention." },
+    // RRHH (HR) — asistencia / entradas y salidas / nomina
+    { name: "rrhh_checador_checadas", category: "rrhh", purpose: "Asistencia: raw ZKTeco time-clock punches (checadas). Entrada y salida of a day = min/max checada_at per pin per date -- there is NO entrada/salida flag column. Join rrhh_checador_pins to name the person." },
+    { name: "rrhh_checador_pins", category: "rrhh", purpose: "Asistencia: time-clock identity map PIN -> display_name -> user_id (NULL for staff with no ERP account, e.g. limpieza/instaladores)." },
+    { name: "rrhh_checador_uploads", category: "rrhh", purpose: "Asistencia: log of ZKTeco backup files (backupdata.dat) uploaded by RH from /rh/asistencia." },
+    { name: "rrhh_empleados", category: "rrhh", purpose: "Expediente del empleado: fecha_ingreso, fecha_nacimiento, puesto, tipo_contrato, documentos (jsonb)." },
+    { name: "rrhh_incidencias_nomina", category: "rrhh", purpose: "Incidencias de nomina per empleado (vacaciones, permisos, faltas, horas extra) by periodo/fechas." },
     // System
     { name: "system_config", category: "system", purpose: "Global config key-value store." },
     { name: "short_links", category: "system", purpose: "Short link redirects." },
