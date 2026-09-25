@@ -112,6 +112,8 @@ export const PRONTO_TABLES: ProntoTable[] = [
   { name: "installation_visits", category: "instalacion", purpose: "Installation visit log (multi-day jobs)." },
   { name: "gps_override_requests", category: "instalacion", purpose: "Installer requests to override GPS-based check-in location." },
   { name: "visitas_tecnicas", category: "instalacion", purpose: "Technical site survey visits (pre-installation)." },
+  { name: "cuadrillas", category: "instalacion", purpose: "Cuadrillas (crews, equipos de instaladores, Heliosun, proveedores externos): nombre, tipo, zona, color, activa. Every cuadrilla_id / cuadrilla_destino_id column is an FK to cuadrillas.id — join here for the crew name." },
+  { name: "cuadrilla_stock", category: "finance", purpose: "Inventario por cuadrilla: stock balance per crew and catalog item (the crew tier). Crew name in cuadrillas.nombre." },
   { name: "visita_tecnica_photos", category: "junction", purpose: "Photos attached to a visita tecnica." },
 
   // Drone inventory
@@ -545,6 +547,14 @@ export const KEY_FIELDS: Record<string, Record<string, string>> = {
     fecha_creacion: "Creation timestamp.",
     canal: "ticket_channel enum — origin of the request.",
   },
+  cuadrillas: {
+    nombre: "Crew display name.",
+    tipo: "instalacion | servicios_adicionales | mantenimiento (CHECK constraint), or null.",
+    zona: "Free text, e.g. Monterrey, Playa del Carmen.",
+    is_active: "Inactive crews stay for history; filter is_active=eq.true for current crews.",
+    genera_servicios_recurrentes: "The one crew that receives the first limpieza/mantenimiento when an instalación is completed.",
+    installer_synced_at: "Last time installer-nest (mobile app backend) confirmed the row. Members live there, not here.",
+  },
   leads: {
     status: "LeadStatus string enum (nuevo, asignado, primer_contacto, seguimiento, visita_en_sitio, negociacion, calificado, descalificado).",
     lead_qualification: "System-computed: Good/Warm/Cold/HOT/Bad Lead.",
@@ -558,7 +568,7 @@ export const KEY_FIELDS: Record<string, Record<string, string>> = {
   },
   instalaciones: {
     efu: "Project EFU code (e.g. EFU-00514-1) — human-readable identifier. There is NO `folio` column on this table.",
-    cuadrilla_id: "FK to the installing team.",
+    cuadrilla_id: "FK to cuadrillas.id (the installing crew; name in cuadrillas.nombre). PostgREST embed: select=*,cuadrilla:cuadrillas(nombre).",
     assigned_to: "uuid[] of profile ids — installers (crew members) assigned to this job.",
     status: "Installation state (asignada/pendiente/en_proceso/completada/cancelada — text column, NOT a PG enum, and NOT named `estado`).",
     nombre_cliente: "Denormalized client display name (for fast list rendering).",

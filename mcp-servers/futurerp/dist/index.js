@@ -100,6 +100,24 @@ async function sbCount(table, qs = "") {
     const total = parseInt(range.split("/").pop() ?? "0", 10);
     return Number.isFinite(total) ? total : 0;
 }
+/**
+ * Crew names from public.cuadrillas (the ERP's record of each crew; every
+ * cuadrilla_id column has an FK to it). Tolerant on purpose: an empty map on any
+ * failure, so callers fall back to the raw id instead of failing the whole tool.
+ */
+async function cuadrillaNames(ids) {
+    const wanted = ids?.filter((id) => UUID_RX.test(id));
+    if (ids && (!wanted || wanted.length === 0))
+        return new Map();
+    const filter = wanted ? `id=in.(${wanted.join(",")})&` : "";
+    const rows = await sbApi(`/cuadrillas?${filter}select=id,nombre&limit=1000`).catch(() => []);
+    return new Map((Array.isArray(rows) ? rows : []).map((r) => [r.id, r.nombre]));
+}
+function cuadrillaLabel(id, names) {
+    if (!id)
+        return "(sin asignar)";
+    return `${names.get(id) ?? "(sin nombre)"} (\`${id.slice(0, 8)}\`)`;
+}
 /** POST to `/rest/v1/rpc/<name>`. Returns the RPC's return value (rows or scalar). */
 async function sbRpc(name, args = {}) {
     const url = `${REST_BASE}/rpc/${name}`;
@@ -1045,7 +1063,7 @@ export function buildServer(auth) {
             return { content: [{ type: "text", text: `Ticket KPIs failed: ${e.message}` }], isError: true };
         }
     });
-    server.tool("futurerp_instalacion_kpis", "Field installation KPIs: status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts.", {
+    server.tool("futurerp_instalacion_kpis", "Field installation KPIs: status breakdown (asignada/pendiente/en_proceso/completada/cancelada), completion rate, total jobs in period, panels installed, and per-cuadrilla counts (by crew name, from the cuadrillas table).", {
         period: z
             .enum(["this_month", "last_month", "this_quarter", "last_quarter", "this_year", "last_year", "all_time"])
             .optional()
@@ -1086,10 +1104,12 @@ export function buildServer(auth) {
                 .sort((a, b) => b[1] - a[1])
                 .map(([k, v]) => `| ${k} | ${v} | ${((v / total) * 100).toFixed(1)}% |`)
                 .join("\n");
-            const cuadrillaRows = Object.entries(byCuadrilla)
+            const topCuadrillas = Object.entries(byCuadrilla)
                 .sort((a, b) => b[1].total - a[1].total)
-                .slice(0, 15)
-                .map(([k, s]) => `| ${k.slice(0, 8)} | ${s.total} | ${s.completed} | ${s.total > 0 ? ((s.completed / s.total) * 100).toFixed(1) : "0.0"}% | ${s.panels} |`)
+                .slice(0, 15);
+            const names = await cuadrillaNames(topCuadrillas.map(([k]) => k));
+            const cuadrillaRows = topCuadrillas
+                .map(([k, s]) => `| ${names.get(k) ?? (UUID_RX.test(k) ? "(sin nombre)" : k)} | ${UUID_RX.test(k) ? k : "—"} | ${s.total} | ${s.completed} | ${s.total > 0 ? ((s.completed / s.total) * 100).toFixed(1) : "0.0"}% | ${s.panels} |`)
                 .join("\n");
             return {
                 content: [
@@ -1114,8 +1134,8 @@ export function buildServer(auth) {
                             "",
                             `## By cuadrilla (top 15)`,
                             "",
-                            `| Cuadrilla | Total | Completed | Rate | Panels |`,
-                            `|-----------|-------|-----------|------|--------|`,
+                            `| Cuadrilla | Id | Total | Completed | Rate | Panels |`,
+                            `|-----------|----|-------|-----------|------|--------|`,
                             cuadrillaRows || "*No cuadrilla assignments.*",
                             "",
                             total === 5000
@@ -1690,7 +1710,7 @@ export function buildServer(auth) {
                 sbApi(`/project_files?project_id=eq.${encodeURIComponent(p.id)}&select=id,file_name,mime_type,file_size,firebase_url,uploaded_by,created_at&order=created_at.desc&limit=50`).catch(() => []),
                 sbApi(`/project_tramites?project_id=eq.${encodeURIComponent(p.id)}&select=*&order=created_at.desc&limit=50`).catch(() => []),
                 sbApi(`/project_scheduled_payments?project_id=eq.${encodeURIComponent(p.id)}&select=*&order=fecha_comprometida.asc&limit=50`).catch(() => []),
-                sbApi(`/instalaciones?project_id=eq.${encodeURIComponent(p.id)}&select=id,folio,estado,fecha_instalacion,cuadrilla_id,numero_paneles&order=fecha_instalacion.desc&limit=20`).catch(() => []),
+                sbApi(`/instalaciones?project_id=eq.${encodeURIComponent(p.id)}&select=id,efu,tipo_servicio,status,fecha_instalacion,cuadrilla_id,numero_paneles&order=fecha_instalacion.desc&limit=20`).catch(() => []),
                 sbApi(`/project_expenses?project_id=eq.${encodeURIComponent(p.id)}&select=id,category,amount_total,status,approved_at,paid_at,created_at&order=created_at.desc&limit=50`).catch(() => []),
                 p.client_id
                     ? sbApi(`/clients?id=eq.${encodeURIComponent(p.client_id)}&select=*&limit=1`).catch(() => [])
@@ -1700,7 +1720,12 @@ export function buildServer(auth) {
             const fileRows = Array.isArray(files) ? files : [];
             const tramiteRows = Array.isArray(tramites) ? tramites : [];
             const paymentRows = Array.isArray(payments) ? payments : [];
-            const instRows = Array.isArray(instalaciones) ? instalaciones : [];
+            const instRowsRaw = Array.isArray(instalaciones) ? instalaciones : [];
+            const instCrewNames = await cuadrillaNames([...new Set(instRowsRaw.map((r) => r.cuadrilla_id).filter(Boolean))]);
+            const instRows = instRowsRaw.map((r) => ({
+                ...r,
+                cuadrilla: r.cuadrilla_id ? instCrewNames.get(r.cuadrilla_id) ?? null : null,
+            }));
             const expRows = Array.isArray(expenses) ? expenses : [];
             return {
                 content: [
@@ -1771,7 +1796,7 @@ export function buildServer(auth) {
                 };
             }
             const inst = rows[0];
-            const [fotos, lineItems, reports, visits, crew] = await Promise.all([
+            const [fotos, lineItems, reports, visits, crew, crewNames] = await Promise.all([
                 sbApi(`/instalacion_fotos?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=id,url,file_name,category,subcategory,ai_validation_status,created_at&order=created_at.desc&limit=100`).catch(() => []),
                 sbApi(`/instalacion_line_items?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&limit=100`).catch(() => []),
                 sbApi(`/installation_reports?instalacion_id=eq.${encodeURIComponent(inst.id)}&select=*&order=created_at.desc&limit=20`).catch(() => []),
@@ -1779,6 +1804,7 @@ export function buildServer(auth) {
                 Array.isArray(inst.assigned_to) && inst.assigned_to.length > 0
                     ? sbApi(`/profiles?user_id=in.(${inst.assigned_to.map((u) => encodeURIComponent(u)).join(",")})&select=user_id,first_name,last_name,email,department`).catch(() => [])
                     : Promise.resolve([]),
+                cuadrillaNames(inst.cuadrilla_id ? [inst.cuadrilla_id] : []),
             ]);
             const crewRows = Array.isArray(crew) ? crew : [];
             const crewWithNames = crewRows.map((p) => ({
@@ -1791,7 +1817,7 @@ export function buildServer(auth) {
                         type: "text",
                         text: [
                             `# Instalacion ${inst.efu ?? inst.id}  (\`${inst.id}\`)`,
-                            `**Status:** ${inst.status ?? "—"}  •  **Fecha:** ${inst.fecha_instalacion ?? "—"}  •  **Paneles:** ${inst.numero_paneles ?? "?"}  •  **Cuadrilla:** ${inst.cuadrilla_id ?? "(sin asignar)"}`,
+                            `**Status:** ${inst.status ?? "—"}  •  **Fecha:** ${inst.fecha_instalacion ?? "—"}  •  **Paneles:** ${inst.numero_paneles ?? "?"}  •  **Cuadrilla:** ${cuadrillaLabel(inst.cuadrilla_id, crewNames)}`,
                             `**Cliente:** ${inst.nombre_cliente ?? "—"}  •  **Check-in:** ${inst.check_in_time ?? "(no)"}  •  **Check-out:** ${inst.check_out_time ?? "(no)"}`,
                             "",
                             `## Cuadrilla / installers (${crewWithNames.length})`,
