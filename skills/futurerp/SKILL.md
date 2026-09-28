@@ -55,7 +55,7 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 |---|---|
 | `futurerp_lead_kpis` | Pipeline KPIs (org-wide, scoped to a period). Mirrors VentasHome's Mi Pipeline widget but org-scoped. |
 | `futurerp_ticket_kpis` | Open vs resolved, SLA breaches, breakdown by status / priority / area / channel / responsable. |
-| `futurerp_instalacion_kpis` | Status breakdown, completion rate, per-cuadrilla panels and counts. |
+| `futurerp_instalacion_kpis` | Status breakdown, completion rate, per-cuadrilla panels and counts (by crew name). |
 | `futurerp_drone_leaderboard` | User leaderboard via `get_user_drone_rankings()`; per-drone via `get_drone_kpis()`. |
 | `futurerp_aggregate` | Generic GROUP BY (count / sum / avg / min / max). Client-side over a row sample (cap 10k). |
 
@@ -119,7 +119,7 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 
 ### Instalaciones (field installs)
 - `estado`: text column (NOT a PG enum). Values: `asignada`, `pendiente`, `en_proceso`, `completada`, `cancelada`.
-- `cuadrilla_id`: FK to the installing team.
+- `cuadrilla_id`: FK to `cuadrillas.id`; the crew name is `cuadrillas.nombre` (embed: `select=*,cuadrilla:cuadrillas(nombre)`). Every `cuadrilla_id` column in the ERP points at `cuadrillas`.
 - GPS-tracked: `checkin_at`, `checkout_at`. GPS overrides go through `gps_override_requests`.
 - Photos in `instalacion_fotos`; BOM in `instalacion_line_items`; payment milestones in `instalacion_income_schedule`.
 - Per-cuadrilla KPIs: completion rate, panels installed, panels/hour, incidencia counts. See `futurerp_instalacion_kpis`.
