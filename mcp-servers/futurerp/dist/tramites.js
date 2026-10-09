@@ -11,6 +11,12 @@
  * src/types/tramite.ts and src/config/tramiteRequirements.ts. Keep in sync.
  */
 import { z } from "zod";
+const OPENWA_API_URL = (process.env.OPENWA_API_URL ?? "").replace(/\/$/, "");
+const OPENWA_API_KEY = process.env.OPENWA_API_KEY ?? "";
+const WA_SENDS_PER_HOUR = 20;
+const WA_HOUR_FROM = 8; // Monterrey, UTC-6 (no DST since 2022)
+const WA_HOUR_TO = 19;
+const CIERRE_ITEMS = ["medidor_instalado", "sistema_inyectando", "cliente_entiende", "acta_conformidad"];
 // ── catalog (mirror of the app) ─────────────────────────────────────────────
 const PRIMARY_STAGES = ["expediente_integracion", "documentacion_con_gestor", "folio_ingresado", "en_seguimiento_cfe", "c0b_emitida", "medidor_instalado", "sistema_activado"];
 const CAMBIO_NOMBRE_STAGES = ["deteccion", "solicitar_documentos", "documentos_recibidos", "enviado_a_gestor", "ingresado_cfe", "en_seguimiento", "concluido"];
@@ -72,7 +78,7 @@ const FIREBASE_HOSTS = ["firebasestorage.googleapis.com", "storage.googleapis.co
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerTramiteTools(server, deps) {
-    const { userId, restBase, uuidRx, authHeaders, sbApi, sbRpc } = deps;
+    const { userId, restBase, uuidRx, authHeaders, serviceHeaders, sbApi, sbRpc } = deps;
     async function sbWrite(method, path, body, prefer = "return=representation") {
         const res = await fetch(`${restBase}${path}`, { method, headers: authHeaders({ Prefer: prefer }), body: JSON.stringify(body) });
         const txt = await res.text();
@@ -375,6 +381,96 @@ export function registerTramiteTools(server, deps) {
         }
         catch (e) {
             return fail(`No se pudo abrir el bloqueo: ${e.message}`);
+        }
+    });
+    // ── futurerp_whatsapp_send ────────────────────────────────────────────────
+    server.tool("futurerp_whatsapp_send", "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media. The message is recorded in the inbox like any outbound.", {
+        conversation_id: z.string().uuid().optional(),
+        chat_id: z.string().optional().describe("Phone digits (E.164 without +) or a WhatsApp chat id (…@c.us / …@g.us)"),
+        text: z.string().min(1).max(4096),
+        media_url: z.string().url().optional().describe("Firebase Storage URL (PDF or image)"),
+        media_name: z.string().optional().describe("File name shown to the recipient"),
+    }, async ({ conversation_id, chat_id, text: body, media_url, media_name }) => {
+        try {
+            if (!OPENWA_API_URL || !OPENWA_API_KEY)
+                return fail("El gateway de WhatsApp no está configurado en el MCP (OPENWA_API_URL / OPENWA_API_KEY).");
+            const mty = (Date.now() - 6 * 3600_000) % 86_400_000;
+            const hour = Math.floor(mty / 3_600_000);
+            if (hour < WA_HOUR_FROM || hour >= WA_HOUR_TO)
+                return fail(`Fuera de horario (${String(hour).padStart(2, "0")}:00 Monterrey). Solo se envía de ${WA_HOUR_FROM}:00 a ${WA_HOUR_TO}:00.`);
+            if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname))
+                return fail("Solo se adjuntan archivos del Storage de Firebase.");
+            const channels = await sbApi(`/whatsapp_channels?vendor_user_id=eq.${userId}&active=is.true&select=id,session_id,connection_status,label&limit=1`);
+            const ch = channels[0];
+            if (!ch)
+                return fail("No tienes una sesión de WhatsApp propia (whatsapp_channels.vendor_user_id). Trami solo escribe desde su número.");
+            // Rate limit: outbound rows on this channel in the last hour.
+            const since = new Date(Date.now() - 3600_000).toISOString();
+            const convIds = ((await sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&select=id`, serviceHeaders())) ?? []).map((c) => c.id);
+            let sentLastHour = 0;
+            if (convIds.length) {
+                const cnt = await fetch(`${restBase}/whatsapp_messages?select=id&conversation_id=in.(${convIds.join(",")})&direction=eq.outbound&sent_at=gte.${encodeURIComponent(since)}&limit=1`, { headers: serviceHeaders({ Prefer: "count=exact" }) });
+                sentLastHour = parseInt((cnt.headers.get("content-range") ?? "*/0").split("/").pop() ?? "0", 10) || 0;
+            }
+            if (sentLastHour >= WA_SENDS_PER_HOUR)
+                return fail(`Tope alcanzado: ${sentLastHour} envíos en la última hora (máximo ${WA_SENDS_PER_HOUR}).`);
+            // Conversation under this channel (create for a new chat).
+            let convo = null;
+            if (conversation_id) {
+                convo = (await sbApi(`/whatsapp_conversations?id=eq.${conversation_id}&channel_id=eq.${ch.id}&select=id,chat_id&limit=1`))?.[0];
+                if (!convo)
+                    return fail("Esa conversación no es de tu número.");
+            }
+            else if (chat_id) {
+                const cid = chat_id.includes("@") ? chat_id : `${chat_id.replace(/\D/g, "")}@c.us`;
+                if (!/^\d{10,15}@c\.us$|^\d+@g\.us$/.test(cid))
+                    return fail(`chat_id inválido: ${chat_id}`);
+                const up = await fetch(`${restBase}/whatsapp_conversations?on_conflict=channel_id,chat_id`, { method: "POST", headers: serviceHeaders({ Prefer: "return=representation,resolution=merge-duplicates" }), body: JSON.stringify({ channel_id: ch.id, chat_id: cid, is_group: cid.endsWith("@g.us"), contact_phone: cid.endsWith("@c.us") ? cid.split("@")[0] : null }) });
+                if (!up.ok)
+                    return fail(`No se pudo abrir la conversación: ${(await up.text()).slice(0, 200)}`);
+                convo = (await up.json())[0];
+            }
+            else {
+                return fail("Indica conversation_id o chat_id.");
+            }
+            // Gateway call (same routes openwa-send uses).
+            const ext = (media_name ?? media_url ?? "").split(".").pop()?.toLowerCase() ?? "";
+            const route = media_url ? (["jpg", "jpeg", "png", "webp"].includes(ext) ? "send-image" : "send-document") : "send-text";
+            const payload = media_url ? { chatId: convo.chat_id, url: media_url, fileName: media_name ?? "archivo", caption: body } : { chatId: convo.chat_id, text: body };
+            const r = await fetch(`${OPENWA_API_URL}/sessions/${ch.session_id}/messages/${route}`, { method: "POST", headers: { "X-API-Key": OPENWA_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
+            if (!r.ok)
+                return fail(`OpenWA rechazó el envío (${r.status}): ${(await r.text()).slice(0, 200)}`);
+            const out = await r.json().catch(() => ({}));
+            const waId = out?.messageId ? String(out.messageId) : null;
+            const now = new Date().toISOString();
+            if (waId) {
+                await fetch(`${restBase}/whatsapp_messages?on_conflict=conversation_id,wa_message_id`, { method: "POST", headers: serviceHeaders({ Prefer: "return=minimal,resolution=ignore-duplicates" }), body: JSON.stringify({ conversation_id: convo.id, wa_message_id: waId, direction: "outbound", body, media_url: media_url ?? null, media_type: media_url ? (route === "send-image" ? "image" : "document") : null, status: "sent", sent_at: now, metadata: { source: "mcp", agent: "trami" } }) });
+            }
+            await fetch(`${restBase}/whatsapp_conversations?id=eq.${convo.id}`, { method: "PATCH", headers: serviceHeaders({ Prefer: "return=minimal" }), body: JSON.stringify({ last_message_at: now, last_message_preview: body.slice(0, 120), unread_count: 0 }) });
+            return text(`WhatsApp enviado a ${convo.chat_id} desde ${ch.label ?? ch.session_id}${waId ? ` (id ${waId})` : ""}. Envíos en la última hora: ${sentLastHour + 1}/${WA_SENDS_PER_HOUR}.`);
+        }
+        catch (e) {
+            return fail(`No se pudo enviar el WhatsApp: ${e.message}`);
+        }
+    });
+    // ── futurerp_verification_tick ────────────────────────────────────────────
+    server.tool("futurerp_verification_tick", "Tick one item of the project's closing checklist (verificacion_cierre, stage Instalación Pagada → Funcionando) through the app's RPC: medidor_instalado when CFE changed the meter, sistema_inyectando when it is confirmed generating. The RPC refuses unless you are in that checklist's approver group.", {
+        project_id: z.string().describe("Project uuid or EFU code"),
+        item_key: z.enum(CIERRE_ITEMS),
+        checked: z.boolean().optional().describe("Default true"),
+    }, async ({ project_id, item_key, checked }) => {
+        try {
+            const p = await projectRow(project_id, "id,efu,stage");
+            if (!p)
+                return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
+            const v = (await sbApi(`/project_stage_verifications?project_id=eq.${p.id}&verification_key=eq.verificacion_cierre&select=id,status&order=created_at.desc&limit=1`))?.[0];
+            if (!v)
+                return fail(`${p.efu ?? p.id} no tiene todavía el checklist de cierre (se solicita desde el proyecto en Instalación Pagada; etapa actual: ${p.stage}).`);
+            const row = await sbRpc("set_stage_verification_item", { p_verification_id: v.id, p_item_key: item_key, p_checked: checked ?? true });
+            return text(`Checklist de cierre de ${p.efu ?? p.id}: ${item_key} = ${row?.checked ?? (checked ?? true)}.`);
+        }
+        catch (e) {
+            return fail(`No se pudo palomear el checklist: ${e.message}`);
         }
     });
 }

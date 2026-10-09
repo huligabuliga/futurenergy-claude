@@ -4,6 +4,8 @@ export interface TramiteDeps {
     restBase: string;
     uuidRx: RegExp;
     authHeaders: (extra?: Record<string, string>) => Record<string, string>;
+    /** Service-role headers: only for the WhatsApp tables, which have no user INSERT policy. */
+    serviceHeaders: (extra?: Record<string, string>) => Record<string, string>;
     sbApi: (path: string, headers?: Record<string, string>) => Promise<any>;
     sbRpc: (name: string, args?: Record<string, any>) => Promise<any>;
 }
