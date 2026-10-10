@@ -7,6 +7,7 @@
 //   node scripts/trami-local-agent.mjs --scenario docs_change --project EFU-00645-1 --file "predial.pdf" --slot "Predial"
 //   node scripts/trami-local-agent.mjs --message "texto libre"           # any instruction
 //   node scripts/trami-local-agent.mjs --dry …                            # no model call: prints prompt size + tools
+//   OPENAI_API_KEY=… node scripts/trami-local-agent.mjs --provider openai --model gpt-5 …   # plumbing test with another model
 //
 // Needs scripts/trami-sandbox.mjs running (TRAMI_MODE=shadow by default) and
 // the trami/ folder of pronto-resolver (TRAMI_DIR). Writes a transcript to
@@ -21,7 +22,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, arr) => { if (a.startsWith("--")) acc.push([a.slice(2), arr[i + 1]?.startsWith("--") || arr[i + 1] === undefined ? "true" : arr[i + 1]]); return acc; }, []));
 const SANDBOX = process.env.TRAMI_SANDBOX_DIR || resolve(here, "../.sandbox");
 const TRAMI_DIR = process.env.TRAMI_DIR || join(homedir(), "Documents/GitHub/pronto-resolver-61-trami/trami");
-const MODEL = args.model || process.env.TRAMI_MODEL || "claude-sonnet-5-5";
+const PROVIDER = args.provider || (process.env.ANTHROPIC_API_KEY ? "anthropic" : process.env.OPENAI_API_KEY ? "openai" : "anthropic");
+const MODEL = args.model || process.env.TRAMI_MODEL || (PROVIDER === "openai" ? "gpt-5" : "claude-sonnet-5-5");
 const MAX_TURNS = Number(args.turns || 40);
 const sb = JSON.parse(readFileSync(resolve(SANDBOX, "sandbox.json"), "utf8"));
 
@@ -59,39 +61,70 @@ function userMessage() {
   }
 }
 const first = userMessage();
-console.log(`model ${MODEL} · system ${system.length} chars · ${tools.length} tools · scenario ${args.scenario ?? "message"}`);
+console.log(`${PROVIDER} · model ${MODEL} · system ${system.length} chars · ${tools.length} tools · scenario ${args.scenario ?? "message"}`);
 if (args.dry === "true") { console.log(tools.map((t) => t.name).join(", ")); console.log("\n--- user ---\n" + first); process.exit(0); }
-if (!process.env.ANTHROPIC_API_KEY) { console.error("Set ANTHROPIC_API_KEY (or use --dry)."); process.exit(2); }
+if (PROVIDER === "anthropic" && !process.env.ANTHROPIC_API_KEY) { console.error("Set ANTHROPIC_API_KEY (or use --dry / --provider openai)."); process.exit(2); }
+if (PROVIDER === "openai" && !process.env.OPENAI_API_KEY) { console.error("Set OPENAI_API_KEY."); process.exit(2); }
 
 // ── agent loop ───────────────────────────────────────────────────────────────
-const client = new Anthropic();
-const messages = [{ role: "user", content: first }];
 const calls = [];
 let usage = { input: 0, output: 0 };
-for (let turn = 0; turn < MAX_TURNS; turn++) {
-  const res = await client.messages.create({ model: MODEL, max_tokens: 4096, system, tools, messages });
-  usage.input += res.usage?.input_tokens ?? 0; usage.output += res.usage?.output_tokens ?? 0;
-  messages.push({ role: "assistant", content: res.content });
-  const uses = res.content.filter((b) => b.type === "tool_use");
-  for (const b of res.content) if (b.type === "text" && b.text.trim()) console.log(`\n[trami] ${b.text.trim()}`);
-  if (res.stop_reason !== "tool_use" || uses.length === 0) break;
-  const results = [];
-  for (const u of uses) {
-    const t0 = Date.now();
-    const r = await mcp("tools/call", { name: u.name, arguments: u.input });
-    const content = r?.result?.content ?? [{ type: "text", text: JSON.stringify(r?.error ?? r) }];
-    const isError = r?.result?.isError === true || !!r?.error;
-    const text = content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
-    calls.push({ turn, name: u.name, input: u.input, isError, result: text.slice(0, 2000), ms: Date.now() - t0 });
-    console.log(`  → ${u.name}(${JSON.stringify(u.input).slice(0, 160)})${isError ? " ✗" : ""}\n    ${text.replace(/\s+/g, " ").slice(0, 220)}`);
-    // Pass images (read_document on a photo) through to the model.
-    const blocks = content.map((c) => c.type === "image" ? { type: "image", source: { type: "base64", media_type: c.mimeType, data: c.data } } : { type: "text", text: c.text ?? "" });
-    results.push({ type: "tool_result", tool_use_id: u.id, content: blocks, is_error: isError });
+const messages = [];
+async function runTool(name, input) {
+  const t0 = Date.now();
+  const r = await mcp("tools/call", { name, arguments: input });
+  const content = r?.result?.content ?? [{ type: "text", text: JSON.stringify(r?.error ?? r) }];
+  const isError = r?.result?.isError === true || !!r?.error;
+  const text = content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  calls.push({ name, input, isError, result: text.slice(0, 2000), ms: Date.now() - t0 });
+  console.log(`  → ${name}(${JSON.stringify(input).slice(0, 160)})${isError ? " ✗" : ""}\n    ${text.replace(/\s+/g, " ").slice(0, 220)}`);
+  return { content, isError, text };
+}
+
+if (PROVIDER === "anthropic") {
+  const client = new Anthropic();
+  messages.push({ role: "user", content: first });
+  for (let turn = 0; turn < MAX_TURNS; turn++) {
+    const res = await client.messages.create({ model: MODEL, max_tokens: 4096, system, tools, messages });
+    usage.input += res.usage?.input_tokens ?? 0; usage.output += res.usage?.output_tokens ?? 0;
+    messages.push({ role: "assistant", content: res.content });
+    const uses = res.content.filter((b) => b.type === "tool_use");
+    for (const b of res.content) if (b.type === "text" && b.text.trim()) console.log(`\n[trami] ${b.text.trim()}`);
+    if (res.stop_reason !== "tool_use" || uses.length === 0) break;
+    const results = [];
+    for (const u of uses) {
+      const { content, isError } = await runTool(u.name, u.input);
+      // Pass images (read_document on a photo) through to the model.
+      const blocks = content.map((c) => c.type === "image" ? { type: "image", source: { type: "base64", media_type: c.mimeType, data: c.data } } : { type: "text", text: c.text ?? "" });
+      results.push({ type: "tool_result", tool_use_id: u.id, content: blocks, is_error: isError });
+    }
+    messages.push({ role: "user", content: results });
   }
-  messages.push({ role: "user", content: results });
+} else {
+  // OpenAI chat completions with function calling: a plumbing test only, the
+  // shipped agent is Claude on Managed Agents.
+  const oaTools = tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.input_schema } }));
+  messages.push({ role: "system", content: system }, { role: "user", content: first });
+  for (let turn = 0; turn < MAX_TURNS; turn++) {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: MODEL, messages, tools: oaTools }) });
+    const res = await r.json();
+    if (!r.ok) { console.error("openai:", JSON.stringify(res).slice(0, 400)); process.exit(1); }
+    usage.input += res.usage?.prompt_tokens ?? 0; usage.output += res.usage?.completion_tokens ?? 0;
+    const msg = res.choices[0].message;
+    messages.push(msg);
+    if (msg.content?.trim()) console.log(`\n[trami] ${msg.content.trim()}`);
+    if (!msg.tool_calls?.length) break;
+    for (const tc of msg.tool_calls) {
+      let input = {}; try { input = JSON.parse(tc.function.arguments || "{}"); } catch {}
+      const { content, text } = await runTool(tc.function.name, input);
+      const img = content.find((c) => c.type === "image");
+      messages.push({ role: "tool", tool_call_id: tc.id, content: text || "(sin texto)" });
+      if (img) messages.push({ role: "user", content: [{ type: "text", text: `Imagen devuelta por ${tc.function.name}:` }, { type: "image_url", image_url: { url: `data:${img.mimeType};base64,${img.data}` } }] });
+    }
+  }
 }
 mkdirSync(join(SANDBOX, "runs"), { recursive: true });
 const out = join(SANDBOX, "runs", `${new Date().toISOString().replace(/[:.]/g, "-")}-${args.scenario ?? "message"}.json`);
-writeFileSync(out, JSON.stringify({ model: MODEL, scenario: args, first, calls, usage, messages }, null, 2));
+writeFileSync(out, JSON.stringify({ provider: PROVIDER, model: MODEL, scenario: args, first, calls, usage, messages }, null, 2));
 console.log(`\n${calls.length} tool calls · ${usage.input} in / ${usage.output} out tokens · transcript ${out}`);
 console.log("tools used: " + [...new Set(calls.map((c) => c.name))].join(", "));
