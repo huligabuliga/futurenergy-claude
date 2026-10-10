@@ -4,6 +4,25 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 export function registerOpsTools(server: McpServer, deps: { sbRpc: (name: string, args?: Record<string, any>) => Promise<any> }) {
   server.tool(
+    "futurerp_trami_barrido",
+    "The morning sweep list in one call: every open project with required trámites or a trámite still in progress (created after the configured cutoff), with zona, stage, required labels and vetoes, each trámite's stage/SI/dates/next review, active bloqueo, and whether recibo and INE are on file. Sorted by priority: 1 subsanación, 2 review date due, 3 assembling expediente, 4 no trámite yet, 5 with the gestora > 2 days without news, 6 the rest. Open futurerp_tramite_contexto only for the projects you will act on.",
+    {},
+    async () => {
+      try {
+        const rows: any[] = (await deps.sbRpc("trami_barrido")) ?? [];
+        const P: Record<number, string> = { 1: "en subsanación", 2: "revisión vencida", 3: "armando expediente", 4: "sin trámite", 5: "con la gestora sin noticias", 6: "en curso" };
+        const lines = rows.map((r) => {
+          const tr = (r.tramites ?? []).map((t: any) => `${t.tipo}:${t.etapa}${t.enviado ? "/enviado" : ""}${t.si ? `/SI ${t.si}` : ""}${t.subsanacion ? "/SUBSANACIÓN" : ""}${t.revisar ? `/revisar ${t.revisar}` : ""}${t.docs_pedidos ? `/docs pedidos ${t.docs_pedidos}` : ""} (${t.dias_en_etapa}d, id ${t.id})`).join("; ");
+          return `- [${r.prioridad} ${P[r.prioridad]}] ${r.efu} ${r.name} · ${r.stage} · zona ${r.zona_cfe ?? "SIN ZONA"} · requeridos: ${(r.requeridos ?? []).join(", ") || "—"}${r.vetados?.length ? ` · vetados: ${r.vetados.join(", ")}` : ""}${r.bloqueado ? " · BLOQUEADO" : ""} · recibo ${r.tiene_recibo ? "sí" : "no"}, INE ${r.tiene_ine ? "sí" : "no"} · trámites: ${tr || "ninguno"}`;
+        });
+        return { content: [{ type: "text" as const, text: `## Barrido (${rows.length} proyectos)\n${lines.join("\n") || "- nada"}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: `No se pudo leer el barrido: ${e?.message ?? e}` }], isError: true as const };
+      }
+    },
+  );
+
+  server.tool(
     "futurerp_trami_lecciones",
     "Flor's corrections of your past actions (shadow mode grades): what you proposed, whether she would have done the same (correcto / parcial / incorrecto) and what she would have done instead. Read them at the start of every session; they override your own judgement and your memory.",
     { limit: z.number().int().min(1).max(200).default(40) },

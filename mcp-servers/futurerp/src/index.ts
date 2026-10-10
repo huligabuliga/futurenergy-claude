@@ -37,6 +37,7 @@ import { registerTramiteTools } from "./tramites.js";
 import { registerMailTools } from "./mail.js";
 import { registerDocumentTools } from "./documents.js";
 import { registerOpsTools } from "./ops.js";
+import { registerContextoTool } from "./contexto.js";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
@@ -3410,6 +3411,7 @@ if (auth.extra?.tramitesManage === true) {
   });
   registerDocumentTools(server, { userId: (auth.extra?.userId as string) ?? "", uuidRx: UUID_RX, restBase: REST_BASE, authHeaders, sbApi });
   registerOpsTools(server, { sbRpc });
+  registerContextoTool(server, { uuidRx: UUID_RX, sbApi });
   registerMailTools(server, {
     userId: (auth.extra?.userId as string) ?? "",
     uuidRx: UUID_RX,

@@ -6,7 +6,7 @@ export function fechaCfe(s) {
         return null;
     return `20${m[3]}-${MESES[m[2]]}-${m[1]}`;
 }
-const SKIP = /COMISI[ÓO]N FEDERAL|^CFE|^RFC|AV\. PASEO|ALCALD[ÍI]A|CIUDAD DE M[ÉE]XICO|TOTAL A PAGAR|PESOS|^C\.P\.|^CP\.|^\$|N\.L\.|^RMU|^NO\. |CUENTA:|TARIFA:|L[ÍI]MITE|CORTE|PERIODO|MULTIPLICADOR|HILOS|MEDIDOR|ENERG[ÍI]A|B[ÁA]SICO|INTERMEDIO|EXCEDENTE|SUBSIDIO|^IVA|DAP|SALDO|ADEUDO|AVISO/;
+const SKIP = /COMISI[ÓO]N FEDERAL|^CFE|^RFC|AV\. PASEO|ALCALD[ÍI]A|CIUDAD DE M[ÉE]XICO|TOTAL A PAGAR|PESOS|^C\.P\.|^CP\.|^\$|N\.L\.|^RMU|^NO\. |CUENTA:|TARIFA:|L[ÍI]MITE|CORTE|PERIODO|MULTIPLICADOR|HILOS|MEDIDOR|ENERG[ÍI]A|B[ÁA]SICO|INTERMEDIO|EXCEDENTE|SUBSIDIO|^IVA|DAP|SALDO|ADEUDO|AVISO|DESGLOSE|IMPORTE|CONCEPTO|LECTURA|CARGO|CR[ÉE]DITO|FACTURA|HISTORIAL|CONSUMO|MEDIDA|ESTIMADA|FRACC|COL\b/;
 export function esRecibo(text) {
     return /NO\. DE SERVICIO|COMISI[ÓO]N FEDERAL DE ELECTRICIDAD|RMU:/i.test(text);
 }
@@ -14,17 +14,27 @@ export function parseRecibo(text, hoy = new Date()) {
     const t = text.replace(/\r/g, "");
     const u = t.toUpperCase();
     const g = (re) => u.match(re)?.[1]?.trim() ?? null;
-    // Titular: first line in caps, letters only, 2+ words, before the address block.
+    // Titular: the first caps-only line after CFE's own header (its RFC line);
+    // every layout prints the customer right there. Fallback: first caps line.
+    const lines = t.split("\n").map((l) => l.trim()).filter(Boolean);
+    const esNombre = (line) => !SKIP.test(line) && !/\d/.test(line) && /^[A-ZÁÉÍÓÚÑ.\- ]{6,}$/.test(line) && line.split(/\s+/).length >= 2;
     let titular = null;
-    for (const raw of t.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 40)) {
+    const rfcIdx = lines.findIndex((l) => /CFE370814QI0|RFC:\s*CFE/i.test(l));
+    for (const raw of lines.slice(rfcIdx >= 0 ? rfcIdx + 1 : 0, (rfcIdx >= 0 ? rfcIdx + 1 : 0) + 12)) {
         const line = raw.toUpperCase();
-        if (SKIP.test(line) || /\d/.test(line))
-            continue;
-        if (/^[A-ZÁÉÍÓÚÑ.\- ]{6,}$/.test(line) && line.split(/\s+/).length >= 2) {
+        if (esNombre(line)) {
             titular = line.replace(/\s+/g, " ");
             break;
         }
     }
+    if (!titular)
+        for (const raw of lines.slice(0, 40)) {
+            const line = raw.toUpperCase();
+            if (esNombre(line)) {
+                titular = line.replace(/\s+/g, " ");
+                break;
+            }
+        }
     const cuenta = g(/CUENTA:\s*([0-9A-Z]{8,})/);
     const zona = cuenta?.match(/\d{2}(DD\d{2})/)?.[1] ?? null;
     const periodo = u.match(/PERIODO FACTURADO:\s*(\d{2} [A-Z]{3} \d{2})\s*-\s*(\d{2} [A-Z]{3} \d{2})/);

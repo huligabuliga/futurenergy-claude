@@ -57,6 +57,13 @@ test("adeudo signals and DD12 account", () => {
   assert.equal(cero.adeudo_anterior, 0);
   assert.deepEqual(cero.senales_adeudo, []);
 });
+test("second layout: total before the address, 'DESGLOSE' further down", () => {
+  const txt = `Comisión Federal de Electricidad\nAv. Paseo de la Reforma 164, Col. Juárez,\nAlcaldía: Cuauhtémoc, Código Postal: 06600,\nCiudad de México. RFC: CFE370814QI0\nGARCIA G JOSE GPE\nTOTAL A PAGAR:\n$2,005\nLUIS XIV 718\nLOS REYES FRACCC.P.67277\nDESGLOSE DEL IMPORTE A PAGAR\nNO. DE SERVICIO:411990403783\nCUENTA:35DD11F123524605\nPERIODO FACTURADO:19 MAR 26-19 MAY 26\n`;
+  const r = parseRecibo(txt, new Date("2026-10-10T12:00:00-06:00"));
+  assert.equal(r.titular, "GARCIA G JOSE GPE");
+  assert.equal(r.zona, "DD11");
+  assert.equal(r.antiguedad_dias, 144);
+});
 test("not a recibo", () => {
   assert.equal(esRecibo("INSTITUTO NACIONAL ELECTORAL CREDENCIAL PARA VOTAR"), false);
   assert.equal(parseRecibo("hola").titular, null);
