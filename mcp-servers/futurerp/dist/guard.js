@@ -30,7 +30,7 @@ export function describeCall(name, a) {
         case "futurerp_tramite_update": return `Actualizar trámite ${a.tramite_id}: ${Object.entries(a.patch ?? {}).map(([k, v]) => `${k}=${short(v, 40)}`).join(", ")}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;
         case "futurerp_tramite_link_file": return `Adjuntar ${a.file_name ?? a.file_id ?? a.url} al trámite ${a.tramite_id} como ${a.doc_key}`;
         case "futurerp_project_set_zona_cfe": return `Fijar zona ${a.zona} en ${a.project_id}`;
-        case "futurerp_project_tramites_requeridos_set": return `Requeridos de ${a.project_id}: +${(a.add ?? []).join(", ")}${a.remove?.length ? ` −${a.remove.join(", ")}` : ""}`;
+        case "futurerp_project_tramites_requeridos_set": return `Requeridos de ${a.project_id}: +${(a.labels ?? []).join(", ")}${a.remove?.length ? ` −${a.remove.join(", ")}` : ""}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;
         case "futurerp_bloqueo_open": return `Abrir bloqueo ${a.categoria ?? "cfe_tramite"} en ${a.project_id}: ${short(a.motivo, 100)}`;
         case "futurerp_verification_tick": return `Palomear ${a.item_key} en el checklist de ${a.project_id}`;
         case "futurerp_whatsapp_send": return `WhatsApp a ${a.chat_id ?? a.conversation_id}: "${short(a.text, 120)}"${a.media_url ? " + archivo" : ""}`;

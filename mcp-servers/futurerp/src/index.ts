@@ -1780,10 +1780,16 @@ server.tool(
     entity_type: FileEntityEnum.describe(
       "What the files are attached to. One of: project, lead, instalacion, visita, inventory_movement, announcement, cantina."
     ),
-    parent_id: z.string().describe("Parent record uuid"),
+    parent_id: z.string().describe("Parent record uuid (for projects an EFU code also works)"),
     limit: z.number().int().min(1).max(200).optional().describe("Max files (default 50, max 200)"),
   },
   async ({ entity_type, parent_id, limit }) => {
+    // The agent often passes the EFU it got from get_project; resolve it here instead of failing on the uuid cast.
+    if (entity_type === "project" && !UUID_RX.test(parent_id)) {
+      const p: any[] = await sbApi(`/projects?efu=eq.${encodeURIComponent(parent_id)}&select=id`);
+      if (!p?.[0]?.id) return { content: [{ type: "text" as const, text: `No existe el proyecto ${parent_id} (o no tienes acceso).` }], isError: true as const };
+      parent_id = p[0].id;
+    }
     try {
       requireCredentials();
       const spec = FILE_TABLES[entity_type];

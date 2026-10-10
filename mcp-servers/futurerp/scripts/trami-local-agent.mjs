@@ -82,7 +82,8 @@ async function runTool(name, input) {
 }
 
 if (PROVIDER === "anthropic") {
-  const client = new Anthropic();
+  // A user-scoped key (sk-ant-usr-…) must name the workspace on every request.
+  const client = new Anthropic({ defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID ? { "anthropic-workspace-id": process.env.ANTHROPIC_WORKSPACE_ID } : {} });
   messages.push({ role: "user", content: first });
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const res = await client.messages.create({ model: MODEL, max_tokens: 4096, system, tools, messages });
