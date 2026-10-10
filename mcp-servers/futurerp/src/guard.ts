@@ -75,7 +75,12 @@ async function resolveIds(deps: GuardDeps, a: Record<string, any>): Promise<{ pr
       const digits = a.chat_id.replace(/\D/g, "");
       const local = digits.length >= 10 ? digits.slice(-10) : digits;
       if (local.length === 10) {
-        const c: any[] = await deps.sbApi(`/clients?or=(mobile_phone.ilike.*${local},phone.ilike.*${local})&select=id&limit=1`, deps.serviceHeaders());
+        // Stored phones carry spaces and prefixes ("+52 1 81 8366 7268"): match on the last 4
+        // digits in SQL, then on the full 10 digits here.
+        const tail = local.slice(-4);
+        const cands: any[] = await deps.sbApi(`/clients?or=(mobile_phone.ilike.*${tail}*,phone.ilike.*${tail}*)&select=id,mobile_phone,phone&limit=50`, deps.serviceHeaders());
+        const d10 = (v: unknown) => String(v ?? "").replace(/\D/g, "").slice(-10);
+        const c = (cands ?? []).filter((x) => d10(x.mobile_phone) === local || d10(x.phone) === local);
         if (c?.[0]?.id) {
           const p: any[] = await deps.sbApi(`/projects?client_id=eq.${c[0].id}&select=id&order=created_at.desc&limit=1`, deps.serviceHeaders());
           project_id = p?.[0]?.id ?? null;
