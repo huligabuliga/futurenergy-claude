@@ -1,6 +1,18 @@
 /** futurerp_trami_stats: the numbers behind the daily report (trami_stats + trami_health RPCs, caller's RLS). */
 import { z } from "zod";
 export function registerOpsTools(server, deps) {
+    server.tool("futurerp_trami_lecciones", "Flor's corrections of your past actions (shadow mode grades): what you proposed, whether she would have done the same (correcto / parcial / incorrecto) and what she would have done instead. Read them at the start of every session; they override your own judgement and your memory.", { limit: z.number().int().min(1).max(200).default(40) }, async ({ limit }) => {
+        try {
+            const rows = (await deps.sbRpc("trami_lecciones", { p_limit: limit })) ?? [];
+            if (!rows.length)
+                return { content: [{ type: "text", text: "Sin lecciones todavía: Flor no ha corregido ninguna acción." }] };
+            const lines = rows.map((r) => `- [${r.verdict}] ${r.proyecto ? `${r.proyecto} (${r.efu}) · ` : ""}${r.resumen}\n  Flor: ${r.verdict_nota ?? "(sin nota)"}`);
+            return { content: [{ type: "text", text: `## Lecciones de Flor (${rows.length}, correcciones primero)\n${lines.join("\n")}` }] };
+        }
+        catch (e) {
+            return { content: [{ type: "text", text: `No se pudieron leer las lecciones: ${e?.message ?? e}` }], isError: true };
+        }
+    });
     server.tool("futurerp_trami_stats", "Trami's own numbers for a period: sessions per trigger/status and per day, gated calls per tool and outcome, shadow-mode rows with Flor's agreement per tool, expedientes sent, median hours from anticipo to send, documents requested, questions to Flor, gestora messages, errors by type; plus current health (stuck outbox rows, long-open sessions, failed sessions, pending Buzón, ungraded shadow rows, last errors). Needs tramites.access.", { days: z.number().int().min(1).max(365).default(1).describe("Window in days (1 = today's report)") }, async ({ days }) => {
         try {
             const [stats, health] = await Promise.all([deps.sbRpc("trami_stats", { p_days: days }), deps.sbRpc("trami_health")]);

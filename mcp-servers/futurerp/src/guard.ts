@@ -70,6 +70,17 @@ async function resolveIds(deps: GuardDeps, a: Record<string, any>): Promise<{ pr
       const q = deps.uuidRx.test(a.project_id) ? `id=eq.${a.project_id}` : `efu=eq.${encodeURIComponent(a.project_id)}`;
       const p: any[] = await deps.sbApi(`/projects?${q}&select=id`, deps.serviceHeaders());
       project_id = p?.[0]?.id ?? null;
+    } else if (typeof a.chat_id === "string" && !/@g\.us$/.test(a.chat_id)) {
+      // A WhatsApp to a client: find the client by phone, then their newest project.
+      const digits = a.chat_id.replace(/\D/g, "");
+      const local = digits.length >= 10 ? digits.slice(-10) : digits;
+      if (local.length === 10) {
+        const c: any[] = await deps.sbApi(`/clients?or=(mobile_phone.ilike.*${local},phone.ilike.*${local})&select=id&limit=1`, deps.serviceHeaders());
+        if (c?.[0]?.id) {
+          const p: any[] = await deps.sbApi(`/projects?client_id=eq.${c[0].id}&select=id&order=created_at.desc&limit=1`, deps.serviceHeaders());
+          project_id = p?.[0]?.id ?? null;
+        }
+      }
     }
   } catch { /* labels only */ }
   return { project_id, tramite_id };
