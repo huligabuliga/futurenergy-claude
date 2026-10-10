@@ -655,6 +655,8 @@ export interface FileTableSpec {
   created?: string;
   /** Free-form notes about quirks (Google Drive vs Firebase, missing columns, etc.) */
   notes?: string;
+  /** FK to the document slot the file fills (project_files.document_id → project_documents.name). */
+  slot?: string;
 }
 
 export const FILE_TABLES: Record<string, FileTableSpec> = {
@@ -667,7 +669,8 @@ export const FILE_TABLES: Record<string, FileTableSpec> = {
     mime: "mime_type",
     extension: "file_extension",
     uploader: "uploaded_by",
-    notes: "Generic project file storage. Linked to project_tramites via tramite_file_links.",
+    slot: "document_id",
+    notes: "Generic project file storage. [slot] = the document the file fills (project_documents, or tramite_file_links doc_key when attached from a trámite card).",
   },
   lead: {
     table: "lead_files",

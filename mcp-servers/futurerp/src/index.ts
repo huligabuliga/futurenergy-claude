@@ -1805,6 +1805,7 @@ server.tool(
         spec.category,
         spec.subcategory,
         spec.thumbnail,
+        spec.slot,
         createdCol,
       ]
         .filter(Boolean)
@@ -1822,14 +1823,29 @@ server.tool(
         };
       }
 
+      // Which document each project file fills: the project slot (document_id) or the
+      // trámite card's doc_key. Trami's expediente check needs this, not just names.
+      const slotOf = new Map<string, string>();
+      if (spec.slot) {
+        const docIds = [...new Set(rows.map((r) => r[spec.slot!]).filter(Boolean))];
+        if (docIds.length) {
+          const docs: any[] = (await sbApi(`/project_documents?id=in.(${docIds.map(encodeURIComponent).join(",")})&select=id,name`)) ?? [];
+          const nameOf = new Map(docs.map((d) => [d.id, d.name]));
+          for (const r of rows) if (r[spec.slot!] && nameOf.has(r[spec.slot!])) slotOf.set(r.id, nameOf.get(r[spec.slot!]));
+        }
+        const links: any[] = (await sbApi(`/tramite_file_links?file_id=in.(${rows.map((r) => encodeURIComponent(r.id)).join(",")})&select=file_id,doc_key`)) ?? [];
+        for (const l of links) if (l.doc_key && !slotOf.has(l.file_id)) slotOf.set(l.file_id, `${l.doc_key} (trámite)`);
+      }
+
       const lines = rows.map((r) => {
         const url = r[spec.url];
         const name = r[spec.filename] ?? "(unnamed)";
         const sizeKb = spec.size && r[spec.size] ? `${(r[spec.size] / 1024).toFixed(1)} KB` : "";
         const mime = spec.mime && r[spec.mime] ? r[spec.mime] : "";
-        const cat = spec.category && r[spec.category] ? `[${r[spec.category]}${spec.subcategory && r[spec.subcategory] ? "/" + r[spec.subcategory] : ""}]` : "";
+        const slot = slotOf.get(r.id);
+        const cat = spec.category && r[spec.category] ? `[${r[spec.category]}${spec.subcategory && r[spec.subcategory] ? "/" + r[spec.subcategory] : ""}]` : slot ? `[${slot}]` : "";
         const meta = [mime, sizeKb, cat].filter(Boolean).join(" • ");
-        return `- ${cat ? cat + " " : ""}**${name}**${meta ? ` — ${meta}` : ""}\n  ${url ?? "*(no url)*"}`;
+        return `- ${cat ? cat + " " : ""}**${name}** (id ${r.id})${meta ? ` — ${meta}` : ""}\n  ${url ?? "*(no url)*"}`;
       });
 
       return {

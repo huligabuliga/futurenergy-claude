@@ -80,6 +80,8 @@ export interface FileTableSpec {
     created?: string;
     /** Free-form notes about quirks (Google Drive vs Firebase, missing columns, etc.) */
     notes?: string;
+    /** FK to the document slot the file fills (project_files.document_id → project_documents.name). */
+    slot?: string;
 }
 export declare const FILE_TABLES: Record<string, FileTableSpec>;
 export declare const FILE_ENTITY_TYPES: Array<keyof typeof FILE_TABLES>;

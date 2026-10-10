@@ -534,7 +534,8 @@ export const FILE_TABLES = {
         mime: "mime_type",
         extension: "file_extension",
         uploader: "uploaded_by",
-        notes: "Generic project file storage. Linked to project_tramites via tramite_file_links.",
+        slot: "document_id",
+        notes: "Generic project file storage. [slot] = the document the file fills (project_documents, or tramite_file_links doc_key when attached from a trámite card).",
     },
     lead: {
         table: "lead_files",

@@ -301,18 +301,42 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_activity_add ─────────────────────────────────────────────────
-    server.tool("futurerp_activity_add", "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for Flor.", {
-        project_id: z.string().describe("Project uuid or EFU code"),
+    server.tool("futurerp_activity_add", "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for Flor. A question for Flor goes with pregunta_para_flor=true: every tramites.manage holder gets a notification pointing at the project, so the question is not just a silent note. Without a project (e.g. a gestora message that matches nothing) pass pregunta_para_flor=true and omit project_id: only the notification is sent.", {
+        project_id: z.string().optional().describe("Project uuid or EFU code; optional only when pregunta_para_flor is true"),
         activity_type: z.enum(ACTIVITY_TYPES).default("note"),
         subject: z.string().max(200),
         description: z.string().max(4000).optional(),
-    }, async ({ project_id, activity_type, subject, description }) => {
+        pregunta_para_flor: z.boolean().optional().describe("true = also notify everyone with tramites.manage"),
+    }, async ({ project_id, activity_type, subject, description, pregunta_para_flor }) => {
         try {
-            const p = await projectRow(project_id, "id,efu");
-            if (!p)
-                return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-            await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp" } });
-            return text(`Nota registrada en ${p.efu ?? p.id}: ${subject}`);
+            let p = null;
+            if (project_id) {
+                p = await projectRow(project_id, "id,efu");
+                if (!p)
+                    return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
+                await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp", pregunta_para_flor: !!pregunta_para_flor } });
+            }
+            else if (!pregunta_para_flor) {
+                return fail("Falta project_id (solo puede omitirse con pregunta_para_flor=true).");
+            }
+            let avisados = 0;
+            if (pregunta_para_flor) {
+                const rows = await sbApi(`/user_crm_roles?select=user_id,crm_roles!inner(id)&crm_roles.permissions=cs.${encodeURIComponent(JSON.stringify({ "tramites.manage": true }))}`, serviceHeaders());
+                const ids = [...new Set((rows ?? []).map((r) => r.user_id).filter(Boolean))];
+                if (ids.length) {
+                    await sbRpc("create_notification", {
+                        p_user_ids: ids,
+                        p_type: "system",
+                        p_title: `Trami pregunta: ${subject}`.slice(0, 120),
+                        p_body: (description ?? subject).slice(0, 500),
+                        p_resource_type: p ? "project" : "system",
+                        p_resource_id: p?.id ?? null,
+                        p_metadata: { agent: "trami", ruta: p ? `/proyectos/${p.id}` : "/tramites/trami/buzon" },
+                    });
+                    avisados = ids.length;
+                }
+            }
+            return text(p ? `Nota registrada en ${p.efu ?? p.id}: ${subject}${avisados ? ` · pregunta enviada a ${avisados} persona(s) con tramites.manage` : ""}` : `Pregunta enviada a ${avisados} persona(s) con tramites.manage: ${subject}`);
         }
         catch (e) {
             return fail(`No se pudo registrar la nota: ${e.message}`);
