@@ -31,6 +31,8 @@ import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerTramiteTools } from "./tramites.js";
 import { registerMailTools } from "./mail.js";
+import { registerDocumentTools } from "./documents.js";
+import { registerOpsTools } from "./ops.js";
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -2883,11 +2885,14 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             sbApi,
             sbRpc,
         });
+        registerDocumentTools(server, { userId: auth.extra?.userId ?? "", uuidRx: UUID_RX, restBase: REST_BASE, authHeaders, sbApi });
+        registerOpsTools(server, { sbRpc });
         registerMailTools(server, {
             userId: auth.extra?.userId ?? "",
             uuidRx: UUID_RX,
             restBase: REST_BASE,
             authHeaders,
+            serviceHeaders,
             sbApi,
         });
     }

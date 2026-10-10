@@ -69,7 +69,7 @@ async function startServer() {
   const PORT = 3211;
   const here = dirname(fileURLToPath(import.meta.url));
   child = spawn(process.execPath, [resolve(here, "../dist/index.js")], {
-    env: { ...process.env, ...MOCK_ENV, SUPABASE_URL: SB, SUPABASE_PUBLISHABLE_KEY: PUB, SUPABASE_SERVICE_ROLE_KEY: SVC, PORT: String(PORT), MCP_PUBLIC_URL: `http://localhost:${PORT}/mcp`, MCP_SKIP_AS_METADATA: "1" },
+    env: { ...process.env, ...MOCK_ENV, SUPABASE_URL: SB, SUPABASE_PUBLISHABLE_KEY: PUB, SUPABASE_SERVICE_ROLE_KEY: SVC, PORT: String(PORT), MCP_PUBLIC_URL: `http://localhost:${PORT}/mcp`, MCP_SKIP_AS_METADATA: "1", TRAMI_MODE_CACHE_MS: "0" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.on("data", (d) => { const s = String(d); if (!/WARNING: MCP_SKIP_AS_METADATA/.test(s)) process.stderr.write(`[server] ${s}`); });
@@ -87,7 +87,11 @@ async function call(tok, name, args) { await mcp(tok, "initialize", { protocolVe
 
 const WRITE_TOOLS = ["futurerp_tramite_create", "futurerp_tramite_update", "futurerp_project_set_zona_cfe", "futurerp_project_tramites_requeridos_set", "futurerp_activity_add", "futurerp_tramite_link_file", "futurerp_bloqueo_open", "futurerp_whatsapp_send", "futurerp_verification_tick", "futurerp_mail_list", "futurerp_mail_get", "futurerp_mail_send"];
 const users = []; let projectId = null; let channelId = null; let gestoraId = null; let prevPostventa = null;
+let prevMode = null;
 try {
+  // The write tools shadow by default; this suite exercises the live path and restores the flag at the end.
+  prevMode = (await rest("/system_config?config_key=eq.trami_mode&select=config_value")).b?.[0]?.config_value ?? null;
+  await rest("/system_config?config_key=eq.trami_mode", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: "live" }) });
   if (!MCP_URL) await startServer();
   const stamp = randomBytes(3).toString("hex");
   const adminEmail = `wt-admin-${stamp}@futurenergy.mx`, plainEmail = `wt-plain-${stamp}@futurenergy.mx`;
@@ -244,8 +248,29 @@ try {
   r = await call(pTok, "futurerp_tramite_update", { tramite_id: tramiteId, patch: { numero_si: "HACK" } });
   ok(r.isError, "plain user: tool call rejected", r.text.slice(0, 80));
   ok((await rest(`/project_tramites?id=eq.${tramiteId}&select=numero_si`)).b[0].numero_si === "SI123", "plain user changed nothing");
+  // ── shadow mode ──────────────────────────────────────────────────────────
+  await rest("/system_config?config_key=eq.trami_mode", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: "shadow" }) });
+  const shBefore = (await rest("/agent_shadow_calls?select=id")).b?.length ?? 0;
+  const shNote = await call(aTok, "futurerp_activity_add", { project_id: projectId, subject: "sombra: nota", description: "las notas no se sombrean" });
+  ok(!shNote.isError && !shNote.text.startsWith("(sombra)"), "shadow: activity_add still writes", shNote.text.slice(0, 80));
+  const shWa = await call(aTok, "futurerp_whatsapp_send", { chat_id: "5218100000001", text: "hola desde sombra" });
+  ok(!shWa.isError && shWa.text.startsWith("(sombra)"), "shadow: whatsapp_send is recorded, not sent", shWa.text.slice(0, 100));
+  const waCallsBefore = openwaCalls.length;
+  const shMail = await call(aTok, "futurerp_mail_send", { to: "irisreyna335@gmail.com", subject: "sombra", text: "x" });
+  ok(shMail.text.startsWith("(sombra)") && openwaCalls.length === waCallsBefore, "shadow: mail_send recorded, mocks untouched", shMail.text.slice(0, 80));
+  const shRows = (await rest("/agent_shadow_calls?select=tool_name,resumen,project_id&order=created_at.desc&limit=2")).b ?? [];
+  ok(shRows.length >= 2 && shRows.some((r) => r.tool_name === "futurerp_whatsapp_send") && ((await rest("/agent_shadow_calls?select=id")).b?.length ?? 0) === shBefore + 2, "shadow: two agent_shadow_calls rows with resumen", JSON.stringify(shRows).slice(0, 160));
+  const shDoc = await call(aTok, "futurerp_read_document", { url: "https://example.com/x.pdf" });
+  ok(shDoc.isError && /Firebase/.test(shDoc.text), "read_document refuses non-Firebase URLs", shDoc.text.slice(0, 80));
+  const shStats = await call(aTok, "futurerp_trami_stats", { days: 1 });
+  ok(!shStats.isError && /sombra_total/.test(shStats.text) && /outbox_atorado/.test(shStats.text), "trami_stats returns stats + health");
+  const shErr = (await rest("/bot_error_log?fase=eq.trami&tipo=like.mcp:*&select=id&order=created_at.desc&limit=1")).b ?? [];
+  ok(shErr.length >= 1, "tool errors land in bot_error_log (fase trami, tipo mcp:*)");
+  await rest("/agent_shadow_calls?resumen=like.*sombra*", { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  await rest("/system_config?config_key=eq.trami_mode", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: "live" }) });
 } catch (e) {
   console.error("ERROR", e); fails++;
+
 } finally {
   if (channelId) {
     const convs = (await rest(`/whatsapp_conversations?channel_id=eq.${channelId}&select=id`)).b ?? [];
@@ -254,6 +279,7 @@ try {
     await rest(`/whatsapp_channels?id=eq.${channelId}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
   }
   if (gestoraId) await rest(`/gestoras?id=eq.${gestoraId}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  if (prevMode !== null) await rest(`/system_config?config_key=eq.trami_mode`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: prevMode }) });
   if (prevPostventa !== null) await rest(`/system_config?config_key=eq.postventa_approvers`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: prevPostventa }) });
   if (projectId) {
     await rest(`/project_stage_verifications?project_id=eq.${projectId}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });

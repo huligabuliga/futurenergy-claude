@@ -15,6 +15,7 @@
  */
 import { createSign, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { guardedTool } from "./guard.js";
 const TOKEN_URL = process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com/token";
 const GMAIL_BASE = (process.env.GMAIL_API_BASE ?? "https://gmail.googleapis.com").replace(/\/$/, "");
 const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify";
@@ -134,9 +135,10 @@ const stripHtml = (h) => h.replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerMailTools(server, deps) {
-    const { userId, uuidRx, restBase, authHeaders, sbApi } = deps;
+    const { userId, uuidRx, restBase, authHeaders, serviceHeaders, sbApi } = deps;
+    const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
     const mailbox = process.env.TRAMI_MAILBOX ?? "";
-    server.tool("futurerp_mail_list", `List messages in the trámites mailbox (${mailbox || "not configured"}) with a Gmail search query. Default: unread mail. Returns id, from, to, subject, date and the snippet; open one with futurerp_mail_get.`, {
+    tool("futurerp_mail_list", `List messages in the trámites mailbox (${mailbox || "not configured"}) with a Gmail search query. Default: unread mail. Returns id, from, to, subject, date and the snippet; open one with futurerp_mail_get.`, {
         query: z.string().optional().describe("Gmail search, e.g. 'is:unread', 'from:irisreyna335@gmail.com newer_than:7d', 'from:@cfe.mx'"),
         max: z.number().int().min(1).max(50).optional().describe("Default 20"),
     }, async ({ query, max }) => {
@@ -154,7 +156,7 @@ export function registerMailTools(server, deps) {
             return fail(`No se pudo listar el correo: ${e.message}`);
         }
     });
-    server.tool("futurerp_mail_get", "Read one message from the trámites mailbox: headers, plain-text body (HTML stripped when there is no text part) and the list of attachments. Marks it read.", { message_id: z.string().min(3) }, async ({ message_id }) => {
+    tool("futurerp_mail_get", "Read one message from the trámites mailbox: headers, plain-text body (HTML stripped when there is no text part) and the list of attachments. Marks it read.", { message_id: z.string().min(3) }, async ({ message_id }) => {
         try {
             const m = await gmail(`/gmail/v1/users/me/messages/${encodeURIComponent(message_id)}?format=full`);
             const out = { text: [], html: [], attachments: [] };
@@ -168,7 +170,7 @@ export function registerMailTools(server, deps) {
             return fail(`No se pudo leer el correo: ${e.message}`);
         }
     });
-    server.tool("futurerp_mail_send", "Send an email from the trámites mailbox. Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.", {
+    tool("futurerp_mail_send", "Send an email from the trámites mailbox. Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.", {
         to: z.string().email(),
         subject: z.string().min(3).max(200),
         text: z.string().min(1).max(20000),

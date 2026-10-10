@@ -4,6 +4,7 @@ export interface MailDeps {
     uuidRx: RegExp;
     restBase: string;
     authHeaders: (extra?: Record<string, string>) => Record<string, string>;
+    serviceHeaders: (extra?: Record<string, string>) => Record<string, string>;
     sbApi: (path: string, headers?: Record<string, string>) => Promise<any>;
 }
 export declare function mailConfigured(): boolean;

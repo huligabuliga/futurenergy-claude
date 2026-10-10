@@ -11,6 +11,7 @@
  * src/types/tramite.ts and src/config/tramiteRequirements.ts. Keep in sync.
  */
 import { z } from "zod";
+import { guardedTool } from "./guard.js";
 const OPENWA_API_URL = (process.env.OPENWA_API_URL ?? "").replace(/\/$/, "");
 const OPENWA_API_KEY = process.env.OPENWA_API_KEY ?? "";
 const WA_SENDS_PER_HOUR = 20;
@@ -79,6 +80,7 @@ const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerTramiteTools(server, deps) {
     const { userId, restBase, uuidRx, authHeaders, serviceHeaders, sbApi, sbRpc } = deps;
+    const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
     async function sbWrite(method, path, body, prefer = "return=representation") {
         const res = await fetch(`${restBase}${path}`, { method, headers: authHeaders({ Prefer: prefer }), body: JSON.stringify(body) });
         const txt = await res.text();
@@ -110,7 +112,7 @@ export function registerTramiteTools(server, deps) {
         }, "return=minimal");
     }
     // ── futurerp_tramite_create ───────────────────────────────────────────────
-    server.tool("futurerp_tramite_create", "Create a trámite (CFE procedure) on a project in its first stage and seed its document slots, exactly like the app's 'Nuevo trámite'. Refuses if the project already has a trámite of that tipo; a project has at most ONE primary (bidireccional) trámite, whatever the zona. Logs a note on the project timeline.", {
+    tool("futurerp_tramite_create", "Create a trámite (CFE procedure) on a project in its first stage and seed its document slots, exactly like the app's 'Nuevo trámite'. Refuses if the project already has a trámite of that tipo; a project has at most ONE primary (bidireccional) trámite, whatever the zona. Logs a note on the project timeline.", {
         project_id: z.string().describe("Project uuid or EFU code"),
         tipo: z.enum(TIPOS).describe("Trámite tipo. Primary tipos follow the project's zona_cfe: DD11→primary_bidireccional_dd11, DD10→primary_dd10, DD12→primary_dd12, DD06→primary_dd06, foraneo→primary_foraneo"),
         comentarios: z.string().optional().describe("Why it is being created (shown on the trámite and in the timeline)"),
@@ -153,7 +155,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_tramite_update ───────────────────────────────────────────────
-    server.tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list, unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
+    tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list, unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
         tramite_id: z.string().uuid(),
         patch: z.object({
             stage: z.string().optional(),
@@ -246,7 +248,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_project_set_zona_cfe ─────────────────────────────────────────
-    server.tool("futurerp_project_set_zona_cfe", "Set the project's CFE zone (DD10, DD11, DD12, DD06, foraneo) through the app's RPC. The zone decides which primary trámite tipo applies and when it is eligible.", {
+    tool("futurerp_project_set_zona_cfe", "Set the project's CFE zone (DD10, DD11, DD12, DD06, foraneo) through the app's RPC. The zone decides which primary trámite tipo applies and when it is eligible.", {
         project_id: z.string().describe("Project uuid or EFU code"),
         zona: z.enum(ZONAS),
         motivo: z.string().optional().describe("How it was determined (recibo, dirección…)"),
@@ -267,7 +269,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_project_tramites_requeridos_set ──────────────────────────────
-    server.tool("futurerp_project_tramites_requeridos_set", "Add (and optionally remove) required trámite labels on a project through the app's RPC (set_project_tramites_requeridos). The effective list is the manual list plus what the Visita Técnica marked; this tool is ADDITIVE: it keeps everything already there and adds `labels`. Pass `remove` to untick explicitly (the RPC records an untick as a veto, so only do it when a person asked). Labels in projects.tramites_requeridos_vetados are never re-added; they are dropped and reported. Omit `otro` to keep the current 'Otro' text; pass '' to clear it.", {
+    tool("futurerp_project_tramites_requeridos_set", "Add (and optionally remove) required trámite labels on a project through the app's RPC (set_project_tramites_requeridos). The effective list is the manual list plus what the Visita Técnica marked; this tool is ADDITIVE: it keeps everything already there and adds `labels`. Pass `remove` to untick explicitly (the RPC records an untick as a veto, so only do it when a person asked). Labels in projects.tramites_requeridos_vetados are never re-added; they are dropped and reported. Omit `otro` to keep the current 'Otro' text; pass '' to clear it.", {
         project_id: z.string().describe("Project uuid or EFU code"),
         labels: z.array(z.enum(REQUERIDO_LABELS)).describe("Labels that must be present"),
         remove: z.array(z.enum(REQUERIDO_LABELS)).optional().describe("Labels to untick (recorded as vetoes)"),
@@ -301,7 +303,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_activity_add ─────────────────────────────────────────────────
-    server.tool("futurerp_activity_add", "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for Flor. A question for Flor goes with pregunta_para_flor=true: every tramites.manage holder gets a notification pointing at the project, so the question is not just a silent note. Without a project (e.g. a gestora message that matches nothing) pass pregunta_para_flor=true and omit project_id: only the notification is sent.", {
+    tool("futurerp_activity_add", "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for Flor. A question for Flor goes with pregunta_para_flor=true: every tramites.manage holder gets a notification pointing at the project, so the question is not just a silent note. Without a project (e.g. a gestora message that matches nothing) pass pregunta_para_flor=true and omit project_id: only the notification is sent.", {
         project_id: z.string().optional().describe("Project uuid or EFU code; optional only when pregunta_para_flor is true"),
         activity_type: z.enum(ACTIVITY_TYPES).default("note"),
         subject: z.string().max(200),
@@ -343,7 +345,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_tramite_link_file ────────────────────────────────────────────
-    server.tool("futurerp_tramite_link_file", "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Use doc_key 'Comprobante de ingreso' for the gestora's ingreso PDF.", {
+    tool("futurerp_tramite_link_file", "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Use doc_key 'Comprobante de ingreso' for the gestora's ingreso PDF.", {
         tramite_id: z.string().uuid(),
         file_id: z.string().uuid().optional().describe("Existing project_files.id"),
         url: z.string().url().optional().describe("Firebase Storage URL of a file not yet registered"),
@@ -387,7 +389,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_bloqueo_open ─────────────────────────────────────────────────
-    server.tool("futurerp_bloqueo_open", "Open a bloqueo (blocker) on a project at its current stage, like the project's 'Bloqueo' button. Use categoria cfe_tramite for a trámite stuck at CFE. Refuses if an active bloqueo of the same categoria already exists.", {
+    tool("futurerp_bloqueo_open", "Open a bloqueo (blocker) on a project at its current stage, like the project's 'Bloqueo' button. Use categoria cfe_tramite for a trámite stuck at CFE. Refuses if an active bloqueo of the same categoria already exists.", {
         project_id: z.string().describe("Project uuid or EFU code"),
         categoria: z.enum(BLOQUEO_CATEGORIAS),
         dependencia: z.enum(BLOQUEO_DEPENDENCIAS).describe("Who the resolution depends on"),
@@ -408,7 +410,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_whatsapp_send ────────────────────────────────────────────────
-    server.tool("futurerp_whatsapp_send", "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media. The message is recorded in the inbox like any outbound.", {
+    tool("futurerp_whatsapp_send", "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media. The message is recorded in the inbox like any outbound.", {
         conversation_id: z.string().uuid().optional(),
         chat_id: z.string().optional().describe("Phone digits (E.164 without +) or a WhatsApp chat id (…@c.us / …@g.us)"),
         text: z.string().min(1).max(4096),
@@ -478,7 +480,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_verification_tick ────────────────────────────────────────────
-    server.tool("futurerp_verification_tick", "Tick one item of the project's closing checklist (verificacion_cierre, stage Instalación Pagada → Funcionando) through the app's RPC: medidor_instalado when CFE changed the meter, sistema_inyectando when it is confirmed generating. The RPC refuses unless you are in that checklist's approver group.", {
+    tool("futurerp_verification_tick", "Tick one item of the project's closing checklist (verificacion_cierre, stage Instalación Pagada → Funcionando) through the app's RPC: medidor_instalado when CFE changed the meter, sistema_inyectando when it is confirmed generating. The RPC refuses unless you are in that checklist's approver group.", {
         project_id: z.string().describe("Project uuid or EFU code"),
         item_key: z.enum(CIERRE_ITEMS),
         checked: z.boolean().optional().describe("Default true"),

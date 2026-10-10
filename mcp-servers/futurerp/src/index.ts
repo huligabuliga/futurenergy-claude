@@ -35,6 +35,8 @@ import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerTramiteTools } from "./tramites.js";
 import { registerMailTools } from "./mail.js";
+import { registerDocumentTools } from "./documents.js";
+import { registerOpsTools } from "./ops.js";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
@@ -3400,11 +3402,14 @@ if (auth.extra?.tramitesManage === true) {
     sbApi,
     sbRpc,
   });
+  registerDocumentTools(server, { userId: (auth.extra?.userId as string) ?? "", uuidRx: UUID_RX, restBase: REST_BASE, authHeaders, sbApi });
+  registerOpsTools(server, { sbRpc });
   registerMailTools(server, {
     userId: (auth.extra?.userId as string) ?? "",
     uuidRx: UUID_RX,
     restBase: REST_BASE,
     authHeaders,
+    serviceHeaders,
     sbApi,
   });
 }

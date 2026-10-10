@@ -16,12 +16,14 @@
 import { createSign, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { guardedTool } from "./guard.js";
 
 export interface MailDeps {
   userId: string;
   uuidRx: RegExp;
   restBase: string;
   authHeaders: (extra?: Record<string, string>) => Record<string, string>;
+  serviceHeaders: (extra?: Record<string, string>) => Record<string, string>;
   sbApi: (path: string, headers?: Record<string, string>) => Promise<any>;
 }
 
@@ -140,10 +142,11 @@ const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true as const });
 
 export function registerMailTools(server: McpServer, deps: MailDeps) {
-  const { userId, uuidRx, restBase, authHeaders, sbApi } = deps;
+  const { userId, uuidRx, restBase, authHeaders, serviceHeaders, sbApi } = deps;
+  const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
   const mailbox = process.env.TRAMI_MAILBOX ?? "";
 
-  server.tool(
+  tool(
     "futurerp_mail_list",
     `List messages in the trámites mailbox (${mailbox || "not configured"}) with a Gmail search query. Default: unread mail. Returns id, from, to, subject, date and the snippet; open one with futurerp_mail_get.`,
     {
@@ -165,7 +168,7 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
     },
   );
 
-  server.tool(
+  tool(
     "futurerp_mail_get",
     "Read one message from the trámites mailbox: headers, plain-text body (HTML stripped when there is no text part) and the list of attachments. Marks it read.",
     { message_id: z.string().min(3) },
@@ -184,7 +187,7 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
     },
   );
 
-  server.tool(
+  tool(
     "futurerp_mail_send",
     "Send an email from the trámites mailbox. Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.",
     {

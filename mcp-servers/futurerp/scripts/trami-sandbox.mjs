@@ -68,6 +68,9 @@ const pv = (await rest("/system_config?config_key=eq.postventa_approvers&select=
 const list = (() => { try { return JSON.parse(pv ?? "[]"); } catch { return []; } })();
 if (!list.includes(email)) await rest("/system_config?config_key=eq.postventa_approvers", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: JSON.stringify([...list, email]) }) });
 
+// Mode: TRAMI_MODE=live writes for real; default shadow records intentions only.
+await rest("/system_config?config_key=eq.trami_mode", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ config_value: process.env.TRAMI_MODE === "live" ? "live" : "shadow" }) });
+
 // ── server ──────────────────────────────────────────────────────────────────
 const child = spawn(process.execPath, [resolve(here, "../dist/index.js")], {
   env: { ...process.env, OPENWA_API_URL: `http://127.0.0.1:${OPENWA_PORT}`, OPENWA_API_KEY: "openwa-sandbox", TRAMI_GMAIL_SERVICE_ACCOUNT: SA_JSON, TRAMI_MAILBOX: "tramites@futurenergy.mx", GOOGLE_TOKEN_URL: `http://127.0.0.1:${GOOGLE_PORT}/token`, GMAIL_API_BASE: `http://127.0.0.1:${GOOGLE_PORT}`, SUPABASE_URL: SB, SUPABASE_PUBLISHABLE_KEY: PUB, SUPABASE_SERVICE_ROLE_KEY: SVC, PORT: String(PORT), MCP_PUBLIC_URL: `http://localhost:${PORT}/mcp`, MCP_SKIP_AS_METADATA: "1" },
