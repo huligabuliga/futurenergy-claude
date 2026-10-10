@@ -70,6 +70,38 @@ function userMessage() {
   }
 }
 const first = userMessage();
+// The cause of this run, in the same shape trami-dispatch stores on agent_sessions.disparador,
+// so the Sombra feed can say "Porque: …" for local runs too.
+function disparador() {
+  const project = args.project ?? null;
+  switch (args.scenario) {
+    case "stage_change": return { tipo: "etapa", etapa: args.stage ?? "anticipo 1 pagado", de: null };
+    case "docs_change": return { tipo: "archivo", archivo: args.file ?? "documento.pdf", slot: args.slot ?? "Recibo CFE" };
+    case "whatsapp": return { tipo: "gestora", de: args.from ?? "Iris Reyna", texto: String(args.text ?? "").slice(0, 300), chatId: args.chat ?? null };
+    case "cliente": return { tipo: "cliente", de: args.from ?? "cliente", texto: String(args.text ?? "").slice(0, 300), archivo: args.media ? (args.mediatype ?? "document") : null, chatId: args.chat ?? null };
+    case "sweep": return { tipo: "rutina", nombre: "Barrido de la mañana" };
+    case "rutina": return { tipo: "rutina", nombre: args.name };
+    default: {
+      // A dispatcher-rendered message (trami-e2e-cliente.sh) carries its cause in the first line.
+      const m = String(args.message ?? "");
+      const cli = m.match(/^Mensaje nuevo de un CLIENTE.*: ([^:,\n]+), proyecto ([^\s(]+)/);
+      const body = (m.match(/<untrusted source="whatsapp">\n([\s\S]*?)\n<\/untrusted>/) ?? [])[1]?.split("\n")[0] ?? "";
+      if (cli) return { tipo: "cliente", de: cli[1], texto: body.slice(0, 300), viaTrami: !/al número de un vendedor/.test(m) };
+      if (/^Mensaje nuevo de WhatsApp/.test(m)) return { tipo: "gestora", de: (m.match(/Remitente: ([^.]+)\./) ?? [])[1] ?? "Iris", texto: body.slice(0, 300) };
+      return { tipo: "manual", nombre: "runner local", texto: m.slice(0, 200) };
+    }
+  }
+}
+// The LOCAL service key comes from the sandbox (the .env may hold another project's key).
+const SB_URL = sb.sb, SVC = sb.serviceKey ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
+async function ledger(method, path, body) {
+  if (!SVC) return null;
+  const r = await fetch(`${SB_URL}/rest/v1${path}`, { method, headers: { apikey: SVC, Authorization: `Bearer ${SVC}`, "Content-Type": "application/json", Prefer: "return=representation" }, body: body ? JSON.stringify(body) : undefined });
+  try { return await r.json(); } catch { return null; }
+}
+const disp = disparador();
+const projForLedger = args.project && /^[0-9a-f-]{36}$/i.test(args.project) ? args.project : args.project ? (await ledger("GET", `/projects?efu=eq.${encodeURIComponent(args.project)}&select=id`))?.[0]?.id ?? null : null;
+const ledgerRow = (await ledger("POST", "/agent_sessions", { agent: "trami", session_id: `local:${Date.now().toString(36)}`, trigger: disp.tipo === "cliente" || disp.tipo === "gestora" ? "whatsapp" : disp.tipo === "etapa" ? "stage_change" : disp.tipo === "archivo" ? "docs_change" : disp.tipo === "rutina" ? "deployment" : "manual", status: "open", project_id: projForLedger, chat_id: disp.chatId ?? null, disparador: disp }))?.[0] ?? null;
 console.log(`${PROVIDER} · model ${MODEL} · system ${system.length} chars · ${tools.length} tools · scenario ${args.scenario ?? "message"}`);
 if (args.dry === "true") { console.log(tools.map((t) => t.name).join(", ")); console.log("\n--- user ---\n" + first); process.exit(0); }
 if (PROVIDER === "anthropic" && !process.env.ANTHROPIC_API_KEY) { console.error("Set ANTHROPIC_API_KEY (or use --dry / --provider openai)."); process.exit(2); }
@@ -137,6 +169,7 @@ if (PROVIDER === "anthropic") {
     }
   }
 }
+if (ledgerRow?.id) await ledger("PATCH", `/agent_sessions?id=eq.${ledgerRow.id}`, { status: "terminated", last_event_at: new Date().toISOString() });
 mkdirSync(join(SANDBOX, "runs"), { recursive: true });
 const out = join(SANDBOX, "runs", `${new Date().toISOString().replace(/[:.]/g, "-")}-${args.scenario ?? "message"}.json`);
 writeFileSync(out, JSON.stringify({ provider: PROVIDER, model: MODEL, scenario: args, first, calls, usage, messages }, null, 2));

@@ -78,7 +78,7 @@ const child = spawn(process.execPath, [resolve(here, "../dist/index.js")], {
 });
 for (let i = 0; i < 50; i++) { try { if ((await fetch(`http://localhost:${PORT}/healthz`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 200)); }
 const token = (await j(`${SB}/auth/v1/token?grant_type=password`, { method: "POST", headers: { apikey: PUB, "Content-Type": "application/json" }, body: JSON.stringify({ email, password: PASS }) })).b.access_token;
-writeFileSync(resolve(OUT, "sandbox.json"), JSON.stringify({ mcp: `http://localhost:${PORT}/mcp`, token, userId, email, channel, role: role.name, sb: SB }, null, 2));
+writeFileSync(resolve(OUT, "sandbox.json"), JSON.stringify({ mcp: `http://localhost:${PORT}/mcp`, token, userId, email, channel, role: role.name, sb: SB, serviceKey: SVC }, null, 2));
 console.log(`trami sandbox up: mcp http://localhost:${PORT}/mcp · user ${email} (${role.name}) · channel ${channel} · out ${OUT}`);
 const bye = () => { child.kill(); process.exit(0); };
 process.on("SIGINT", bye); process.on("SIGTERM", bye);

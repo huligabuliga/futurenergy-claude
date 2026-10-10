@@ -34,7 +34,7 @@ P="$PAYLOAD" H="$HIST" deno eval --quiet "import { renderWhatsAppMessage } from 
 echo "3. dispatcher text ($(wc -c < "$TEXTFILE") chars): $(head -c 220 "$TEXTFILE" | tr '\n' ' ')…"
 T0=$(date -u +%FT%TZ)
 echo "4. session:"
-node "$HERE/trami-local-agent.mjs" --message "$(cat "$TEXTFILE")" | grep -E "^  → |^\[trami\]|tool calls" | cut -c1-240
+node "$HERE/trami-local-agent.mjs" --message "$(cat "$TEXTFILE")" --project "$(echo "$PAYLOAD" | python3 -c "import sys,json; print(json.load(sys.stdin).get('efu') or '')")" | grep -E "^  → |^\[trami\]|tool calls" | cut -c1-240
 echo "5. what it would have done (shadow rows):"
 q "select '   - '||tool_name||' · '||left(resumen,200) from agent_shadow_calls where created_at >= '$T0' order by created_at"
 rm -f "$TEXTFILE"
