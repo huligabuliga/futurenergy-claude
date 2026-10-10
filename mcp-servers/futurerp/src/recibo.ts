@@ -16,7 +16,9 @@ export interface Recibo {
   total: number | null;
   limite_pago: string | null;
   corte_a_partir: string | null;
-  /** Words on the bill that mean the client owes CFE something. */
+  /** Previous balance carried on the bill (ADEUDO/SALDO ANTERIOR), 0 when the line says 0. */
+  adeudo_anterior: number | null;
+  /** Signals that the client owes CFE something: a non-zero previous balance, a cut-off notice, a suspended service. */
   senales_adeudo: string[];
   /** Days from periodo_fin to `hoy` (null when the period is unreadable). */
   antiguedad_dias: number | null;
@@ -54,7 +56,13 @@ export function parseRecibo(text: string, hoy: Date = new Date()): Recibo {
   const periodo = u.match(/PERIODO FACTURADO:\s*(\d{2} [A-Z]{3} \d{2})\s*-\s*(\d{2} [A-Z]{3} \d{2})/);
   const periodo_fin = fechaCfe(periodo?.[2]);
   const totalRaw = g(/TOTAL A PAGAR:\s*\$?\s*([\d,]+(?:\.\d+)?)/);
-  const senales = ["SALDO ANTERIOR", "ADEUDO", "AVISO DE CORTE", "SERVICIO SUSPENDIDO", "RECONEXI"].filter((w) => u.includes(w));
+  // Every bill prints an "ADEUDO ANTERIOR" line; it only matters when the amount is not zero.
+  const adeudoRaw = u.match(/(?:ADEUDO|SALDO) ANTERIOR[^\d$\n]*\n?\s*\$?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
+  const adeudo_anterior = adeudoRaw != null ? Number(adeudoRaw.replace(/,/g, "")) : null;
+  const senales = [
+    ...(adeudo_anterior ? ["ADEUDO ANTERIOR"] : []),
+    ...["AVISO DE CORTE", "SERVICIO SUSPENDIDO", "RECONEXI"].filter((w) => u.includes(w)),
+  ];
   return {
     titular,
     numero_servicio: g(/NO\. DE SERVICIO:\s*(\d{10,14})/),
@@ -68,6 +76,7 @@ export function parseRecibo(text: string, hoy: Date = new Date()): Recibo {
     total: totalRaw ? Number(totalRaw.replace(/,/g, "")) : null,
     limite_pago: fechaCfe(g(/L[ÍI]MITE DE PAGO:\s*(\d{2} [A-Z]{3} \d{2})/)),
     corte_a_partir: fechaCfe(g(/CORTE A PARTIR:\s*(\d{2} [A-Z]{3} \d{2})/)),
+    adeudo_anterior,
     senales_adeudo: senales,
     antiguedad_dias: periodo_fin ? Math.round((hoy.getTime() - new Date(periodo_fin + "T12:00:00-06:00").getTime()) / 86_400_000) : null,
   };

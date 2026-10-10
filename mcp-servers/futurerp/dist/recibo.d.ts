@@ -16,7 +16,9 @@ export interface Recibo {
     total: number | null;
     limite_pago: string | null;
     corte_a_partir: string | null;
-    /** Words on the bill that mean the client owes CFE something. */
+    /** Previous balance carried on the bill (ADEUDO/SALDO ANTERIOR), 0 when the line says 0. */
+    adeudo_anterior: number | null;
+    /** Signals that the client owes CFE something: a non-zero previous balance, a cut-off notice, a suspended service. */
     senales_adeudo: string[];
     /** Days from periodo_fin to `hoy` (null when the period is unreadable). */
     antiguedad_dias: number | null;

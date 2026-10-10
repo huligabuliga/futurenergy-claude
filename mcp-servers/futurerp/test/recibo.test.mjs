@@ -49,9 +49,13 @@ test("parseRecibo reads the fields the trámite needs", () => {
   assert.equal(r.antiguedad_dias, 26);
 });
 test("adeudo signals and DD12 account", () => {
-  const r = parseRecibo(SAMPLE.replace("CUENTA:25DD11H", "CUENTA:25DD12H") + "\nSALDO ANTERIOR $1,200\nAVISO DE CORTE");
+  const r = parseRecibo(SAMPLE.replace("CUENTA:25DD11H", "CUENTA:25DD12H") + "\nADEUDO ANTERIOR\n$1,200\nAVISO DE CORTE");
   assert.equal(r.zona, "DD12");
-  assert.deepEqual(r.senales_adeudo, ["SALDO ANTERIOR", "AVISO DE CORTE"]);
+  assert.equal(r.adeudo_anterior, 1200);
+  assert.deepEqual(r.senales_adeudo, ["ADEUDO ANTERIOR", "AVISO DE CORTE"]);
+  const cero = parseRecibo(SAMPLE + "\nADEUDO ANTERIOR\n$0.00");
+  assert.equal(cero.adeudo_anterior, 0);
+  assert.deepEqual(cero.senales_adeudo, []);
 });
 test("not a recibo", () => {
   assert.equal(esRecibo("INSTITUTO NACIONAL ELECTORAL CREDENCIAL PARA VOTAR"), false);

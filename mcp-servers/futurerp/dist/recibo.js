@@ -30,7 +30,13 @@ export function parseRecibo(text, hoy = new Date()) {
     const periodo = u.match(/PERIODO FACTURADO:\s*(\d{2} [A-Z]{3} \d{2})\s*-\s*(\d{2} [A-Z]{3} \d{2})/);
     const periodo_fin = fechaCfe(periodo?.[2]);
     const totalRaw = g(/TOTAL A PAGAR:\s*\$?\s*([\d,]+(?:\.\d+)?)/);
-    const senales = ["SALDO ANTERIOR", "ADEUDO", "AVISO DE CORTE", "SERVICIO SUSPENDIDO", "RECONEXI"].filter((w) => u.includes(w));
+    // Every bill prints an "ADEUDO ANTERIOR" line; it only matters when the amount is not zero.
+    const adeudoRaw = u.match(/(?:ADEUDO|SALDO) ANTERIOR[^\d$\n]*\n?\s*\$?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
+    const adeudo_anterior = adeudoRaw != null ? Number(adeudoRaw.replace(/,/g, "")) : null;
+    const senales = [
+        ...(adeudo_anterior ? ["ADEUDO ANTERIOR"] : []),
+        ...["AVISO DE CORTE", "SERVICIO SUSPENDIDO", "RECONEXI"].filter((w) => u.includes(w)),
+    ];
     return {
         titular,
         numero_servicio: g(/NO\. DE SERVICIO:\s*(\d{10,14})/),
@@ -44,6 +50,7 @@ export function parseRecibo(text, hoy = new Date()) {
         total: totalRaw ? Number(totalRaw.replace(/,/g, "")) : null,
         limite_pago: fechaCfe(g(/L[ÍI]MITE DE PAGO:\s*(\d{2} [A-Z]{3} \d{2})/)),
         corte_a_partir: fechaCfe(g(/CORTE A PARTIR:\s*(\d{2} [A-Z]{3} \d{2})/)),
+        adeudo_anterior,
         senales_adeudo: senales,
         antiguedad_dias: periodo_fin ? Math.round((hoy.getTime() - new Date(periodo_fin + "T12:00:00-06:00").getTime()) / 86_400_000) : null,
     };
