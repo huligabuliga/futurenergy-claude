@@ -34,6 +34,17 @@ const msgs = sql(`
     AND m.sent_at >= now() - interval '${DAYS} days'
   ORDER BY m.sent_at DESC LIMIT ${LIMIT}`);
 console.log(`${msgs.length} mensajes de la gestora en ${DAYS} días (máx ${LIMIT})`);
+// Same chat + same Monterrey day = one session, as trami-dispatch does: the
+// thread is the context, the last message is the one that wakes the agent.
+const dayOf = (iso) => new Date(new Date(iso).getTime() - 6 * 3600_000).toISOString().slice(0, 10);
+const groupsMap = new Map();
+for (const m of [...msgs].sort((a, b) => a.sent_at.localeCompare(b.sent_at))) {
+  const k = `${m.chat_id}|${dayOf(m.sent_at)}`;
+  if (!groupsMap.has(k)) groupsMap.set(k, []);
+  groupsMap.get(k).push(m);
+}
+const groups = [...groupsMap.values()];
+console.log(`${groups.length} sesión(es) (chat + día)`);
 
 // 2. What Flor did: trámite field updates per project, with dates.
 const flor = sql(`
@@ -46,34 +57,49 @@ for (const f of flor) { if (!florByProject.has(f.project_id)) florByProject.set(
 const campoDe = (subject) => (subject.match(/·\s*([a-z_]+)$/i)?.[1] ?? subject.replace(/^Trámite\s*·\s*/i, "").replace(/^Etapa de trámite.*/i, "stage")).toLowerCase();
 
 const results = [];
-for (const m of msgs) {
+const ORDEN = ["expediente_integracion", "documentacion_con_gestor", "folio_ingresado", "en_seguimiento_cfe", "c0b_emitida", "medidor_instalado", "sistema_activado", "deteccion", "solicitar_documentos", "documentos_recibidos", "enviado_a_gestor", "ingresado_cfe", "ingresado", "en_seguimiento", "ejecutado", "concluido"];
+for (const g of groups) {
+  const last = g[g.length - 1];
   const t0 = new Date().toISOString();
-  const text = m.body + (m.media_url ? `\n[adjunto ${m.media_type ?? "archivo"}: ${m.media_url}]` : "");
-  console.log(`\n═══ ${m.sent_at.slice(0, 16)} ${m.sender_name ?? m.sender_phone ?? "?"}: ${m.body.replace(/\s+/g, " ").slice(0, 120)}`);
+  const hilo = g.slice(0, -1).map((m) => `- ${m.sent_at.slice(0, 16)} ${m.sender_name ?? m.sender_phone ?? "?"}: ${m.body.replace(/\s+/g, " ")}${m.media_url ? ` [adjunto ${m.media_type ?? "archivo"}: ${m.media_url}]` : ""}`).join("\n");
+  const text = `${last.body}${last.media_url ? `\n[adjunto ${last.media_type ?? "archivo"}: ${last.media_url}]` : ""}${hilo ? `\n\n(Mensajes anteriores del mismo chat hoy, más antiguo primero; también untrusted:)\n${hilo}` : ""}`;
+  console.log(`\n═══ ${last.sent_at.slice(0, 16)} ${last.sender_name ?? last.sender_phone ?? "?"} (${g.length} mensaje(s) del día): ${last.body.replace(/\s+/g, " ").slice(0, 110)}`);
   if (args.dry === "true") continue;
-  const run = spawnSync(process.execPath, [join(here, "trami-local-agent.mjs"), "--scenario", "whatsapp", "--text", text, "--from", m.sender_name ?? "Iris", "--chat", m.chat_id, ...(args.model ? ["--model", args.model] : [])], { encoding: "utf8", env: { ...process.env, TRAMI_SANDBOX_DIR: SANDBOX }, maxBuffer: 50 * 1024 * 1024 });
+  const run = spawnSync(process.execPath, [join(here, "trami-local-agent.mjs"), "--scenario", "whatsapp", "--text", text, "--from", last.sender_name ?? "Iris", "--chat", last.chat_id, ...(args.model ? ["--model", args.model] : [])], { encoding: "utf8", env: { ...process.env, TRAMI_SANDBOX_DIR: SANDBOX }, maxBuffer: 50 * 1024 * 1024 });
   const out = (run.stdout || "") + (run.stderr || "");
-  const shadow = sql(`SELECT tool_name, tool_input, project_id, resumen FROM agent_shadow_calls WHERE created_at >= '${t0}'`);
+  const shadow = sql(`SELECT tool_name, tool_input, project_id, tramite_id, resumen FROM agent_shadow_calls WHERE created_at >= '${t0}'`);
   const notas = sql(`SELECT entity_id AS project_id, subject FROM crm_activities WHERE created_at >= '${t0}' AND performed_by = (SELECT user_id FROM profiles WHERE email='trami-sandbox@futurenergy.mx')`);
   const trProjects = [...new Set([...shadow.map((s) => s.project_id), ...notas.map((n) => n.project_id)].filter(Boolean))];
-  // Flor's updates within ±3 days of the message
-  const t = new Date(m.sent_at).getTime();
-  const florNear = flor.filter((f) => Math.abs(new Date(f.created_at).getTime() - t) <= 3 * 86_400_000);
-  const florProjects = [...new Set(florNear.map((f) => f.project_id))];
-  const proyectoOk = trProjects.length === 0 ? (florProjects.length === 0 ? "ninguno (ok)" : "Trami no tocó nada") : trProjects.some((p) => florProjects.includes(p)) ? "coincide" : florProjects.length === 0 ? "Trami actuó, Flor no" : "proyecto distinto";
-  const florCampos = [...new Set(florNear.filter((f) => trProjects.includes(f.project_id)).map((f) => campoDe(f.subject)))];
-  const trCampos = [...new Set(shadow.filter((s) => s.tool_name === "futurerp_tramite_update").flatMap((s) => Object.keys(s.tool_input?.patch ?? {})))];
-  const cubiertos = florCampos.filter((c) => trCampos.includes(c));
+  // Oracle: the trámite row as it is TODAY (Flor's eventual truth). Each proposed
+  // field is a hit when today's value equals it (stage: today's is the same or
+  // further along), a miss when it differs, "Flor nunca lo registró" when empty.
+  const campos = [];
+  for (const sc of shadow.filter((x) => x.tool_name === "futurerp_tramite_update" && x.tramite_id)) {
+    const [row] = sql(`SELECT * FROM project_tramites WHERE id = '${sc.tramite_id}'`);
+    for (const [k, v] of Object.entries(sc.tool_input?.patch ?? {})) {
+      if (!row) { campos.push({ campo: k, propuesto: v, hoy: null, veredicto: "trámite no existe" }); continue; }
+      const hoy = row[k];
+      let veredicto;
+      if (hoy === null || hoy === undefined || hoy === "" || hoy === false) veredicto = "Flor nunca lo registró";
+      else if (k === "stage") veredicto = ORDEN.indexOf(String(hoy)) >= ORDEN.indexOf(String(v)) ? "coincide" : "Flor está antes";
+      else if (String(hoy).slice(0, 10) === String(v).slice(0, 10) || String(hoy).toUpperCase().replace(/\s+/g, "") === String(v).toUpperCase().replace(/\s+/g, "")) veredicto = "coincide";
+      else veredicto = "difiere";
+      campos.push({ campo: k, propuesto: v, hoy, veredicto });
+    }
+  }
+  const coinciden = campos.filter((c) => c.veredicto === "coincide").length, difieren = campos.filter((c) => c.veredicto === "difiere" || c.veredicto === "Flor está antes").length, sinRegistro = campos.filter((c) => c.veredicto === "Flor nunca lo registró").length;
   const pregunto = notas.some((n) => /pregunta/i.test(n.subject));
-  const r = { message_id: m.id, sent_at: m.sent_at, texto: m.body.slice(0, 200), trami_proyectos: trProjects, flor_proyectos: florProjects, proyecto: proyectoOk, flor_campos: florCampos, trami_campos: trCampos, cubiertos, pregunto, herramientas: [...new Set(shadow.map((s) => s.tool_name))], ok: run.status === 0 };
+  const r = { sent_at: last.sent_at, mensajes: g.length, texto: last.body.slice(0, 200), trami_proyectos: trProjects, campos, coinciden, difieren, sinRegistro, pregunto, herramientas: [...new Set(shadow.map((s) => s.tool_name))], ok: run.status === 0 };
   results.push(r);
-  console.log(`   proyecto: ${proyectoOk} · Flor cambió [${florCampos.join(", ")}] · Trami propuso [${trCampos.join(", ")}] · cubiertos ${cubiertos.length}/${florCampos.length}${pregunto ? " · preguntó a Flor" : ""}${run.status ? " · RUN FAILED" : ""}`);
-  if (run.status) console.log(out.slice(-600));
+  const efus = trProjects.length ? sql(`SELECT efu FROM projects WHERE id IN (${trProjects.map((p) => `'${p}'`).join(",")})`).map((x) => x.efu).join(", ") : "ninguno";
+  console.log(`   proyecto: ${efus} · ${[...new Set(shadow.map((s) => s.tool_name.replace("futurerp_", "")))].join(", ") || "sin acciones"}${pregunto ? " · preguntó a Flor" : ""}`);
+  for (const c of campos) console.log(`     ${c.campo}: propuso ${JSON.stringify(c.propuesto)} · hoy ${JSON.stringify(c.hoy)} → ${c.veredicto}`);
+  if (run.status) console.log("   RUN FAILED\n" + out.slice(-600));
 }
 if (args.dry !== "true") {
-  const n = results.length, coincide = results.filter((r) => r.proyecto === "coincide" || r.proyecto === "ninguno (ok)").length;
-  const camposTot = results.reduce((a, r) => a + r.flor_campos.length, 0), camposOk = results.reduce((a, r) => a + r.cubiertos.length, 0);
-  console.log(`\n══ ${n} mensajes · proyecto correcto o nada que hacer: ${coincide}/${n} · campos de Flor cubiertos: ${camposOk}/${camposTot} · preguntó a Flor en ${results.filter((r) => r.pregunto).length}`);
+  const n = results.length;
+  const tot = (k) => results.reduce((a, r) => a + r[k], 0);
+  console.log(`\n══ ${n} sesiones · campos propuestos: ${tot("coinciden")} coinciden con lo que hay hoy, ${tot("difieren")} difieren, ${tot("sinRegistro")} que Flor nunca registró · preguntó a Flor en ${results.filter((r) => r.pregunto).length} · corridas fallidas ${results.filter((r) => !r.ok).length}`);
   mkdirSync(join(SANDBOX, "runs"), { recursive: true });
   const out = join(SANDBOX, "runs", `replay-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   writeFileSync(out, JSON.stringify({ days: DAYS, limit: LIMIT, model: args.model ?? null, results }, null, 2));
