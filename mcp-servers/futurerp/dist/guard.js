@@ -3,7 +3,7 @@ export const SHADOW_TOOLS = new Set([
     "futurerp_tramite_create", "futurerp_tramite_update", "futurerp_tramite_link_file",
     "futurerp_project_set_zona_cfe", "futurerp_project_tramites_requeridos_set",
     "futurerp_bloqueo_open", "futurerp_verification_tick",
-    "futurerp_whatsapp_send", "futurerp_mail_send",
+    "futurerp_whatsapp_send", "futurerp_mail_draft",
 ]);
 let modeCache = { at: 0, mode: "shadow" };
 const MODE_TTL_MS = Number(process.env.TRAMI_MODE_CACHE_MS ?? 30_000);
@@ -34,7 +34,7 @@ export function describeCall(name, a) {
         case "futurerp_bloqueo_open": return `Abrir bloqueo ${a.categoria ?? "cfe_tramite"} en ${a.project_id}: ${short(a.motivo, 100)}`;
         case "futurerp_verification_tick": return `Palomear ${a.item_key} en el checklist de ${a.project_id}`;
         case "futurerp_whatsapp_send": return `WhatsApp a ${a.chat_id ?? a.conversation_id}: "${short(a.text, 120)}"${a.media_url ? " + archivo" : ""}`;
-        case "futurerp_mail_send": return `Correo a ${a.to}: "${short(a.subject, 100)}" (${(a.attachment_file_ids ?? []).length} adjuntos)`;
+        case "futurerp_mail_draft": return `Borrador de correo a ${a.to}: "${short(a.subject, 100)}" (${(a.attachment_file_ids ?? []).length} adjuntos)`;
         default: return `${name} ${short(a, 200)}`;
     }
 }

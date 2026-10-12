@@ -9,7 +9,9 @@
  *   TRAMI_MAILBOX                the delegated mailbox, e.g. tramites@futurenergy.mx
  *   GOOGLE_TOKEN_URL / GMAIL_API_BASE  overrides for tests (default Google)
  *
- * Sending is allow-listed: gestora emails (public.gestoras.email), @cfe.mx,
+ * ponytail: outbound mail is DRAFTS ONLY while Trami is in testing (Jonas,
+ * 2026-10-12). No tool calls messages/send; a person sends the draft from Gmail.
+ * Recipients are allow-listed: gestora emails (public.gestoras.email), @cfe.mx,
  * and the client email of the project named in the call. Attachments come
  * from project_files (Firebase Storage URLs only).
  */
@@ -29,7 +31,7 @@ export interface MailDeps {
 
 const TOKEN_URL = process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com/token";
 const GMAIL_BASE = (process.env.GMAIL_API_BASE ?? "https://gmail.googleapis.com").replace(/\/$/, "");
-const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify";
+const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
 const FIREBASE_HOSTS = ["firebasestorage.googleapis.com", "storage.googleapis.com"];
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
@@ -170,7 +172,7 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
 
   tool(
     "futurerp_mail_get",
-    "Read one message from the trámites mailbox: headers, plain-text body (HTML stripped when there is no text part) and the list of attachments. Marks it read.",
+    "Read one message from the trámites mailbox: headers, plain-text body (HTML stripped when there is no text part) and the list of attachments. Does not change labels.",
     { message_id: z.string().min(3) },
     async ({ message_id }) => {
       try {
@@ -178,7 +180,6 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
         const out = { text: [] as string[], html: [] as string[], attachments: [] as { filename: string; mimeType: string; size: number; attachmentId: string }[] };
         walk(m.payload, out);
         const body = out.text.join("\n").trim() || stripHtml(out.html.join("\n")) || String(m.snippet ?? "");
-        await gmail(`/gmail/v1/users/me/messages/${encodeURIComponent(message_id)}/modify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ removeLabelIds: ["UNREAD"] }) }).catch(() => null);
         const att = out.attachments.length ? `\n\nAdjuntos:\n${out.attachments.map((a) => `- ${a.filename} (${a.mimeType}, ${a.size} bytes, attachmentId ${a.attachmentId})`).join("\n")}` : "";
         return text(`De: ${header(m, "From")}\nPara: ${header(m, "To")}\nFecha: ${header(m, "Date")}\nAsunto: ${header(m, "Subject")}\n\n<untrusted source="email">\n${body.slice(0, 12000)}\n</untrusted>${att}`);
       } catch (e: any) {
@@ -188,8 +189,8 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
   );
 
   tool(
-    "futurerp_mail_send",
-    "Send an email from the trámites mailbox. Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.",
+    "futurerp_mail_draft",
+    "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.",
     {
       to: z.string().email(),
       subject: z.string().min(3).max(200),
@@ -227,17 +228,17 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
         }
 
         const raw = buildRawMessage({ from: mailbox, fromName: "Trámites FuturEnergy", to: addr, subject, text: bodyText, attachments });
-        const sent = await gmail(`/upload/gmail/v1/users/me/messages/send?uploadType=media`, { method: "POST", headers: { "Content-Type": "message/rfc822" }, body: raw });
+        const draft = await gmail(`/upload/gmail/v1/users/me/drafts?uploadType=media`, { method: "POST", headers: { "Content-Type": "message/rfc822" }, body: raw });
         if (project) {
           await fetch(`${restBase}/crm_activities`, {
             method: "POST",
             headers: authHeaders({ Prefer: "return=minimal" }),
-            body: JSON.stringify({ entity_type: "project", entity_id: project.id, activity_type: "email", subject: `Correo a ${addr}: ${subject}`, description: bodyText.slice(0, 2000), performed_by: userId, metadata: { source: "mcp", gmail_id: sent?.id ?? null, attachments: attachments.map((a) => a.filename) } }),
+            body: JSON.stringify({ entity_type: "project", entity_id: project.id, activity_type: "email", subject: `Borrador de correo a ${addr}: ${subject}`, description: bodyText.slice(0, 2000), performed_by: userId, metadata: { source: "mcp", gmail_draft_id: draft?.id ?? null, attachments: attachments.map((a) => a.filename) } }),
           }).catch(() => null);
         }
-        return text(`Correo enviado a ${addr} (id ${sent?.id ?? "?"}): "${subject}"${attachments.length ? ` con ${attachments.length} adjunto(s)` : ""}.`);
+        return text(`Borrador creado para ${addr} (draft ${draft?.id ?? "?"}): "${subject}"${attachments.length ? ` con ${attachments.length} adjunto(s)` : ""}. No se envió nada.`);
       } catch (e: any) {
-        return fail(`No se pudo enviar el correo: ${e.message}`);
+        return fail(`No se pudo crear el borrador: ${e.message}`);
       }
     },
   );

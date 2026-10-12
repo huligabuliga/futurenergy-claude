@@ -38,7 +38,7 @@ const googleMock = createServer(async (req, res) => {
   const body = await readBody(req); res.setHeader("content-type", "application/json");
   if (req.url === "/token") return res.end(JSON.stringify({ access_token: "ya29.mock", expires_in: 3600 }));
   if (req.url.startsWith("/gmail/v1/users/me/messages?")) return res.end(JSON.stringify({ messages: [] }));
-  if (req.url.startsWith("/upload/gmail/v1/users/me/messages/send")) {
+  if (req.url.startsWith("/upload/gmail/v1/users/me/drafts")) {
     // raw = base64url RFC822; decode the headers + text part for the log
     let decoded = ""; try { const m = JSON.parse(body); decoded = Buffer.from(m.raw ?? "", "base64url").toString("utf8"); } catch { decoded = body.slice(0, 4000); }
     log("gmail.jsonl", { raw_bytes: body.length, headers: decoded.split("\r\n\r\n")[0], text: (decoded.match(/Content-Type: text\/plain[\s\S]*?\r\n\r\n([\s\S]*?)\r\n--/) || [])[1]?.slice(0, 3000), attachments: [...decoded.matchAll(/filename="([^"]+)"/g)].map((m) => m[1]) });

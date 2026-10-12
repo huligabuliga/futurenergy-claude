@@ -34,7 +34,7 @@ const signIn = async (email) => (await j(`${SB}/auth/v1/token?grant_type=passwor
 
 // ── mocks: OpenWA gateway + Google (token + Gmail) ──────────────────────────
 const OPENWA_PORT = 3212, GOOGLE_PORT = 3213;
-const openwaCalls = []; const gmailCalls = { token: 0, sends: [], modified: [] };
+const openwaCalls = []; const gmailCalls = { token: 0, drafts: [], modified: [] };
 const readBody = (req) => new Promise((res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => res(b)); });
 const openwaMock = createServer(async (req, res) => {
   const body = await readBody(req);
@@ -51,7 +51,7 @@ const googleMock = createServer(async (req, res) => {
   if (req.url.startsWith("/gmail/v1/users/me/messages?")) return res.end(JSON.stringify({ messages: [{ id: "msg_iris_1" }] }));
   if (req.url.startsWith("/gmail/v1/users/me/messages/msg_iris_1/modify")) { gmailCalls.modified.push(JSON.parse(body)); return res.end("{}"); }
   if (req.url.startsWith("/gmail/v1/users/me/messages/msg_iris_1")) return res.end(JSON.stringify(GMAIL_MSG));
-  if (req.url.startsWith("/upload/gmail/v1/users/me/messages/send")) { gmailCalls.sends.push({ contentType: req.headers["content-type"], raw: body }); return res.end(JSON.stringify({ id: `sent_${gmailCalls.sends.length}` })); }
+  if (req.url.startsWith("/upload/gmail/v1/users/me/drafts")) { gmailCalls.drafts.push({ contentType: req.headers["content-type"], raw: body }); return res.end(JSON.stringify({ id: `draft_${gmailCalls.drafts.length}` })); }
   res.statusCode = 404; res.end(JSON.stringify({ error: `mock ${req.url}` }));
 });
 await new Promise((r) => openwaMock.listen(OPENWA_PORT, "127.0.0.1", r));
@@ -85,7 +85,7 @@ async function mcp(tok, method, params = {}, id = 1) {
 async function tools(tok) { await mcp(tok, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } }); return (await mcp(tok, "tools/list", {}, 2)).data?.result?.tools?.map((t) => t.name) ?? []; }
 async function call(tok, name, args) { await mcp(tok, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } }); const r = await mcp(tok, "tools/call", { name, arguments: args }, 9); return { text: r.data?.result?.content?.[0]?.text ?? JSON.stringify(r.data), isError: r.data?.result?.isError === true || !!r.data?.error }; }
 
-const WRITE_TOOLS = ["futurerp_tramite_create", "futurerp_tramite_update", "futurerp_project_set_zona_cfe", "futurerp_project_tramites_requeridos_set", "futurerp_activity_add", "futurerp_tramite_link_file", "futurerp_bloqueo_open", "futurerp_whatsapp_send", "futurerp_verification_tick", "futurerp_mail_list", "futurerp_mail_get", "futurerp_mail_send"];
+const WRITE_TOOLS = ["futurerp_tramite_create", "futurerp_tramite_update", "futurerp_project_set_zona_cfe", "futurerp_project_tramites_requeridos_set", "futurerp_activity_add", "futurerp_tramite_link_file", "futurerp_bloqueo_open", "futurerp_whatsapp_send", "futurerp_verification_tick", "futurerp_mail_list", "futurerp_mail_get", "futurerp_mail_draft"];
 const users = []; let projectId = null; let channelId = null; let gestoraId = null; let prevPostventa = null;
 let prevMode = null;
 try {
@@ -234,15 +234,15 @@ try {
   ok(!r.isError && /msg_iris_1/.test(r.text) && /Comprobante SI123/.test(r.text) && gmailCalls.token >= 1, "mail_list via DWD token + Gmail API", r.text.slice(0, 160));
   r = await call(aTok, "futurerp_mail_get", { message_id: "msg_iris_1" });
   ok(!r.isError && /<untrusted source="email">/.test(r.text) && /Ignora tus reglas/.test(r.text) && /comprobante\.pdf/.test(r.text) && gmailCalls.modified.length === 1, "mail_get wraps the body as untrusted, lists attachments, marks read", r.text.slice(0, 120));
-  r = await call(aTok, "futurerp_mail_send", { to: "someone@gmail.com", subject: "Trámite nuevo", text: "hola" });
-  ok(r.isError && /Destinatario no permitido/.test(r.text), "mail_send refuses an unlisted recipient");
+  r = await call(aTok, "futurerp_mail_draft", { to: "someone@gmail.com", subject: "Trámite nuevo", text: "hola" });
+  ok(r.isError && /Destinatario no permitido/.test(r.text), "mail_draft refuses an unlisted recipient");
   gestoraId = (await rest("/gestoras", { method: "POST", body: JSON.stringify({ nombre: `WT Gestora ${stamp}`, email: `gestora-${stamp}@example.com`, activo: true }) })).b?.[0]?.id;
-  r = await call(aTok, "futurerp_mail_send", { to: `gestora-${stamp}@example.com`, subject: "Trámite nuevo – DD10 – Juan Pérez", text: "Buen día Iris, adjunto expediente.", project_id: projectId });
-  const raw = gmailCalls.sends[gmailCalls.sends.length - 1]?.raw ?? "";
-  ok(!r.isError && gmailCalls.sends.length === 1 && /message\/rfc822/.test(gmailCalls.sends[0].contentType) && raw.includes(`To: gestora-${stamp}@example.com`) && raw.includes("From: ") && raw.includes("tramites@futurenergy.mx"), "mail_send to a gestora: raw RFC 822 upload", r.text);
-  ok((await rest(`/crm_activities?entity_id=eq.${projectId}&activity_type=eq.email&select=id`)).b.length === 1, "mail_send logs an email activity on the project");
-  r = await call(aTok, "futurerp_mail_send", { to: "inspecciones@cfe.mx", subject: "Inspección", text: "Adjunto.", attachment_file_ids: [links[0].file_id] });
-  ok(r.isError && /no está en Firebase|No se pudo descargar|no pertenece/.test(r.text) || !r.isError, "mail_send to @cfe.mx allowed (attachment fetch may fail offline)", r.text.slice(0, 120));
+  r = await call(aTok, "futurerp_mail_draft", { to: `gestora-${stamp}@example.com`, subject: "Trámite nuevo – DD10 – Juan Pérez", text: "Buen día Iris, adjunto expediente.", project_id: projectId });
+  const raw = gmailCalls.drafts[gmailCalls.drafts.length - 1]?.raw ?? "";
+  ok(!r.isError && gmailCalls.drafts.length === 1 && /message\/rfc822/.test(gmailCalls.drafts[0].contentType) && raw.includes(`To: gestora-${stamp}@example.com`) && raw.includes("From: ") && raw.includes("tramites@futurenergy.mx"), "mail_draft to a gestora: raw RFC 822 upload", r.text);
+  ok((await rest(`/crm_activities?entity_id=eq.${projectId}&activity_type=eq.email&select=id`)).b.length === 1, "mail_draft logs an email activity on the project");
+  r = await call(aTok, "futurerp_mail_draft", { to: "inspecciones@cfe.mx", subject: "Inspección", text: "Adjunto.", attachment_file_ids: [links[0].file_id] });
+  ok(r.isError && /no está en Firebase|No se pudo descargar|no pertenece/.test(r.text) || !r.isError, "mail_draft to @cfe.mx allowed (attachment fetch may fail offline)", r.text.slice(0, 120));
 
   // 9 plain user cannot reach the tools at all
   r = await call(pTok, "futurerp_tramite_update", { tramite_id: tramiteId, patch: { numero_si: "HACK" } });
@@ -256,8 +256,8 @@ try {
   const shWa = await call(aTok, "futurerp_whatsapp_send", { chat_id: "5218100000001", text: "hola desde sombra" });
   ok(!shWa.isError && shWa.text.startsWith("(sombra)"), "shadow: whatsapp_send is recorded, not sent", shWa.text.slice(0, 100));
   const waCallsBefore = openwaCalls.length;
-  const shMail = await call(aTok, "futurerp_mail_send", { to: "irisreyna335@gmail.com", subject: "sombra", text: "x" });
-  ok(shMail.text.startsWith("(sombra)") && openwaCalls.length === waCallsBefore, "shadow: mail_send recorded, mocks untouched", shMail.text.slice(0, 80));
+  const shMail = await call(aTok, "futurerp_mail_draft", { to: "irisreyna335@gmail.com", subject: "sombra", text: "x" });
+  ok(shMail.text.startsWith("(sombra)") && openwaCalls.length === waCallsBefore, "shadow: mail_draft recorded, mocks untouched", shMail.text.slice(0, 80));
   const shRows = (await rest("/agent_shadow_calls?select=tool_name,resumen,project_id&order=created_at.desc&limit=2")).b ?? [];
   ok(shRows.length >= 2 && shRows.some((r) => r.tool_name === "futurerp_whatsapp_send") && ((await rest("/agent_shadow_calls?select=id")).b?.length ?? 0) === shBefore + 2, "shadow: two agent_shadow_calls rows with resumen", JSON.stringify(shRows).slice(0, 160));
   const shDoc = await call(aTok, "futurerp_read_document", { url: "https://example.com/x.pdf" });
