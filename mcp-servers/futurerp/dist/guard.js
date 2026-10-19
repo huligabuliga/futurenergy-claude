@@ -177,7 +177,7 @@ export function guardedTool(server, deps) {
             const res = await handler(args, extra);
             if (res?.isError)
                 await logToolError(deps, name, args, String(res?.content?.[0]?.text ?? "error"));
-            else if (SHADOW_TOOLS.has(name) && !/^Sin cambios:/.test(String(res?.content?.[0]?.text ?? "")))
+            else if (SHADOW_TOOLS.has(name) && !/^Sin cambios\b/.test(String(res?.content?.[0]?.text ?? "")))
                 await recordLive(deps, name, args ?? {}, antes, res);
             return res;
         }
