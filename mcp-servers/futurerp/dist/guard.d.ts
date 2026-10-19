@@ -1,10 +1,12 @@
 /**
- * Trami write-tool guard: shadow mode + error logging.
+ * Trami write-tool guard: shadow mode + live ledger + error logging.
  *
  * system_config.trami_mode = 'shadow' (default) → every write tool records what
- * it WOULD do in agent_shadow_calls and returns a "(sombra)" result; nothing is
- * written, sent or mailed. 'live' → the tool runs. Flor grades the shadow rows
- * (trami_shadow_verdict) and trami_stats() reports the agreement per tool.
+ * it WOULD do in agent_shadow_calls (modo 'sombra') and returns a "(sombra)"
+ * result; nothing is written, sent or mailed. 'live' → the tool runs and the
+ * same table gets a modo 'vivo' row with the previous values (antes) and the
+ * tool's reply, so the panel shows what was done and can undo it. Flor grades
+ * both (trami_shadow_verdict); trami_stats() reports the agreement per tool.
  * Either way a tool error lands in bot_error_log (fase 'trami').
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

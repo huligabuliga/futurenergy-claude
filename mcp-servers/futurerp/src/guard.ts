@@ -1,10 +1,12 @@
 /**
- * Trami write-tool guard: shadow mode + error logging.
+ * Trami write-tool guard: shadow mode + live ledger + error logging.
  *
  * system_config.trami_mode = 'shadow' (default) → every write tool records what
- * it WOULD do in agent_shadow_calls and returns a "(sombra)" result; nothing is
- * written, sent or mailed. 'live' → the tool runs. Flor grades the shadow rows
- * (trami_shadow_verdict) and trami_stats() reports the agreement per tool.
+ * it WOULD do in agent_shadow_calls (modo 'sombra') and returns a "(sombra)"
+ * result; nothing is written, sent or mailed. 'live' → the tool runs and the
+ * same table gets a modo 'vivo' row with the previous values (antes) and the
+ * tool's reply, so the panel shows what was done and can undo it. Flor grades
+ * both (trami_shadow_verdict); trami_stats() reports the agreement per tool.
  * Either way a tool error lands in bot_error_log (fase 'trami').
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -91,6 +93,69 @@ async function resolveIds(deps: GuardDeps, a: Record<string, any>): Promise<{ pr
   return { project_id, tramite_id };
 }
 
+async function projectBy(deps: GuardDeps, ref: unknown, select: string): Promise<any | null> {
+  if (typeof ref !== "string" || !ref) return null;
+  const q = deps.uuidRx.test(ref) ? `id=eq.${ref}` : `efu=eq.${encodeURIComponent(ref)}`;
+  const p: any[] = await deps.sbApi(`/projects?${q}&select=${select}&limit=1`, deps.serviceHeaders());
+  return p?.[0] ?? null;
+}
+
+/**
+ * What the touched row holds BEFORE a live call, so trami_revertir_accion()
+ * can put it back. Only for the tools the RPC knows how to undo; null otherwise.
+ */
+async function snapshotAntes(deps: GuardDeps, name: string, a: Record<string, any>): Promise<Record<string, unknown> | null> {
+  try {
+    switch (name) {
+      case "futurerp_tramite_update": {
+        if (!a.tramite_id || !deps.uuidRx.test(a.tramite_id)) return null;
+        const rows: any[] = await deps.sbApi(`/project_tramites?id=eq.${a.tramite_id}&select=*&limit=1`, deps.serviceHeaders());
+        const cur = rows?.[0];
+        if (!cur) return null;
+        const keys = Object.keys(a.patch ?? {}).filter((k) => k !== "type_data" && k in cur);
+        if (a.patch?.type_data) keys.push("type_data");
+        if (a.patch?.enviado === true) keys.push("enviado_at", "enviado_by");
+        return Object.fromEntries(keys.map((k) => [k, cur[k] ?? null]));
+      }
+      case "futurerp_project_set_zona_cfe": {
+        const p = await projectBy(deps, a.project_id, "id,zona_cfe");
+        return p ? { zona_cfe: p.zona_cfe ?? null } : null;
+      }
+      case "futurerp_project_tramites_requeridos_set": {
+        const p = await projectBy(deps, a.project_id, "id,tramites_requeridos_manual");
+        return p ? { tramites_requeridos_manual: p.tramites_requeridos_manual ?? [] } : null;
+      }
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Live ledger row: what ran, what it replied, what it replaced. Never throws. */
+async function recordLive(deps: GuardDeps, name: string, args: Record<string, any>, antes: Record<string, unknown> | null, res: any) {
+  try {
+    const resultado = String(res?.content?.[0]?.text ?? "").slice(0, 600);
+    const ids = await resolveIds(deps, args);
+    if (name === "futurerp_tramite_create") {
+      const m = resultado.match(/\bid ([0-9a-f-]{36})\b/i);
+      if (m) ids.tramite_id = m[1];
+    }
+    if (name === "futurerp_tramite_link_file") {
+      const m = resultado.match(/Archivo ([0-9a-f-]{36}) vinculado/i);
+      if (m) antes = { file_id: m[1] };
+    }
+    await fetch(`${deps.restBase}/agent_shadow_calls`, {
+      method: "POST",
+      headers: deps.serviceHeaders({ Prefer: "return=minimal" }),
+      body: JSON.stringify({ agent: "trami", tool_name: name, tool_input: args, resumen: describeCall(name, args), user_id: deps.userId, modo: "vivo", antes, resultado, ...ids }),
+    });
+  } catch (e: any) {
+    console.error("[trami guard] bitácora:", e?.message);
+  }
+}
+
 export async function logToolError(deps: GuardDeps, name: string, args: unknown, detalle: string) {
   try {
     await fetch(`${deps.restBase}/bot_error_log`, {
@@ -124,8 +189,12 @@ export function guardedTool(server: McpServer, deps: GuardDeps): McpServer["tool
           });
           return { content: [{ type: "text" as const, text: `(sombra) ${resumen}. Trami está en modo sombra: la acción quedó registrada para que Flor la califique y NO se ejecutó. Sigue con el resto del trabajo como si se hubiera hecho; no la repitas.` }] };
         }
+        // Live: snapshot first, run, then write the ledger row (modo 'vivo') the
+        // panel's Bitácora shows and trami_revertir_accion() undoes.
+        const antes = SHADOW_TOOLS.has(name) ? await snapshotAntes(deps, name, args ?? {}) : null;
         const res = await handler(args, extra);
         if (res?.isError) await logToolError(deps, name, args, String(res?.content?.[0]?.text ?? "error"));
+        else if (SHADOW_TOOLS.has(name) && !/^Sin cambios:/.test(String(res?.content?.[0]?.text ?? ""))) await recordLive(deps, name, args ?? {}, antes, res);
         return res;
       } catch (e: any) {
         await logToolError(deps, name, args, `throw: ${e?.message ?? e}`);
