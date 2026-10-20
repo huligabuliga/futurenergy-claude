@@ -369,16 +369,55 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     },
   );
 
+  // ── futurerp_ticket_create ────────────────────────────────────────────────
+  tool(
+    "futurerp_ticket_create",
+    "Open a ticket to the project's vendor (projects.owner_id), like the app's 'Nuevo ticket': area = the vendor's department, SLA 2 business days, the vendor gets a 'ticket_assigned' notification. Use it for documents the expediente is missing (Flor's rule: the vendor first, the client only if the vendor is slow). Logs a note on the project timeline.",
+    {
+      project_id: z.string().describe("Project uuid or EFU code"),
+      asunto: z.string().max(200),
+      descripcion: z.string().max(4000).describe("What is missing and for which trámite; plain text"),
+      prioridad: z.enum(["alta", "media", "baja"]).default("media"),
+    },
+    async ({ project_id, asunto, descripcion, prioridad }) => {
+      try {
+        const p = await projectRow(project_id, "id,efu,name,owner_id");
+        if (!p) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
+        if (!p.owner_id) return fail(`El proyecto ${p.efu ?? p.id} no tiene vendedor asignado: pregunta a Flor a quién pedirle.`);
+        const [v]: any[] = await sbApi(`/profiles?user_id=eq.${p.owner_id}&select=user_id,first_name,last_name,department&limit=1`, serviceHeaders());
+        const nombre = [v?.first_name, v?.last_name].filter(Boolean).join(" ") || "Vendedor";
+        const area = v?.department || "Ventas";
+        const sla = { alta: 510, media: 1020, baja: 1530 }[prioridad]; // minutes, same ladder as the app
+        const [t] = await sbWrite("POST", "/tickets", {
+          area, prioridad, sla_minutos: sla, fecha_vencimiento: new Date(Date.now() + sla * 60_000).toISOString(),
+          canal: "reporte", asunto, descripcion: `<p>${descripcion.replace(/</g, "&lt;").replace(/\n/g, "<br>")}</p>`,
+          responsable: `${nombre} (${area})`, responsables: [`${nombre} (${area})`], responsables_ids: [p.owner_id],
+          project_id: p.id, cliente_nombre: p.name ?? null, created_by: userId,
+        });
+        await sbRpc("create_notification", {
+          p_user_ids: [p.owner_id], p_type: "ticket_assigned", p_title: "Ticket asignado",
+          p_body: `Te han asignado el ticket #${t.folio}: ${asunto}`.slice(0, 500),
+          p_resource_type: "ticket", p_resource_id: t.folio,
+          p_metadata: { folio: t.folio, asunto, assignedBy: "Trami", agent: "trami" }, p_actor_id: userId,
+        });
+        await logActivity(p.id, "note", `Ticket ${t.folio} a ${nombre}: ${asunto}`, descripcion, { metadata: { source: "mcp", ticket_folio: t.folio, ticket_id: t.id } });
+        return text(`Ticket ${t.folio} abierto a ${nombre} (${area}) en ${p.efu ?? p.id}: ${asunto}. id ${t.id}.`);
+      } catch (e: any) {
+        return fail(`No se pudo abrir el ticket: ${e.message}`);
+      }
+    },
+  );
+
   // ── futurerp_tramite_link_file ────────────────────────────────────────────
   tool(
     "futurerp_tramite_link_file",
-    "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Use doc_key 'Comprobante de ingreso' for the gestora's ingreso PDF.",
+    "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Use doc_key 'Anexo 2' for the gestora's ingreso PDF (the Anexo 2 is the comprobante de ingreso).",
     {
       tramite_id: z.string().uuid(),
       file_id: z.string().uuid().optional().describe("Existing project_files.id"),
       url: z.string().url().optional().describe("Firebase Storage URL of a file not yet registered"),
       name: z.string().optional().describe("File name when registering by url"),
-      doc_key: z.string().describe("Document slot, e.g. 'Comprobante de ingreso', 'Recibo CFE', 'Imagenes Instalacion'"),
+      doc_key: z.string().describe("Document slot, e.g. 'Anexo 2' (comprobante de ingreso), 'Recibo CFE', 'Imagenes Instalacion'"),
     },
     async ({ tramite_id, file_id, url, name, doc_key }) => {
       try {

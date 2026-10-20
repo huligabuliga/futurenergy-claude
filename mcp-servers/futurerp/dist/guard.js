@@ -2,7 +2,7 @@
 export const SHADOW_TOOLS = new Set([
     "futurerp_tramite_create", "futurerp_tramite_update", "futurerp_tramite_link_file",
     "futurerp_project_set_zona_cfe", "futurerp_project_tramites_requeridos_set",
-    "futurerp_bloqueo_open", "futurerp_verification_tick",
+    "futurerp_bloqueo_open", "futurerp_verification_tick", "futurerp_ticket_create",
     "futurerp_whatsapp_send", "futurerp_mail_draft",
 ]);
 let modeCache = { at: 0, mode: "shadow" };
@@ -28,6 +28,7 @@ export function describeCall(name, a) {
     switch (name) {
         case "futurerp_tramite_create": return `Crear trámite ${a.tipo} en ${a.project_id}`;
         case "futurerp_tramite_update": return `Actualizar trámite ${a.tramite_id}: ${Object.entries(a.patch ?? {}).map(([k, v]) => `${k}=${short(v, 40)}`).join(", ")}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;
+        case "futurerp_ticket_create": return `Ticket al vendedor de ${a.project_id}: "${short(a.asunto, 100)}"`;
         case "futurerp_tramite_link_file": return `Adjuntar ${a.file_name ?? a.file_id ?? a.url} al trámite ${a.tramite_id} como ${a.doc_key}`;
         case "futurerp_project_set_zona_cfe": return `Fijar zona ${a.zona} en ${a.project_id}`;
         case "futurerp_project_tramites_requeridos_set": return `Requeridos de ${a.project_id}: +${(a.labels ?? []).join(", ")}${a.remove?.length ? ` −${a.remove.join(", ")}` : ""}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;

@@ -18,6 +18,10 @@ export interface Recibo {
   corte_a_partir: string | null;
   /** Previous balance carried on the bill (ADEUDO/SALDO ANTERIOR), 0 when the line says 0. */
   adeudo_anterior: number | null;
+  /** "SU PAGO" line: what the client already paid against that balance (positive). */
+  su_pago: number | null;
+  /** What is really owed: adeudo_anterior minus su_pago, never negative. This is the number that stops an ingreso. */
+  adeudo_vigente: number | null;
   /** Signals that the client owes CFE something: a non-zero previous balance, a cut-off notice, a suspended service. */
   senales_adeudo: string[];
   /** Days from periodo_fin to `hoy` (null when the period is unreadable). */
@@ -63,8 +67,12 @@ export function parseRecibo(text: string, hoy: Date = new Date()): Recibo {
   // Every bill prints an "ADEUDO ANTERIOR" line; it only matters when the amount is not zero.
   const adeudoRaw = u.match(/(?:ADEUDO|SALDO) ANTERIOR[^\d$\n]*\n?\s*\$?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
   const adeudo_anterior = adeudoRaw != null ? Number(adeudoRaw.replace(/,/g, "")) : null;
+  // Flor: "Adeudo anterior" next to a "Su pago" of the same amount is a paid balance, not a debt.
+  const pagoRaw = u.match(/SU PAGO[^\d$\n]*\n?\s*-?\s*\$?\s*-?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
+  const su_pago = pagoRaw != null ? Number(pagoRaw.replace(/,/g, "")) : null;
+  const adeudo_vigente = adeudo_anterior == null ? null : Math.max(0, adeudo_anterior - (su_pago ?? 0));
   const senales = [
-    ...(adeudo_anterior ? ["ADEUDO ANTERIOR"] : []),
+    ...(adeudo_vigente ? ["ADEUDO ANTERIOR"] : []),
     ...["AVISO DE CORTE", "SERVICIO SUSPENDIDO", "RECONEXI"].filter((w) => u.includes(w)),
   ];
   return {
@@ -81,6 +89,8 @@ export function parseRecibo(text: string, hoy: Date = new Date()): Recibo {
     limite_pago: fechaCfe(g(/L[ÍI]MITE DE PAGO:\s*(\d{2} [A-Z]{3} \d{2})/)),
     corte_a_partir: fechaCfe(g(/CORTE A PARTIR:\s*(\d{2} [A-Z]{3} \d{2})/)),
     adeudo_anterior,
+    su_pago,
+    adeudo_vigente,
     senales_adeudo: senales,
     antiguedad_dias: periodo_fin ? Math.round((hoy.getTime() - new Date(periodo_fin + "T12:00:00-06:00").getTime()) / 86_400_000) : null,
   };

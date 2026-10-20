@@ -18,6 +18,10 @@ export interface Recibo {
     corte_a_partir: string | null;
     /** Previous balance carried on the bill (ADEUDO/SALDO ANTERIOR), 0 when the line says 0. */
     adeudo_anterior: number | null;
+    /** "SU PAGO" line: what the client already paid against that balance (positive). */
+    su_pago: number | null;
+    /** What is really owed: adeudo_anterior minus su_pago, never negative. This is the number that stops an ingreso. */
+    adeudo_vigente: number | null;
     /** Signals that the client owes CFE something: a non-zero previous balance, a cut-off notice, a suspended service. */
     senales_adeudo: string[];
     /** Days from periodo_fin to `hoy` (null when the period is unreadable). */

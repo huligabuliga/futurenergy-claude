@@ -57,6 +57,17 @@ test("adeudo signals and DD12 account", () => {
   assert.equal(cero.adeudo_anterior, 0);
   assert.deepEqual(cero.senales_adeudo, []);
 });
+test("adeudo anterior already paid (Su Pago) is not a debt", () => {
+  // Real text layer: label and amount glued together, the payment negative.
+  const pagado = parseRecibo(SAMPLE + "\nFac. del Periodo4,964.15\nAdeudo Anterior2,886.00\nSu Pago-2,886.00\nTotal4,964.15");
+  assert.equal(pagado.adeudo_anterior, 2886);
+  assert.equal(pagado.su_pago, 2886);
+  assert.equal(pagado.adeudo_vigente, 0);
+  assert.deepEqual(pagado.senales_adeudo, []);
+  const parcial = parseRecibo(SAMPLE + "\nAdeudo Anterior2,886.00\nSu Pago-1,000.00");
+  assert.equal(parcial.adeudo_vigente, 1886);
+  assert.deepEqual(parcial.senales_adeudo, ["ADEUDO ANTERIOR"]);
+});
 test("second layout: total before the address, 'DESGLOSE' further down", () => {
   const txt = `Comisión Federal de Electricidad\nAv. Paseo de la Reforma 164, Col. Juárez,\nAlcaldía: Cuauhtémoc, Código Postal: 06600,\nCiudad de México. RFC: CFE370814QI0\nGARCIA G JOSE GPE\nTOTAL A PAGAR:\n$2,005\nLUIS XIV 718\nLOS REYES FRACCC.P.67277\nDESGLOSE DEL IMPORTE A PAGAR\nNO. DE SERVICIO:411990403783\nCUENTA:35DD11F123524605\nPERIODO FACTURADO:19 MAR 26-19 MAY 26\n`;
   const r = parseRecibo(txt, new Date("2026-10-10T12:00:00-06:00"));

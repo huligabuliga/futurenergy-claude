@@ -28,7 +28,7 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
     async ({ project_id }) => {
       try {
         const q = deps.uuidRx.test(project_id) ? `id=eq.${project_id}` : `efu=eq.${encodeURIComponent(project_id)}`;
-        const [p]: any[] = await deps.sbApi(`/projects?${q}&select=id,efu,name,stage,zona_cfe,tarifa_cfe,tipo_proyecto,rfc,razon_social,email_facturacion,tramites_requeridos_manual,tramites_requeridos_vtecnica,tramites_requeridos_vetados,tramites_requeridos_otro,paneles_solicitados,potencia_total,proyecto_street,proyecto_city,proyecto_state_code,proyecto_postal_code,instalacion_street,instalacion_city,proyecto_latitude,proyecto_longitude,instalacion_latitude,instalacion_longitude,fecha_anticipo_completo,client_id,clients(first_name,last_name,name,phone,mobile_phone,email)&limit=1`) ?? [];
+        const [p]: any[] = await deps.sbApi(`/projects?${q}&select=id,efu,name,stage,last_stage_change_date,zona_cfe,tarifa_cfe,tipo_proyecto,rfc,razon_social,email_facturacion,tramites_requeridos_manual,tramites_requeridos_vtecnica,tramites_requeridos_vetados,tramites_requeridos_otro,paneles_solicitados,potencia_total,proyecto_street,proyecto_city,proyecto_state_code,proyecto_postal_code,instalacion_street,instalacion_city,proyecto_latitude,proyecto_longitude,instalacion_latitude,instalacion_longitude,fecha_anticipo_completo,client_id,clients(first_name,last_name,name,phone,mobile_phone,email)&limit=1`) ?? [];
         if (!p) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
         const id = p.id;
         const [tramites, docs, files, links, bom, bloqueos, notas] = await Promise.all([
@@ -71,7 +71,7 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
 
         const md = [
           `# ${p.efu ?? "(sin EFU)"} · ${p.name}  (uuid ${id})`,
-          `Etapa: ${p.stage ?? "—"} · Zona CFE: ${p.zona_cfe ?? "SIN ZONA"} · Tarifa: ${p.tarifa_cfe ?? "—"} · Tipo: ${p.tipo_proyecto ?? "—"}${p.rfc ? ` · RFC ${p.rfc}${String(p.rfc).length === 12 ? " (persona moral)" : ""}` : ""}${p.razon_social ? ` · ${p.razon_social}` : ""}`,
+          `Etapa: ${p.stage ?? "—"}${p.last_stage_change_date ? ` (desde ${String(p.last_stage_change_date).slice(0, 10)})` : ""} · Zona CFE: ${p.zona_cfe ?? "SIN ZONA"} · Tarifa: ${p.tarifa_cfe ?? "—"} · Tipo: ${p.tipo_proyecto ?? "—"}${p.rfc ? ` · RFC ${p.rfc}${String(p.rfc).length === 12 ? " (persona moral)" : ""}` : ""}${p.razon_social ? ` · ${p.razon_social}` : ""}`,
           `Anticipo completo: ${p.fecha_anticipo_completo ?? "—"} · Dirección: ${direccion || "—"}${lat && lng ? ` · Maps: https://www.google.com/maps/search/?api=1&query=${lat},${lng}` : ""}`,
           `Cliente: ${cliente.nombre ?? "—"} · cel ${cliente.celular ?? "—"} · tel ${cliente.telefono ?? "—"} · ${cliente.email ?? "sin email"}`,
           `Requeridos (VT + manual): ${requeridos.join(", ") || "ninguno"}${p.tramites_requeridos_vetados?.length ? ` · VETADOS (no volver a poner): ${p.tramites_requeridos_vetados.join(", ")}` : ""}${p.tramites_requeridos_otro ? ` · Otro: "${p.tramites_requeridos_otro}"` : ""}`,
