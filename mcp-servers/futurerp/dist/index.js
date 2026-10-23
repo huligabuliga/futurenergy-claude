@@ -29,6 +29,7 @@ import { getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/
 import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
+import { registerWriteTools } from "./writes.js";
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -350,16 +351,17 @@ async function resolveAuthInfo(token) {
         throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
     }
     const isAdmin = profRow.is_admin === true;
-    const [leadsViewAll, dronesManage] = await Promise.all([
+    const [leadsViewAll, dronesManage, mcpWrite] = await Promise.all([
         hasCrmPermission(user.id, "leads.view_all"),
         hasCrmPermission(user.id, "drones.manage"),
+        hasCrmPermission(user.id, "mcp.write"),
     ]);
     const info = {
         token,
         clientId: claims.client_id ?? "session",
         scopes: [],
         expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage },
+        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, mcpWrite },
     };
     if (authCache.size > 500)
         authCache.clear();
@@ -2850,6 +2852,18 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             },
         ],
     }));
+    // Generic WRITE tools: only for the `mcp.write` permission (picked in /admin/permisos). The writes
+    // run with the caller's token, so RLS decides per row exactly as in the app.
+    if (auth.extra?.mcpWrite === true) {
+        registerWriteTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            filtersSchema: FiltersSchema,
+            filtersToQs,
+        });
+    }
     return server;
 } // end buildServer
 // ── HTTP entrypoint ───────────────────────────────────────

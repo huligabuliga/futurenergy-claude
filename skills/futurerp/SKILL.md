@@ -45,6 +45,18 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 | `futurerp_get_related` | Child rows by FK. E.g. ticket_activities for a ticket. |
 | `futurerp_recent_records` | Last N rows of any table. Default order: `created_at.desc`. |
 
+### Writing (only with the `mcp.write` permission)
+Visible only to users whose FuturERP role has **MCP FuturERP (Claude): editar y crear registros** (`mcp.write`, set in `/admin/permisos`; admins always pass). Writes run with the user's own token, so RLS, triggers and audit columns behave exactly as in the app: if they can't edit it in FuturERP, the tool returns "No changes" or a permission error.
+
+| Tool | Purpose |
+|---|---|
+| `futurerp_update_record` | `table`, `filters` (required), `patch`, `dry_run?`. Max 20 rows per call. Returns before/after. |
+| `futurerp_insert_record` | `table`, `row`. Returns the created row. |
+
+- Use `dry_run: true` first whenever the filter isn't by `id`.
+- Off-limits: role/permission tables (`crm_roles`, `user_crm_roles`, `crm_role_stage_moves`), `system_config`, ledgers, `is_admin`, audit columns, secret-like columns. Change those in the app.
+- Every write lands in `mcp_write_log` with the previous values (report "Cambios hechos desde Claude"). Undo = `futurerp_update_record` with the `before` values.
+
 ### Search
 | Tool | Purpose |
 |---|---|
