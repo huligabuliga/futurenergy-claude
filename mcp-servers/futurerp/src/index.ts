@@ -35,6 +35,7 @@ import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerWriteTools } from "./writes.js";
 import { registerUploadTools } from "./uploads.js";
+import { registerLeadActionTools } from "./leadActions.js";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
@@ -3384,6 +3385,13 @@ if (auth.extra?.mcpWrite === true) {
     serviceHeaders,
     filtersSchema: FiltersSchema,
     filtersToQs,
+  });
+  registerLeadActionTools(server, {
+    userId: (auth.extra?.userId as string) ?? "",
+    restBase: REST_BASE,
+    authHeaders,
+    serviceHeaders,
+    supabaseUrl: SUPABASE_URL,
   });
 }
 

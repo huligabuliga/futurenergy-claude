@@ -52,8 +52,11 @@ Visible only to users whose FuturERP role has **MCP FuturERP (Claude): editar y 
 |---|---|
 | `futurerp_update_record` | `table`, `filters` (required), `patch`, `dry_run?`. Max 20 rows per call. Returns before/after. |
 | `futurerp_insert_record` | `table`, `row`. Returns the created row. |
+| `futurerp_lead_set_stage` | `lead_id`, `stage`, `reason?` (required for `descalificado`). Same as clicking the stage in the lead: status + "Cambio de etapa" in Actividad; descalificar also cancels the next contact. **Use this, not update_record, to move a lead.** |
+| `futurerp_lead_schedule_next_contact` | `lead_id`, `at` (Monterrey time if no offset), `note?`, `si_pero?`, `vendor_qualification?`, `project_amount?`. Same as the "Siguiente contacto" dialog: replaces the reminder, saves `next_contact_*`, syncs Google Calendar. **Use this, not update_record, for next_contact_*.** |
 
 - Use `dry_run: true` first whenever the filter isn't by `id`.
+- CRM notes: `futurerp_insert_record` into `crm_activities` with `entity_type:'lead'`, `entity_id`, `activity_type:'note'`, `description`. Reminders: insert into `reminders` (`user_id` = the user, `title`, `remind_at`).
 - Off-limits: role/permission tables (`crm_roles`, `user_crm_roles`, `crm_role_stage_moves`), `system_config`, ledgers, `is_admin`, audit columns, secret-like columns. Change those in the app.
 - Every write lands in `mcp_write_log` with the previous values (report "Cambios hechos desde Claude"). Undo = `futurerp_update_record` with the `before` values.
 
