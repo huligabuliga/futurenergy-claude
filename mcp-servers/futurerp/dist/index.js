@@ -30,6 +30,7 @@ import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol
 import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerWriteTools } from "./writes.js";
+import { registerUploadTools } from "./uploads.js";
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -351,17 +352,18 @@ async function resolveAuthInfo(token) {
         throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
     }
     const isAdmin = profRow.is_admin === true;
-    const [leadsViewAll, dronesManage, mcpWrite] = await Promise.all([
+    const [leadsViewAll, dronesManage, mcpWrite, mcpUpload] = await Promise.all([
         hasCrmPermission(user.id, "leads.view_all"),
         hasCrmPermission(user.id, "drones.manage"),
         hasCrmPermission(user.id, "mcp.write"),
+        hasCrmPermission(user.id, "mcp.upload"),
     ]);
     const info = {
         token,
         clientId: claims.client_id ?? "session",
         scopes: [],
         expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, mcpWrite },
+        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, mcpWrite, mcpUpload },
     };
     if (authCache.size > 500)
         authCache.clear();
@@ -2864,6 +2866,22 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             filtersToQs,
         });
     }
+    // File UPLOAD: only for `mcp.upload`. Storage rules + RLS on the attachment row decide, as in the app.
+    if (auth.extra?.mcpUpload === true) {
+        registerUploadTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            supabaseUrl: SUPABASE_URL,
+            publishableKey: SUPABASE_PUBLISHABLE_KEY,
+            userToken: () => reqCtx.getStore()?.token,
+            tableColumns: async (t) => {
+                const props = (await sbOpenApi())?.definitions?.[t]?.properties;
+                return props ? Object.keys(props) : null;
+            },
+        });
+    }
     return server;
 } // end buildServer
 // ── HTTP entrypoint ───────────────────────────────────────
@@ -2873,7 +2891,9 @@ async function main() {
         throw new Error("Set SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) — needed to validate user tokens.");
     }
     const app = express();
-    app.use(express.json({ limit: "4mb" }));
+    // POST /mcp parses its (larger, base64 uploads) body only after the bearer check; everything else 4 MB.
+    const smallJson = express.json({ limit: "4mb" });
+    app.use((req, res, next) => (req.method === "POST" && req.path === "/mcp" ? next() : smallJson(req, res, next)));
     // One line per request in Railway logs: method, path, status, ms, and — for 401/403 — the reason
     // (taken from the WWW-Authenticate header we set; never the token). Cheap, and the only way to see
     // what a remote client (claude.ai) actually did.
@@ -2952,7 +2972,7 @@ async function main() {
             return;
         }
         next();
-    }, bearer, async (req, res) => {
+    }, bearer, express.json({ limit: "16mb" }), async (req, res) => {
         const auth = req.auth;
         const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
         if (toolName) {
