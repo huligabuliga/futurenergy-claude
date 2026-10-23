@@ -31,6 +31,8 @@ const IDT_BASE = process.env.FIREBASE_AUTH_EMULATOR_HOST ? `http://${process.env
 
 const URL_COLS = ["firebase_url", "url", "file_url", "attachment_url"];
 const PATH_COLS = ["storage_path", "file_path"];
+// mcp.upload attaches files; it is not a generic insert (that's mcp.write).
+const ATTACH_TABLE = /^([a-z0-9_]+_(files|attachments|photos|fotos)|ticket_activities|incidencia_activities)$/;
 
 const EXT_MIME: Record<string, string> = {
   pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp",
@@ -63,11 +65,11 @@ export function directUrl(raw: string): string {
   return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : raw;
 }
 
-async function fetchCapped(raw: string): Promise<{ bytes: Buffer; contentType: string | null }> {
+async function fetchCapped(raw: string, fileName: string): Promise<{ bytes: Buffer; contentType: string | null }> {
   let u = new URL(directUrl(raw));
   for (let hop = 0; hop < 5; hop++) {
     await assertPublicHttps(u);
-    const res = await fetch(u, { redirect: "manual" });
+    const res = await fetch(u, { redirect: "manual", signal: AbortSignal.timeout(60_000) });
     if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
       u = new URL(res.headers.get("location")!, u);
       continue;
@@ -81,14 +83,20 @@ async function fetchCapped(raw: string): Promise<{ bytes: Buffer; contentType: s
       if (n > MAX_URL_BYTES) throw new Error("File is larger than 50 MB.");
       chunks.push(Buffer.from(c));
     }
-    return { bytes: Buffer.concat(chunks), contentType: res.headers.get("content-type")?.split(";")[0].trim() || null };
+    const contentType = res.headers.get("content-type")?.split(";")[0].trim() || null;
+    // A private Drive file or a login wall answers 200 with an HTML page: never store that as the file.
+    if (contentType === "text/html" && !/\.html?$/i.test(fileName)) {
+      throw new Error("The URL returned a web page, not a file (is it shared publicly / a direct download link?).");
+    }
+    return { bytes: Buffer.concat(chunks), contentType };
   }
   throw new Error("Too many redirects.");
 }
 
 export function fileMeta(fileName: string, mime?: string | null) {
   const ext = (fileName.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
-  const m = (mime && mime !== "application/octet-stream" ? mime : EXT_MIME[ext]) ?? "application/octet-stream";
+  const generic = !mime || /octet-stream|force-download|^application\/(x-)?download|^binary\//i.test(mime);
+  const m = (generic ? EXT_MIME[ext] : mime) ?? mime ?? "application/octet-stream";
   if (/^image\/hei[cf]$/i.test(m) || ext === "heic" || ext === "heif") {
     throw new Error("HEIC/HEIF photos aren't supported here (the app converts them in the browser). Send a JPEG or PNG.");
   }
@@ -102,6 +110,7 @@ export function buildRow(
   f: { url: string; path: string; name: string; size: number; mime: string; ext: string; fileType: string; isImage: boolean },
   userId: string,
 ): Record<string, any> {
+  if (!ATTACH_TABLE.test(table)) throw new Error(`"${table}" isn't an attachment table; use a *_files / *_attachments / *_photos / *_fotos table or ticket_activities.`);
   const has = (c: string) => cols.includes(c);
   const urlCol = URL_COLS.find(has);
   if (!urlCol && has("metadata")) {
@@ -113,7 +122,7 @@ export function buildRow(
       ...(has("user_id") ? { user_id: userId } : {}),
       ...(has("content") ? { content: `Archivo adjunto: ${f.name}` } : {}),
       ...values,
-      metadata: { ...(values.metadata ?? {}), attachments: [attachment] },
+      metadata: { attachments: [attachment] }, // server-built only: storage-sign trusts paths found here
     };
   }
   const pathCol = PATH_COLS.find(has);
@@ -125,7 +134,7 @@ export function buildRow(
   put("title", f.name); put("file_name", f.name); put("file_size", f.size); put("mime_type", f.mime); put("content_type", f.mime);
   put("file_type", f.fileType); put("file_extension", f.ext); put("is_image", f.isImage);
   put("uploaded_by", userId); put("uploaded_by_user_id", userId);
-  return { ...derived, ...values };
+  return { ...values, ...derived }; // the file columns describe the blob we stored; callers can't repoint them
 }
 
 async function firebaseIdToken(deps: UploadDeps): Promise<string> {
@@ -146,6 +155,9 @@ async function firebaseIdToken(deps: UploadDeps): Promise<string> {
 
 const objUrl = (path: string) => `${STORAGE_BASE}/v0/b/${BUCKET}/o/${encodeURIComponent(path)}`;
 
+let inFlight = 0;
+const MAX_IN_FLIGHT = 2;
+
 export function registerUploadTools(server: McpServer, deps: UploadDeps) {
   server.tool(
     "futurerp_upload_file",
@@ -159,6 +171,14 @@ export function registerUploadTools(server: McpServer, deps: UploadDeps) {
       mime_type: z.string().optional().describe("MIME type; guessed from the download or the extension when omitted"),
     },
     async ({ table, values, file_name, url, base64, mime_type }) => {
+      // ponytail: process-wide cap so a burst of 50 MB uploads can't OOM the shared server; a queue if users hit it.
+      if (inFlight >= MAX_IN_FLIGHT) return text("Another upload is in progress; try again in a moment.", true);
+      inFlight++;
+      try { return await doUpload({ table, values, file_name, url, base64, mime_type }); } finally { inFlight--; }
+    },
+  );
+
+  async function doUpload({ table, values, file_name, url, base64, mime_type }: { table: string; values: Record<string, any>; file_name: string; url?: string; base64?: string; mime_type?: string }) {
       let uploaded: { path: string; idToken: string } | null = null;
       try {
         if (!url === !base64) throw new Error("Give exactly one of url or base64.");
@@ -170,7 +190,7 @@ export function registerUploadTools(server: McpServer, deps: UploadDeps) {
           bytes = Buffer.from(base64.replace(/^data:[^,]*,/, ""), "base64");
           if (bytes.length > MAX_B64_BYTES) throw new Error("base64 files are limited to 10 MB; pass a URL instead.");
         } else {
-          const got = await fetchCapped(url!);
+          const got = await fetchCapped(url!, file_name);
           bytes = got.bytes;
           mime ??= got.contentType;
         }
@@ -186,7 +206,7 @@ export function registerUploadTools(server: McpServer, deps: UploadDeps) {
 
         const idToken = await firebaseIdToken(deps);
         const up = await fetch(`${STORAGE_BASE}/v0/b/${BUCKET}/o?uploadType=media&name=${encodeURIComponent(path)}`, {
-          method: "POST", headers: { Authorization: `Firebase ${idToken}`, "Content-Type": meta.mime }, body: new Uint8Array(bytes),
+          method: "POST", headers: { Authorization: `Firebase ${idToken}`, "Content-Type": meta.mime }, body: bytes as unknown as BodyInit, signal: AbortSignal.timeout(120_000),
         });
         if (!up.ok) throw new Error(`Storage upload ${up.status}: ${await up.text()}`);
         uploaded = { path, idToken };
@@ -205,6 +225,5 @@ export function registerUploadTools(server: McpServer, deps: UploadDeps) {
         }
         return text(`Upload failed: ${e?.message ?? e}${note}`, true);
       }
-    },
-  );
+  }
 }

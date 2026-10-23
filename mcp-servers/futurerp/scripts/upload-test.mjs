@@ -91,7 +91,8 @@ try {
   ok((await tools(tA)).includes("futurerp_upload_file"), "admin sees it (has_crm_permission admin pass)");
 
   console.log("\n# lead");
-  let r = await call(tU, "futurerp_upload_file", { table: "lead_files", values: { lead_id: mine.id, document_type: "otro" }, file_name: "prueba mcp.txt", base64: b64("hola desde el MCP") });
+  let r = await call(tU, "futurerp_upload_file", { table: "lead_files", values: { lead_id: mine.id, document_type: "otro", firebase_url: "https://evil.example/x.pdf", uploaded_by: plain }, file_name: "prueba mcp.txt", base64: b64("hola desde el MCP") });
+  // (values try to repoint the file columns; the server-derived ones must win)
   let path = r.text.match(/Storage path: (\S+)/)?.[1];
   if (path) blobs.push([path, fbU]);
   ok(!r.isError && !!path, "uploader attaches a file to own lead", r.text.slice(0, 90));
@@ -99,6 +100,7 @@ try {
   fileRows.push(...lf.map((x) => ["lead_files", x.id]));
   ok(lf.length === 1 && lf[0].file_name === "prueba mcp.txt" && lf[0].mime_type === "text/plain" && lf[0].file_size === 17 && lf[0].firebase_url?.includes(encodeURIComponent(path)), "lead_files row has url, name, mime, size", JSON.stringify(lf[0] && { n: lf[0].file_name, m: lf[0].mime_type, z: lf[0].file_size }));
   ok(lf[0]?.created_by === uploader, "created_by = uploader (insert ran with the caller's token)");
+  ok(lf[0]?.uploaded_by === uploader && !/evil/.test(lf[0]?.firebase_url ?? ""), "values can't repoint firebase_url / uploaded_by");
 
   r = await call(tU, "futurerp_upload_file", { table: "lead_files", values: { lead_id: other.id }, file_name: "x.txt", base64: b64("no") });
   ok(r.isError && /removed again/.test(r.text), "someone else's lead: refused by RLS and the blob is deleted", r.text.slice(0, 140));
@@ -129,7 +131,9 @@ try {
   r = await call(tU, "futurerp_upload_file", { table: "lead_files", values: { lead_id: mine.id }, file_name: "a.pdf", url: "https://localhost/a.pdf" });
   ok(r.isError && /not a public address/.test(r.text), "loopback host refused (SSRF)", r.text.slice(0, 90));
   r = await call(tU, "futurerp_upload_file", { table: "leads", values: {}, file_name: "a.txt", base64: b64("x") });
-  ok(r.isError && /no file column/.test(r.text), "table without a file column refused");
+  ok(r.isError && /isn't an attachment table/.test(r.text), "non-attachment table refused (not a generic insert)");
+  r = await call(tU, "futurerp_upload_file", { table: "notifications", values: {}, file_name: "a.txt", base64: b64("x") });
+  ok(r.isError && /isn't an attachment table/.test(r.text), "notifications refused");
   r = await call(tU, "futurerp_upload_file", { table: "lead_files", values: { lead_id: mine.id, created_by: admin }, file_name: "a.txt", base64: b64("x") });
   ok(r.isError && /created_by/.test(r.text) && !/removed/.test(r.text), "audit column refused BEFORE uploading");
   ok((await rest(`/mcp_write_log?user_id=eq.${uploader}&select=op,table_name`)).b.length === 2, "one ledger row per successful upload");

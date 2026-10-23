@@ -3416,7 +3416,9 @@ async function main() {
   }
 
   const app = express();
-  app.use(express.json({ limit: "16mb" }));
+  // POST /mcp parses its (larger, base64 uploads) body only after the bearer check; everything else 4 MB.
+  const smallJson = express.json({ limit: "4mb" });
+  app.use((req, res, next) => (req.method === "POST" && req.path === "/mcp" ? next() : smallJson(req, res, next)));
   // One line per request in Railway logs: method, path, status, ms, and — for 401/403 — the reason
   // (taken from the WWW-Authenticate header we set; never the token). Cheap, and the only way to see
   // what a remote client (claude.ai) actually did.
@@ -3496,7 +3498,7 @@ async function main() {
       return;
     }
     next();
-  }, bearer, async (req, res) => {
+  }, bearer, express.json({ limit: "16mb" }), async (req, res) => {
     const auth = req.auth!;
     const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
     if (toolName) {

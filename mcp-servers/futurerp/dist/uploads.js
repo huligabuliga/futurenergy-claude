@@ -21,6 +21,8 @@ const STORAGE_BASE = process.env.FIREBASE_STORAGE_EMULATOR_HOST ? `http://${proc
 const IDT_BASE = process.env.FIREBASE_AUTH_EMULATOR_HOST ? `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}/identitytoolkit.googleapis.com` : "https://identitytoolkit.googleapis.com";
 const URL_COLS = ["firebase_url", "url", "file_url", "attachment_url"];
 const PATH_COLS = ["storage_path", "file_path"];
+// mcp.upload attaches files; it is not a generic insert (that's mcp.write).
+const ATTACH_TABLE = /^([a-z0-9_]+_(files|attachments|photos|fotos)|ticket_activities|incidencia_activities)$/;
 const EXT_MIME = {
     pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp",
     gif: "image/gif", mp4: "video/mp4", mov: "video/quicktime", xml: "application/xml", txt: "text/plain",
@@ -51,11 +53,11 @@ export function directUrl(raw) {
     const m = raw.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([\w-]+)/);
     return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : raw;
 }
-async function fetchCapped(raw) {
+async function fetchCapped(raw, fileName) {
     let u = new URL(directUrl(raw));
     for (let hop = 0; hop < 5; hop++) {
         await assertPublicHttps(u);
-        const res = await fetch(u, { redirect: "manual" });
+        const res = await fetch(u, { redirect: "manual", signal: AbortSignal.timeout(60_000) });
         if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
             u = new URL(res.headers.get("location"), u);
             continue;
@@ -72,13 +74,19 @@ async function fetchCapped(raw) {
                 throw new Error("File is larger than 50 MB.");
             chunks.push(Buffer.from(c));
         }
-        return { bytes: Buffer.concat(chunks), contentType: res.headers.get("content-type")?.split(";")[0].trim() || null };
+        const contentType = res.headers.get("content-type")?.split(";")[0].trim() || null;
+        // A private Drive file or a login wall answers 200 with an HTML page: never store that as the file.
+        if (contentType === "text/html" && !/\.html?$/i.test(fileName)) {
+            throw new Error("The URL returned a web page, not a file (is it shared publicly / a direct download link?).");
+        }
+        return { bytes: Buffer.concat(chunks), contentType };
     }
     throw new Error("Too many redirects.");
 }
 export function fileMeta(fileName, mime) {
     const ext = (fileName.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
-    const m = (mime && mime !== "application/octet-stream" ? mime : EXT_MIME[ext]) ?? "application/octet-stream";
+    const generic = !mime || /octet-stream|force-download|^application\/(x-)?download|^binary\//i.test(mime);
+    const m = (generic ? EXT_MIME[ext] : mime) ?? mime ?? "application/octet-stream";
     if (/^image\/hei[cf]$/i.test(m) || ext === "heic" || ext === "heif") {
         throw new Error("HEIC/HEIF photos aren't supported here (the app converts them in the browser). Send a JPEG or PNG.");
     }
@@ -87,6 +95,8 @@ export function fileMeta(fileName, mime) {
 }
 /** Builds the attachment row for `table` from its live columns. Pure; exported for the check script. */
 export function buildRow(table, cols, values, f, userId) {
+    if (!ATTACH_TABLE.test(table))
+        throw new Error(`"${table}" isn't an attachment table; use a *_files / *_attachments / *_photos / *_fotos table or ticket_activities.`);
     const has = (c) => cols.includes(c);
     const urlCol = URL_COLS.find(has);
     if (!urlCol && has("metadata")) {
@@ -98,7 +108,7 @@ export function buildRow(table, cols, values, f, userId) {
             ...(has("user_id") ? { user_id: userId } : {}),
             ...(has("content") ? { content: `Archivo adjunto: ${f.name}` } : {}),
             ...values,
-            metadata: { ...(values.metadata ?? {}), attachments: [attachment] },
+            metadata: { attachments: [attachment] }, // server-built only: storage-sign trusts paths found here
         };
     }
     const pathCol = PATH_COLS.find(has);
@@ -121,7 +131,7 @@ export function buildRow(table, cols, values, f, userId) {
     put("is_image", f.isImage);
     put("uploaded_by", userId);
     put("uploaded_by_user_id", userId);
-    return { ...derived, ...values };
+    return { ...values, ...derived }; // the file columns describe the blob we stored; callers can't repoint them
 }
 async function firebaseIdToken(deps) {
     const tok = deps.userToken();
@@ -143,6 +153,8 @@ async function firebaseIdToken(deps) {
     return (await r2.json()).idToken;
 }
 const objUrl = (path) => `${STORAGE_BASE}/v0/b/${BUCKET}/o/${encodeURIComponent(path)}`;
+let inFlight = 0;
+const MAX_IN_FLIGHT = 2;
 export function registerUploadTools(server, deps) {
     server.tool("futurerp_upload_file", "Upload a file to FuturERP and attach it to a record, with the signed-in user's own permissions (only where they could attach it in the app). Give the file as a public https URL (Google Drive share links work) or base64 (≤10 MB), and the attachment table plus its link columns: e.g. table 'lead_files' {lead_id}, 'project_files' {project_id, document_id?}, 'ticket_activities' {ticket_id, content?} (adds a comment with the file), 'requisicion_attachments' {requisicion_id}. File columns (url, name, size, type, uploader) are filled automatically. Use futurerp_list_files afterwards to see it.", {
         table: z.string().describe("Table that stores the attachment, e.g. lead_files, project_files, ticket_activities"),
@@ -152,6 +164,18 @@ export function registerUploadTools(server, deps) {
         base64: z.string().optional().describe("File contents in base64 (instead of url), ≤10 MB"),
         mime_type: z.string().optional().describe("MIME type; guessed from the download or the extension when omitted"),
     }, async ({ table, values, file_name, url, base64, mime_type }) => {
+        // ponytail: process-wide cap so a burst of 50 MB uploads can't OOM the shared server; a queue if users hit it.
+        if (inFlight >= MAX_IN_FLIGHT)
+            return text("Another upload is in progress; try again in a moment.", true);
+        inFlight++;
+        try {
+            return await doUpload({ table, values, file_name, url, base64, mime_type });
+        }
+        finally {
+            inFlight--;
+        }
+    });
+    async function doUpload({ table, values, file_name, url, base64, mime_type }) {
         let uploaded = null;
         try {
             if (!url === !base64)
@@ -166,7 +190,7 @@ export function registerUploadTools(server, deps) {
                     throw new Error("base64 files are limited to 10 MB; pass a URL instead.");
             }
             else {
-                const got = await fetchCapped(url);
+                const got = await fetchCapped(url, file_name);
                 bytes = got.bytes;
                 mime ??= got.contentType;
             }
@@ -181,7 +205,7 @@ export function registerUploadTools(server, deps) {
             assertWritable(table, Object.keys(row));
             const idToken = await firebaseIdToken(deps);
             const up = await fetch(`${STORAGE_BASE}/v0/b/${BUCKET}/o?uploadType=media&name=${encodeURIComponent(path)}`, {
-                method: "POST", headers: { Authorization: `Firebase ${idToken}`, "Content-Type": meta.mime }, body: new Uint8Array(bytes),
+                method: "POST", headers: { Authorization: `Firebase ${idToken}`, "Content-Type": meta.mime }, body: bytes, signal: AbortSignal.timeout(120_000),
             });
             if (!up.ok)
                 throw new Error(`Storage upload ${up.status}: ${await up.text()}`);
@@ -202,5 +226,5 @@ export function registerUploadTools(server, deps) {
             }
             return text(`Upload failed: ${e?.message ?? e}${note}`, true);
         }
-    });
+    }
 }
