@@ -31,6 +31,7 @@ import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerWriteTools } from "./writes.js";
 import { registerUploadTools } from "./uploads.js";
+import { registerLeadActionTools } from "./leadActions.js";
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -2864,6 +2865,13 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             serviceHeaders,
             filtersSchema: FiltersSchema,
             filtersToQs,
+        });
+        registerLeadActionTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            supabaseUrl: SUPABASE_URL,
         });
     }
     // File UPLOAD: only for `mcp.upload`. Storage rules + RLS on the attachment row decide, as in the app.
