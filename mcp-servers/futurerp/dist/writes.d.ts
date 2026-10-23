@@ -24,4 +24,13 @@ export interface WriteDeps {
 export declare const MAX_ROWS = 20;
 /** Throws a readable reason when the target or a column is off-limits. Exported for the check script. */
 export declare function assertWritable(table: string, columns: string[]): void;
+export declare const text: (t: string, isError?: boolean) => {
+    isError?: true | undefined;
+    content: {
+        type: "text";
+        text: string;
+    }[];
+};
+export declare function rest(deps: Pick<WriteDeps, "restBase" | "authHeaders">, method: string, path: string, body?: unknown, prefer?: string): Promise<any>;
+export declare function ledger(deps: Pick<WriteDeps, "userId" | "restBase" | "serviceHeaders">, row: Record<string, unknown>): Promise<void>;
 export declare function registerWriteTools(server: McpServer, deps: WriteDeps): void;

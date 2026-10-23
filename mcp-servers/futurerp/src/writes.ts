@@ -43,9 +43,9 @@ export function assertWritable(table: string, columns: string[]): void {
   if (!columns.length) throw new Error("Nothing to write: give at least one column.");
 }
 
-const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], ...(isError ? { isError: true as const } : {}) });
+export const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], ...(isError ? { isError: true as const } : {}) });
 
-async function rest(deps: WriteDeps, method: string, path: string, body?: unknown, prefer?: string) {
+export async function rest(deps: Pick<WriteDeps, "restBase" | "authHeaders">, method: string, path: string, body?: unknown, prefer?: string) {
   const res = await fetch(`${deps.restBase}${path}`, {
     method,
     headers: deps.authHeaders(prefer ? { Prefer: prefer } : {}),
@@ -62,7 +62,7 @@ async function rest(deps: WriteDeps, method: string, path: string, body?: unknow
   return raw ? JSON.parse(raw) : [];
 }
 
-async function ledger(deps: WriteDeps, row: Record<string, unknown>) {
+export async function ledger(deps: Pick<WriteDeps, "userId" | "restBase" | "serviceHeaders">, row: Record<string, unknown>) {
   try {
     const res = await fetch(`${deps.restBase}/mcp_write_log`, {
       method: "POST",

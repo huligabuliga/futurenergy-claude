@@ -57,6 +57,13 @@ Visible only to users whose FuturERP role has **MCP FuturERP (Claude): editar y 
 - Off-limits: role/permission tables (`crm_roles`, `user_crm_roles`, `crm_role_stage_moves`), `system_config`, ledgers, `is_admin`, audit columns, secret-like columns. Change those in the app.
 - Every write lands in `mcp_write_log` with the previous values (report "Cambios hechos desde Claude"). Undo = `futurerp_update_record` with the `before` values.
 
+### Uploading files (only with the `mcp.upload` permission)
+`futurerp_upload_file` appears for users with **MCP FuturERP (Claude): subir archivos** (`mcp.upload`, `/admin/permisos`; admins always pass). It stores the file in the ERP's Firebase bucket with the user's own Firebase session and inserts the attachment row with their token, so it only works where they could attach the file in the app.
+
+- Args: `table`, `values` (link columns), `file_name`, and exactly one of `url` (public https, Google Drive share links OK, ≤50 MB) or `base64` (≤10 MB); `mime_type?`.
+- Targets: `lead_files` {lead_id, document_type?}, `project_files` {project_id, document_id?}, `ticket_activities` {ticket_id, content?} (posts a comment with the file), `requisicion_attachments`, `expense_files`, any other `*_files` / `*_attachments` table. URL, name, size, MIME, type and uploader columns are filled automatically.
+- HEIC/HEIF is refused (ask for JPEG/PNG). If the row is refused, the uploaded blob is deleted again. Each upload is logged in `mcp_write_log` (op insert).
+
 ### Search
 | Tool | Purpose |
 |---|---|
