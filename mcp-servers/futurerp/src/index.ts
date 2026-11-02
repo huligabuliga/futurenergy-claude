@@ -2597,11 +2597,15 @@ server.tool(
       if (!res.ok) {
         return { content: [{ type: "text", text: `RPC ${name} failed ${res.status}: ${text.slice(0, 400)}` }], isError: true };
       }
+      // Pretty-print small results; big ones (e.g. whatsapp_group_response_pairs for a whole
+      // month) stay compact so that artifacts can still parse them. Hard cap keeps a runaway
+      // payload from flooding an LLM client.
       let pretty = text;
       try {
-        pretty = JSON.stringify(JSON.parse(text), null, 2);
+        const parsed = JSON.parse(text);
+        pretty = text.length > 20000 ? JSON.stringify(parsed) : JSON.stringify(parsed, null, 2);
       } catch {}
-      const clipped = pretty.length > 20000 ? pretty.slice(0, 20000) + "\n… (truncated)" : pretty;
+      const clipped = pretty.length > 300000 ? pretty.slice(0, 300000) + "\n… (truncated)" : pretty;
       return { content: [{ type: "text", text: "## " + name + "\n\n```json\n" + clipped + "\n```" }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `RPC ${name} error: ${e.message}` }], isError: true };
