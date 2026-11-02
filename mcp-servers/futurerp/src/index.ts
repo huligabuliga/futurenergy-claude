@@ -2566,6 +2566,7 @@ const CALLABLE_RPCS: Record<string, RpcSpec> = {
   dashboard_operativo_projects: { perm: "operaciones.access", desc: "Operational projects board (no args)" },
   dashboard_operativo_stage_avg: { perm: "operaciones.access", desc: "Avg time per project stage (no args)" },
   dashboard_operativo_mtto_pendientes: { perm: "operaciones.access", desc: "Pending maintenance (no args)" },
+  whatsapp_group_response_pairs: { perm: "operaciones.access", desc: "WhatsApp client-group response times, no message bodies (p_from, p_to: YYYY-MM-DD, p_to inclusive, max 92 days)" },
   dashboard_bot_ventas: { perm: "dashboards.citas_bot.view", desc: "Bot-attributed sales (p_from, p_to ISO optional)" },
   dashboard_citas_bot: { perm: "dashboards.citas_bot.view", desc: "Citas-bot dashboard (no args)" },
   dashboard_citas_bot_escalations: { perm: "dashboards.citas_bot.view", desc: "Citas-bot escalations (no args)" },
