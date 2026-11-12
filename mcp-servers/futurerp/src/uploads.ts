@@ -65,7 +65,7 @@ export function directUrl(raw: string): string {
   return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : raw;
 }
 
-async function fetchCapped(raw: string, fileName: string): Promise<{ bytes: Buffer; contentType: string | null }> {
+export async function fetchCapped(raw: string, fileName: string): Promise<{ bytes: Buffer; contentType: string | null }> {
   let u = new URL(directUrl(raw));
   for (let hop = 0; hop < 5; hop++) {
     await assertPublicHttps(u);

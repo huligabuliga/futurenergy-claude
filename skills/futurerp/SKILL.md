@@ -60,6 +60,15 @@ Visible only to users whose FuturERP role has **MCP FuturERP (Claude): editar y 
 - Off-limits: role/permission tables (`crm_roles`, `user_crm_roles`, `crm_role_stage_moves`), `system_config`, ledgers, `is_admin`, audit columns, secret-like columns. Change those in the app.
 - Every write lands in `mcp_write_log` with the previous values (report "Cambios hechos desde Claude"). Undo = `futurerp_update_record` with the `before` values.
 
+### Nancy's catalog (only with the `nancy.catalog.manage` permission)
+Three tools for whoever can edit `/nancy/catalogo` (Marketing, directors, Sistemas, admins). They call the same RPCs as the screen with the user's token, so the catalog's own review decides what can be published.
+
+- `futurerp_nancy_catalogo`: what Nancy quotes today, the draft and its blockers, any scheduled change. Call it first.
+- `futurerp_nancy_paquete_guardar`: create (`nuevo`) or change (`paquete` = name fragment or id) a package or promotion **in the draft**. Only the fields passed change: `precio`, `bateria_kwh`, `paneles`, `watts_por_panel`, `equipo` (replaces the list), `incluye`, `respaldo`, `nota_para_nancy`, `vigente_desde`, `vigente_hasta` (null clears), `al_terminar`, `flyer_url` / `flyer_base64` (JPG/PNG ≤5 MB; Drive share links OK), `quitar_flyer`, `dejar_de_ofrecer`.
+- `futurerp_nancy_catalogo_publicar`: `accion` = `publicar` (now, or `cuando` in Monterrey time), `cancelar_programado`, `quitar_paquete`, `descartar_borrador`.
+
+Flow: read → guardar → show the person the draft summary and blockers → publish only after their explicit yes. Publishing reaches real prospects within a minute. The three base packages can't be withdrawn and a promotion on them must return to the previous price; a price can't repeat another package's.
+
 ### Uploading files (only with the `mcp.upload` permission)
 `futurerp_upload_file` appears for users with **MCP FuturERP (Claude): subir archivos** (`mcp.upload`, `/admin/permisos`; admins always pass). It stores the file in the ERP's Firebase bucket with the user's own Firebase session and inserts the attachment row with their token, so it only works where they could attach the file in the app.
 

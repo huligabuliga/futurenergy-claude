@@ -53,7 +53,7 @@ export function directUrl(raw) {
     const m = raw.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([\w-]+)/);
     return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : raw;
 }
-async function fetchCapped(raw, fileName) {
+export async function fetchCapped(raw, fileName) {
     let u = new URL(directUrl(raw));
     for (let hop = 0; hop < 5; hop++) {
         await assertPublicHttps(u);

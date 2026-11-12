@@ -35,6 +35,7 @@ import { z } from "zod";
 import { INLINE_IMAGE_MIMES, MAX_INLINE_BYTES, sniffMime } from "./files.js";
 import { registerWriteTools } from "./writes.js";
 import { registerUploadTools } from "./uploads.js";
+import { registerCatalogTools } from "./catalogo.js";
 import { registerLeadActionTools } from "./leadActions.js";
 
 // Load .env from server root (fallback if env vars not passed by MCP client)
@@ -408,11 +409,12 @@ async function resolveAuthInfo(token: string): Promise<AuthInfo> {
     throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
   }
   const isAdmin = profRow.is_admin === true;
-  const [leadsViewAll, dronesManage, mcpWrite, mcpUpload] = await Promise.all([
+  const [leadsViewAll, dronesManage, mcpWrite, mcpUpload, nancyCatalog] = await Promise.all([
     hasCrmPermission(user.id, "leads.view_all"),
     hasCrmPermission(user.id, "drones.manage"),
     hasCrmPermission(user.id, "mcp.write"),
     hasCrmPermission(user.id, "mcp.upload"),
+    hasCrmPermission(user.id, "nancy.catalog.manage"),
   ]);
 
   const info: AuthInfo = {
@@ -420,7 +422,7 @@ async function resolveAuthInfo(token: string): Promise<AuthInfo> {
     clientId: claims.client_id ?? "session",
     scopes: [],
     expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-    extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, mcpWrite, mcpUpload },
+    extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, mcpWrite, mcpUpload, nancyCatalog },
   };
   if (authCache.size > 500) authCache.clear();
   authCache.set(token, { info, until: now + 60_000 });
@@ -3415,6 +3417,11 @@ if (auth.extra?.mcpUpload === true) {
       return props ? Object.keys(props) : null;
     },
   });
+}
+
+// Nancy's catalog: the same permission as /nancy/catalogo, and the same RPCs with the caller's token.
+if (auth.extra?.nancyCatalog === true) {
+  registerCatalogTools(server, { restBase: REST_BASE, authHeaders, supabaseUrl: SUPABASE_URL });
 }
 
 return server;
