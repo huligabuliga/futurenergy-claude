@@ -53,7 +53,8 @@ export function directUrl(raw) {
     const m = raw.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([\w-]+)/);
     return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : raw;
 }
-async function fetchCapped(raw, fileName) {
+export async function fetchCapped(raw, fileName, maxBytes = MAX_URL_BYTES) {
+    const tooBig = `File is larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`;
     let u = new URL(directUrl(raw));
     for (let hop = 0; hop < 5; hop++) {
         await assertPublicHttps(u);
@@ -64,14 +65,14 @@ async function fetchCapped(raw, fileName) {
         }
         if (!res.ok || !res.body)
             throw new Error(`Download failed: HTTP ${res.status}`);
-        if (Number(res.headers.get("content-length") ?? 0) > MAX_URL_BYTES)
-            throw new Error("File is larger than 50 MB.");
+        if (Number(res.headers.get("content-length") ?? 0) > maxBytes)
+            throw new Error(tooBig);
         const chunks = [];
         let n = 0;
         for await (const c of res.body) {
             n += c.length;
-            if (n > MAX_URL_BYTES)
-                throw new Error("File is larger than 50 MB.");
+            if (n > maxBytes)
+                throw new Error(tooBig);
             chunks.push(Buffer.from(c));
         }
         const contentType = res.headers.get("content-type")?.split(";")[0].trim() || null;
