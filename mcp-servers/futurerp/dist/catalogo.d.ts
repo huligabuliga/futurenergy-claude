@@ -13,5 +13,12 @@ interface Pkg {
 }
 /** One package by id, exact name or a fragment only one name contains. Exported for the check script. */
 export declare function pickPackage(pkgs: Pkg[], ref: string): Pkg;
+/**
+ * Short code of a draft's exact contents. `publicar` asks for it back, so what goes live is the
+ * draft the person was shown, not one a colleague changed in between. Exported for the check script.
+ */
+export declare function draftCode(d: {
+    versions?: any[];
+} | null): string;
 export declare function registerCatalogTools(server: McpServer, deps: CatalogDeps): void;
 export {};

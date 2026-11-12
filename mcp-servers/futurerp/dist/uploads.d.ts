@@ -11,7 +11,7 @@ export declare const MAX_B64_BYTES: number;
 export declare function assertPublicHttps(u: URL): Promise<void>;
 /** Google Drive "share" links → direct download. */
 export declare function directUrl(raw: string): string;
-export declare function fetchCapped(raw: string, fileName: string): Promise<{
+export declare function fetchCapped(raw: string, fileName: string, maxBytes?: number): Promise<{
     bytes: Buffer;
     contentType: string | null;
 }>;

@@ -51,7 +51,7 @@ async function call(tok, name, args) { const r = (await mcp(tok, "tools/call", {
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const users = [];
-let flyerPath = null;
+let flyerPath = null, newPkg = null;
 try {
   const s = randomBytes(3).toString("hex");
   const eM = `cat-mkt-${s}@futurenergy.mx`, eP = `cat-plain-${s}@futurenergy.mx`;
@@ -97,8 +97,33 @@ try {
   ok(r.isError && /varios paquetes/.test(r.text), "an ambiguous name asks for the full one", r.text.slice(0, 90));
   r = await call(tM, "futurerp_nancy_paquete_guardar", { paquete: PKG, precio: otherPrice });
   ok(!r.isError && /BLOQUEA: .*mismo precio/.test(r.text), "the reply names what blocks publishing (duplicate price)");
+  const code = r.text.match(/borrador: ([0-9a-f]{8})/)?.[1];
   r = await call(tM, "futurerp_nancy_catalogo_publicar", { accion: "publicar" });
-  ok(r.isError && /No se puede publicar/.test(r.text), "publicar is refused while the review has errors", r.text.slice(0, 90));
+  ok(r.isError && /no es el que se revisó/.test(r.text) && r.text.includes(PKG), "publicar without the draft code is refused and shows the draft", r.text.slice(0, 80));
+  r = await call(tM, "futurerp_nancy_catalogo_publicar", { accion: "publicar", codigo: "00000000" });
+  ok(r.isError && /no es el que se revisó/.test(r.text), "a stale code is refused");
+  r = await call(tM, "futurerp_nancy_catalogo_publicar", { accion: "publicar", codigo: code });
+  ok(r.isError && /No se puede publicar/.test(r.text), "with the right code, publicar is still refused while the review has errors", r.text.slice(0, 90));
+  r = await call(tM, "futurerp_nancy_paquete_guardar", { paquete: PKG, vigente_hasta: "01/12/2026" }).catch((e) => ({ isError: true, text: String(e) }));
+  ok((r.isError || !/Guardado/.test(r.text)) && (await version())?.valid_until === "2099-12-31", "a date that is not AAAA-MM-DD is refused, nothing saved");
+
+  console.log("\n# new package");
+  const NEW = `Prueba MCP ${s}`;
+  const nuevo = { nombre: NEW, tipo: "bateria", publico: "ya_tiene_paneles", para_quien: "Solo para la prueba automática." };
+  const byName = async () => (await rest(`/sales_packages?name=eq.${encodeURIComponent(NEW)}&select=id`)).b;
+  r = await call(tM, "futurerp_nancy_paquete_guardar", { nuevo, precio: 123457, flyer_base64: Buffer.from("not an image").toString("base64") });
+  ok(r.isError && (await byName()).length === 0, "a bad flyer fails before the package is created");
+  r = await call(tM, "futurerp_nancy_paquete_guardar", { nuevo, precio: 123457, bateria_kwh: 5, vigente_hasta: "2099-12-31", equipo: [{ cantidad: 1, texto: "batería de prueba de 5 kWh" }] });
+  newPkg = (await byName())[0]?.id ?? null;
+  const nv = newPkg ? (await rest(`/sales_package_versions?package_id=eq.${newPkg}&select=price_mxn,battery_kwh,on_end,items:sales_package_items(customer_label)`)).b[0] : null;
+  ok(!r.isError && Number(nv?.price_mxn) === 123457 && Number(nv?.battery_kwh) === 5 && nv?.items.length === 1, "nuevo creates the package and fills it in the draft", r.text.slice(0, 90));
+  r = await call(tM, "futurerp_nancy_paquete_guardar", { nuevo, precio: 123458 });
+  ok(r.isError && /Ya existe/.test(r.text) && (await byName()).length === 1, "the same name again is refused: a retry never duplicates");
+  r = await call(tM, "futurerp_nancy_paquete_guardar", { paquete: "Solo batería 16 kWh", precio: 199457, vigente_hasta: "2099-12-31", al_terminar: "dejar_de_ofrecer" });
+  const base = (await rest(`/sales_package_versions?select=on_end,package:sales_packages!inner(role),release:sales_catalog_releases!inner(status)&package.role=eq.battery_only&release.status=eq.draft`)).b[0];
+  ok(!r.isError && base?.on_end === "revert", "a base package's promotion always returns to the previous price");
+  await call(tM, "futurerp_nancy_catalogo_publicar", { accion: "quitar_paquete", paquete: "Solo batería 16 kWh" });
+  await call(tM, "futurerp_nancy_catalogo_publicar", { accion: "quitar_paquete", paquete: NEW });
   ok((await rest(`/sales_catalog_releases?status=eq.draft&select=id`)).b.length === 1, "the draft is still a draft");
 
   console.log("\n# undo");
@@ -109,6 +134,7 @@ finally {
   const pkgId = flyerPath?.split("/")[0];
   if (pkgId) await rest(`/sales_package_versions?package_id=eq.${pkgId}&flyer_path=eq.${encodeURIComponent(flyerPath)}`, { method: "DELETE" });
   if (flyerPath) await fetch(`${SB}/storage/v1/object/nancy-catalogo/${flyerPath}`, { method: "DELETE", headers: H });
+  if (newPkg) { await rest(`/sales_package_versions?package_id=eq.${newPkg}`, { method: "DELETE" }); await rest(`/sales_packages?id=eq.${newPkg}`, { method: "DELETE" }); }
   for (const id of users) await rmUser(id);
   child?.kill();
 }

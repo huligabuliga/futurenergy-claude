@@ -65,7 +65,7 @@ Three tools for whoever can edit `/nancy/catalogo` (Marketing, directors, Sistem
 
 - `futurerp_nancy_catalogo`: what Nancy quotes today, the draft and its blockers, any scheduled change. Call it first.
 - `futurerp_nancy_paquete_guardar`: create (`nuevo`) or change (`paquete` = name fragment or id) a package or promotion **in the draft**. Only the fields passed change: `precio`, `bateria_kwh`, `paneles`, `watts_por_panel`, `equipo` (replaces the list), `incluye`, `respaldo`, `nota_para_nancy`, `vigente_desde`, `vigente_hasta` (null clears), `al_terminar`, `flyer_url` / `flyer_base64` (JPG/PNG ≤5 MB; Drive share links OK), `quitar_flyer`, `dejar_de_ofrecer`.
-- `futurerp_nancy_catalogo_publicar`: `accion` = `publicar` (now, or `cuando` in Monterrey time), `cancelar_programado`, `quitar_paquete`, `descartar_borrador`.
+- `futurerp_nancy_catalogo_publicar`: `accion` = `publicar` (now, or `cuando` in Monterrey time; needs `codigo`, the draft code the read and save tools print, so a draft that changed since the person saw it is refused), `cancelar_programado`, `quitar_paquete`, `descartar_borrador`.
 
 Flow: read → guardar → show the person the draft summary and blockers → publish only after their explicit yes. Publishing reaches real prospects within a minute. The three base packages can't be withdrawn and a promotion on them must return to the previous price; a price can't repeat another package's.
 
