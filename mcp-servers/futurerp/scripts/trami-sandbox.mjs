@@ -26,7 +26,8 @@ const rest = (path, { headers, ...init } = {}) => j(`${SB}/rest/v1${path}`, { ..
 const log = (f, o) => appendFileSync(resolve(OUT, f), JSON.stringify({ at: new Date().toISOString(), ...o }) + "\n");
 
 // ── mocks ───────────────────────────────────────────────────────────────────
-const OPENWA_PORT = 3212, GOOGLE_PORT = 3213, PORT = 3211;
+// TRAMI_SANDBOX_PORT moves all three, so two sandboxes (e.g. an eval and a cost run) can coexist.
+const PORT = Number(process.env.TRAMI_SANDBOX_PORT ?? 3211), OPENWA_PORT = PORT + 1, GOOGLE_PORT = PORT + 2;
 const readBody = (req) => new Promise((res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => res(b)); });
 let n = 0;
 const openwaMock = createServer(async (req, res) => {

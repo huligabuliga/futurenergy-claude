@@ -69,7 +69,7 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
           deps.sbApi(`/tramite_file_links?select=tramite_id,doc_key,project_files(id,file_name,mime_type,file_size)&tramite_id=in.(${"00000000-0000-0000-0000-000000000000"})`).catch(() => []),
           deps.sbApi(`/project_products?project_id=eq.${id}&select=quantity,catalog_items(name,category,watts_per_unit)`),
           deps.sbApi(`/project_bloqueos?project_id=eq.${id}&estado=eq.activo&select=id,categoria,dependencia,motivo,created_at`),
-          deps.sbApi(`/crm_activities?entity_type=eq.project&entity_id=eq.${id}&select=created_at,activity_type,subject&order=created_at.desc&limit=8`),
+          deps.sbApi(`/crm_activities?entity_type=eq.project&entity_id=eq.${id}&select=created_at,activity_type,subject&order=created_at.desc&limit=5`),
         ]);
         const tramIds: string[] = (tramites ?? []).map((t: any) => t.id);
         const linkRows: any[] = tramIds.length ? await deps.sbApi(`/tramite_file_links?select=tramite_id,doc_key,project_files(id,file_name,mime_type,file_size)&tramite_id=in.(${tramIds.join(",")})`) : links;

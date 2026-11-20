@@ -31,7 +31,7 @@ export function registerDocumentTools(server: McpServer, deps: DocDeps) {
     {
       file_id: z.string().uuid().optional().describe("project_files.id"),
       url: z.string().url().optional().describe("Firebase Storage URL (when there is no project_files row)"),
-      max_chars: z.number().int().min(500).max(60000).optional().describe("Cap for the PDF text (default 12000)"),
+      max_chars: z.number().int().min(500).max(60000).optional().describe("Cap for the PDF text (default 12000; 1500 for a parsed CFE bill)"),
     },
     async ({ file_id, url, max_chars }) => {
       try {
@@ -57,12 +57,14 @@ export function registerDocumentTools(server: McpServer, deps: DocDeps) {
         if (isPdf) {
           const parsed = await pdfParse(bytes, { max: 10 });
           const text = parsed.text.replace(/[ \t]+\n/g, "\n").trim();
-          const cap = max_chars ?? 12000;
           const head = `## ${name} — PDF, ${parsed.numpages} página(s), ${(bytes.length / 1024).toFixed(0)} KB`;
           if (text.length < 40) {
             return { content: [{ type: "text" as const, text: `${head}\n\nEl PDF no tiene capa de texto (escaneado). Descárgalo en tu sandbox y conviértelo a imagen para leerlo, o pide el documento en foto.` }] };
           }
           const recibo = esRecibo(text) ? parseRecibo(text) : null;
+          // A parsed CFE bill already carries what the expediente needs: keep only the
+          // first lines of raw text (header, titular) unless the caller asks for more.
+          const cap = max_chars ?? (recibo ? 1500 : 12000);
           const fields = recibo ? `\n\n### Recibo CFE (campos leídos)\n\`\`\`json\n${JSON.stringify(recibo, null, 2)}\n\`\`\`` : "";
           return { content: [{ type: "text" as const, text: `${head}${fields}\n\n### Texto\n${text.slice(0, cap)}${text.length > cap ? "\n…(recortado)" : ""}` }] };
         }

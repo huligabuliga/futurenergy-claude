@@ -5,19 +5,44 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 export function registerOpsTools(server: McpServer, deps: { sbRpc: (name: string, args?: Record<string, any>) => Promise<any> }) {
   server.tool(
     "futurerp_trami_barrido",
-    "The morning sweep list in one call: every open project with required trámites or a trámite still in progress (created after the configured cutoff), with zona, stage, required labels and vetoes, each trámite's stage/SI/dates/next review, active bloqueo, and whether recibo and INE are on file. Sorted by priority: 1 subsanación, 2 review date due, 3 assembling expediente, 4 no trámite yet, 5 with the gestora > 2 days without news, 6 the rest. Open futurerp_tramite_contexto only for the projects you will act on.",
+    "The morning sweep list in one call. By default only the projects that need your judgement today: changed by someone else since the last sweep, in subsanación, review date due, DD10/DD11 that just became eligible (7 days after the anticipo), or > 60 days with CFE and not chased in 7 days. Each row says why (motivo). The quiet ones are only counted, for the summary: do not look them up. todos=true returns every open project (Friday audit). Open futurerp_tramite_contexto only for the projects you will act on.",
+    {
+      todos: z.boolean().optional().describe("true = every open project (audit), default = only what changed or is due"),
+      desde: z.string().datetime({ offset: true }).optional().describe("Override the cutoff (ISO timestamp); only for evals and replays"),
+    },
+    async ({ todos, desde }) => {
+      try {
+        const P: Record<number, string> = { 1: "en subsanación", 2: "revisión vencida", 3: "armando expediente", 4: "sin trámite", 5: "con la gestora sin noticias", 6: "en curso" };
+        const line = (r: any) => {
+          const tr = (r.tramites ?? []).map((t: any) => `${t.tipo}:${t.etapa}${t.enviado ? "/enviado" : ""}${t.si ? `/SI ${t.si}` : ""}${t.subsanacion ? "/SUBSANACIÓN" : ""}${t.revisar ? `/revisar ${t.revisar}` : ""}${t.docs_pedidos ? `/docs pedidos ${t.docs_pedidos}` : ""}${t.ingreso ? `/ingreso ${t.ingreso}` : ""} (${t.dias_en_etapa}d, id ${t.id})`).join("; ");
+          return `- [${r.prioridad} ${P[r.prioridad]}]${r.motivo ? ` (${r.motivo})` : ""} ${r.efu} ${r.name} · ${r.stage} · zona ${r.zona_cfe ?? "SIN ZONA"} · requeridos: ${(r.requeridos ?? []).join(", ") || "—"}${r.vetados?.length ? ` · vetados: ${r.vetados.join(", ")}` : ""}${r.bloqueado ? " · BLOQUEADO" : ""} · recibo ${r.tiene_recibo ? "sí" : "no"}, INE ${r.tiene_ine ? "sí" : "no"} · trámites: ${tr || "ninguno"}`;
+        };
+        if (todos) {
+          const rows: any[] = (await deps.sbRpc("trami_barrido")) ?? [];
+          return { content: [{ type: "text" as const, text: `## Barrido completo (${rows.length} proyectos)\n${rows.map(line).join("\n") || "- nada"}` }] };
+        }
+        const d: any = (await deps.sbRpc("trami_barrido_delta", desde ? { p_desde: desde } : {})) ?? {};
+        const rows: any[] = d.proyectos ?? [];
+        const quietos = Object.entries(d.quietos_por_prioridad ?? {}).map(([k, n]) => `${n} ${P[Number(k)] ?? k}`).join(", ");
+        return { content: [{ type: "text" as const, text: `## Barrido: ${rows.length} de ${d.total ?? "?"} proyectos necesitan tu juicio hoy (cambios desde ${String(d.desde ?? "").slice(0, 16).replace("T", " ")} UTC)\nSin cambios, no los revises: ${quietos || "ninguno"}${d.en_espera_dd10_dd11 ? ` (incluye ${d.en_espera_dd10_dd11} DD10/DD11 en su semana de espera)` : ""}.\n${rows.map(line).join("\n") || "- nada que hacer hoy"}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: `No se pudo leer el barrido: ${e?.message ?? e}` }], isError: true as const };
+      }
+    },
+  );
+
+  server.tool(
+    "futurerp_trami_acuses",
+    "Monday acuses list: expedientes sent to the gestora that still have no SI and were not chased in the last 7 days, grouped (más de un mes / 2 a 4 semanas / esta semana), longest wait first. Already filtered: send ONE grouped reminder with exactly these, then mark ultimo_seguimiento_at on each. Empty = send nothing.",
     {},
     async () => {
       try {
-        const rows: any[] = (await deps.sbRpc("trami_barrido")) ?? [];
-        const P: Record<number, string> = { 1: "en subsanación", 2: "revisión vencida", 3: "armando expediente", 4: "sin trámite", 5: "con la gestora sin noticias", 6: "en curso" };
-        const lines = rows.map((r) => {
-          const tr = (r.tramites ?? []).map((t: any) => `${t.tipo}:${t.etapa}${t.enviado ? "/enviado" : ""}${t.si ? `/SI ${t.si}` : ""}${t.subsanacion ? "/SUBSANACIÓN" : ""}${t.revisar ? `/revisar ${t.revisar}` : ""}${t.docs_pedidos ? `/docs pedidos ${t.docs_pedidos}` : ""} (${t.dias_en_etapa}d, id ${t.id})`).join("; ");
-          return `- [${r.prioridad} ${P[r.prioridad]}] ${r.efu} ${r.name} · ${r.stage} · zona ${r.zona_cfe ?? "SIN ZONA"} · requeridos: ${(r.requeridos ?? []).join(", ") || "—"}${r.vetados?.length ? ` · vetados: ${r.vetados.join(", ")}` : ""}${r.bloqueado ? " · BLOQUEADO" : ""} · recibo ${r.tiene_recibo ? "sí" : "no"}, INE ${r.tiene_ine ? "sí" : "no"} · trámites: ${tr || "ninguno"}`;
-        });
-        return { content: [{ type: "text" as const, text: `## Barrido (${rows.length} proyectos)\n${lines.join("\n") || "- nada"}` }] };
+        const rows: any[] = (await deps.sbRpc("trami_acuses_pendientes")) ?? [];
+        if (!rows.length) return { content: [{ type: "text" as const, text: "Sin acuses pendientes esta semana: no mandes nada." }] };
+        const groups = ["más de un mes", "2 a 4 semanas", "esta semana"].map((g) => [g, rows.filter((r) => r.grupo === g)] as const).filter(([, v]) => v.length);
+        return { content: [{ type: "text" as const, text: `## Acuses pendientes (${rows.length})\n${groups.map(([g, v]) => `### ${g}\n${v.map((r: any) => `- ${r.cliente ?? r.name} · ${r.efu} · ${r.tipo} · ${r.dias} días (trámite ${r.tramite_id})`).join("\n")}`).join("\n")}` }] };
       } catch (e: any) {
-        return { content: [{ type: "text" as const, text: `No se pudo leer el barrido: ${e?.message ?? e}` }], isError: true as const };
+        return { content: [{ type: "text" as const, text: `No se pudieron leer los acuses: ${e?.message ?? e}` }], isError: true as const };
       }
     },
   );
