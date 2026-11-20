@@ -281,3 +281,78 @@ test("no Iris or Flor in the MCP sources (tool descriptions, replies, comments)"
     readFileSync(new URL(f, dir), "utf8").split("\n").map((l, i) => [f, i + 1, l]).filter(([, , l]) => /\b(Iris|Flor)\b/.test(l)).map(([f, n]) => `${f}:${n}`));
   assert.deepEqual(hits, []);
 });
+
+// ── DD10/DD11: the expediente waits 7 days after the anticipo (tramites-reglas "Cuándo empezar") ──
+import { esperaAnticipo, DIAS_ESPERA_ANTICIPO } from "../dist/espera.js";
+const ANTICIPO = "2026-11-13T18:00:00Z"; // 12:00 Monterrey, Friday 13
+const DIA = (n) => new Date(Date.parse(ANTICIPO) + n * 86_400_000 + 3600_000).toISOString(); // n days later, 13:00 Mty
+const SUBJ = "Trámite nuevo – bidireccional – DD11 – Cliente Prueba";
+function esperaHarness({ zona = "DD11", hist = [{ entered_at: ANTICIPO }], fac = null, mode = "shadow", tramite = {} } = {}) {
+  resetModeCache();
+  const h = harness({
+    "/system_config": [{ config_key: "trami_mode", config_value: mode }],
+    "/gestoras": [{ email: "gestora@example.com" }],
+    "/projects": [{ id: P1, efu: "EFU-1", zona_cfe: zona, fecha_anticipo_completo: fac, clients: {} }],
+    "/project_stage_history": hist,
+    "/project_tramites": [{ ...TRAMITE, stage: "expediente_integracion", enviado: false, ...tramite }],
+  });
+  registerMailTools(h.server, h.deps);
+  registerTramiteTools(h.server, h.deps);
+  return h;
+}
+const draft = (h, subject = SUBJ, project_id = P1) => h.tools.futurerp_mail_draft({ to: "gestora@example.com", subject, text: "x", project_id });
+
+test("espera: one constant, 7 days", () => assert.equal(DIAS_ESPERA_ANTICIPO, 7));
+
+for (const [n, ok] of [[0, false], [6, false], [7, true]]) {
+  test(`espera: expediente email on day ${n} after the anticipo is ${ok ? "allowed" : "refused"}`, atUtc(DIA(n), async () => {
+    const r = await draft(esperaHarness());
+    if (ok) assert.match(txt(r), /^\(sombra\)/);
+    else { assert.equal(r.isError, true); assert.match(txt(r), /anticipo se pagó el 2026-11-13.*desde el 2026-11-20.*nota en el timeline/); }
+  }));
+  test(`espera: enviado=true / documentacion_con_gestor on day ${n} is ${ok ? "allowed" : "refused"}`, atUtc(DIA(n), async () => {
+    const h = esperaHarness();
+    for (const patch of [{ enviado: true }, { stage: "documentacion_con_gestor" }, { stage: "folio_ingresado" }]) {
+      const r = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch });
+      if (ok) assert.match(txt(r), /^\(sombra\)/, JSON.stringify(patch));
+      else assert.match(txt(r), /desde el 2026-11-20/, JSON.stringify(patch));
+    }
+  }));
+}
+
+test("espera: live mode refuses too, and nothing is written", atUtc(DIA(0), async () => {
+  const h = esperaHarness({ mode: "live" });
+  const r = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } });
+  assert.equal(r.isError, true);
+  assert.ok(!h.writes.some((w) => w.method === "PATCH"));
+}));
+
+test("espera: no anticipo paid at all is refused; fecha_anticipo_completo is the fallback", atUtc(DIA(7), async () => {
+  assert.match(txt(await draft(esperaHarness({ hist: [] }))), /no hay anticipo pagado/);
+  assert.match(txt(await draft(esperaHarness({ hist: [], fac: "2026-11-13" }))), /^\(sombra\)/);
+  assert.match(txt(await draft(esperaHarness({ hist: [], fac: "2026-11-15" }))), /desde el 2026-11-22/);
+}));
+
+test("espera: an expediente email without project_id is refused", atUtc(DIA(7), async () => {
+  assert.match(txt(await draft(esperaHarness(), SUBJ, "")), /lleva project_id/);
+}));
+
+test("espera: other zones, other tipos, other emails and other fields are unaffected on day 0", atUtc(DIA(0), async () => {
+  for (const zona of ["DD12", "DD06", "foraneo"]) {
+    const h = esperaHarness({ zona });
+    assert.match(txt(await draft(h, `Trámite nuevo – bidireccional – ${zona} – Cliente`)), /^\(sombra\)/, zona);
+    assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/, zona);
+  }
+  const h = esperaHarness();
+  assert.match(txt(await draft(h, "Trámite nuevo – cambio de nombre – DD11 – Cliente")), /^\(sombra\)/);
+  assert.match(txt(await draft(h, "Seguimiento SI-123")), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { numero_si: "SI-1" } })), /^\(sombra\)/);
+  const cn = esperaHarness({ tramite: { tipo: "cambio_nombre", stage: "pendiente" } });
+  assert.match(txt(await cn.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/);
+}));
+
+test("espera: the anticipo day is the Monterrey day (21:00 Mty = 03:00 UTC next day)", async () => {
+  const sb = async (path) => path.startsWith("/projects") ? [{ id: P1, efu: "E", zona_cfe: "DD10" }] : [{ entered_at: "2026-11-14T03:00:00Z" }];
+  assert.match(await esperaAnticipo(sb, {}, P1, Date.parse("2026-11-19T18:00:00Z")), /pagó el 2026-11-13.*desde el 2026-11-20/);
+  assert.equal(await esperaAnticipo(sb, {}, P1, Date.parse("2026-11-20T18:00:00Z")), null);
+});

@@ -18,6 +18,7 @@
 import { createSign, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { guardedTool, setShadowCheck } from "./guard.js";
+import { esperaAnticipo } from "./espera.js";
 const TOKEN_URL = process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com/token";
 const GMAIL_BASE = (process.env.GMAIL_API_BASE ?? "https://gmail.googleapis.com").replace(/\/$/, "");
 const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
@@ -172,7 +173,7 @@ export function registerMailTools(server, deps) {
         }
     });
     /** Allowlist + attachment ownership; also run in shadow (guard.shadowChecks). */
-    async function mailCheck({ to, project_id, attachment_file_ids }) {
+    async function mailCheck({ to, subject, project_id, attachment_file_ids }) {
         let addr;
         try {
             addr = assertSafeAddress(to, "To").toLowerCase();
@@ -202,10 +203,20 @@ export function registerMailTools(server, deps) {
             if (!FIREBASE_HOSTS.includes(new URL(f.firebase_url).hostname))
                 return { error: `El archivo ${fid} no está en Firebase Storage.` };
         }
+        // The expediente email ("Trámite nuevo – <tipo> – <zona> – <cliente>") waits for the DD10/DD11 week.
+        // Cambio de nombre, 220 V, UVIE and alta are eligible right away and pass.
+        const asunto = String(subject ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+        if (/^\s*tramite nuevo\b/.test(asunto) && !/nombre|220|uvie|alta/.test(asunto)) {
+            if (!project)
+                return { error: "Un expediente (asunto 'Trámite nuevo – …') lleva project_id: sin él no se puede revisar si ya toca enviarlo." };
+            const espera = await esperaAnticipo(sbApi, serviceHeaders(), project.id);
+            if (espera)
+                return { error: espera };
+        }
         return { addr, project };
     }
     setShadowCheck(server, "futurerp_mail_draft", async (a) => { const r = await mailCheck(a); return "error" in r ? r.error : null; });
-    tool("futurerp_mail_draft", "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.", {
+    tool("futurerp_mail_draft", "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated. An expediente (subject 'Trámite nuevo – …', project_id required) for a DD10/DD11 project is refused until 7 days after the anticipo; the error gives the date to put in the timeline note.", {
         to: z.string().email(),
         subject: z.string().min(3).max(200),
         text: z.string().min(1).max(20000),
@@ -213,7 +224,7 @@ export function registerMailTools(server, deps) {
         attachment_file_ids: z.array(z.string().uuid()).max(10).optional().describe("project_files ids to attach"),
     }, async ({ to, subject, text: bodyText, project_id, attachment_file_ids }) => {
         try {
-            const chk = await mailCheck({ to, project_id, attachment_file_ids });
+            const chk = await mailCheck({ to, subject, project_id, attachment_file_ids });
             if ("error" in chk)
                 return fail(chk.error);
             const { addr, project } = chk;

@@ -12,6 +12,7 @@
  */
 import { z } from "zod";
 import { guardedTool, setShadowCheck } from "./guard.js";
+import { esperaAnticipo } from "./espera.js";
 const OPENWA_API_URL = (process.env.OPENWA_API_URL ?? "").replace(/\/$/, "");
 const OPENWA_API_KEY = process.env.OPENWA_API_KEY ?? "";
 const WA_SENDS_PER_HOUR = 20;
@@ -159,8 +160,24 @@ export function registerTramiteTools(server, deps) {
             return fail(`No se pudo crear el trámite: ${e.message}`);
         }
     });
+    /**
+     * Marking a primary trámite as sent (enviado=true, or a stage at/after documentacion_con_gestor)
+     * waits for the DD10/DD11 week after the anticipo, like the expediente email. Also run in shadow.
+     */
+    async function envioCheck(cur, patch, reingreso) {
+        if (reingreso || !String(cur.tipo ?? "").startsWith("primary"))
+            return null;
+        const stages = TRAMITE_STAGES[cur.tipo] ?? [];
+        const envio = stages.indexOf("documentacion_con_gestor");
+        const marca = (patch.enviado === true && !cur.enviado) || (envio >= 0 && patch.stage !== undefined && stages.indexOf(patch.stage) >= envio && stages.indexOf(cur.stage) < envio);
+        return marca ? esperaAnticipo(sbApi, serviceHeaders(), cur.project_id) : null;
+    }
+    setShadowCheck(server, "futurerp_tramite_update", async (a) => {
+        const cur = a.tramite_id && uuidRx.test(a.tramite_id) ? (await sbApi(`/project_tramites?id=eq.${a.tramite_id}&select=*&limit=1`))?.[0] : null;
+        return cur ? envioCheck(cur, a.patch ?? {}, a.reingreso) : null;
+    });
     // ── futurerp_tramite_update ───────────────────────────────────────────────
-    tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list (except a re-ingreso: reingreso=true + motivo lets the stage go back, never to the first stage, and keeps the previous numero_si / fecha_ingreso in type_data.ingresos_anteriores), unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
+    tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list (except a re-ingreso: reingreso=true + motivo lets the stage go back, never to the first stage, and keeps the previous numero_si / fecha_ingreso in type_data.ingresos_anteriores), unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by; on a DD10/DD11 primary it (and any stage from documentacion_con_gestor on) is refused until 7 days after the anticipo. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
         tramite_id: z.string().uuid(),
         patch: z.object({
             stage: z.string().optional(),
@@ -205,6 +222,9 @@ export function registerTramiteTools(server, deps) {
                 if (from >= 0 && to < from && to === 0)
                     return fail(`Un re-ingreso no regresa a ${stages[0]}: el expediente ya se envió una vez.`);
             }
+            const espera = await envioCheck(cur, patch, reingreso);
+            if (espera)
+                return fail(espera);
             if (reingreso) {
                 if (!motivo || motivo.trim().length < 5)
                     return fail("Un re-ingreso necesita motivo (qué dijo la gestora o CFE).");
