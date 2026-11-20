@@ -17,6 +17,28 @@ import { esperaAnticipo } from "./espera.js";
 import { leerPlantilla, listaPlantillas } from "./plantillas.js";
 import { textoPdf } from "./documents.js";
 
+/**
+ * tramite_update is default-deny: a changed field needs evidence unless it is listed here as free.
+ * Free = Trami's own bookkeeping about what IT did or will do; no outside fact is claimed.
+ * A new column on the patch schema must land in one of the three lists (test: "every patch field").
+ */
+export const CAMPOS_LIBRES = [
+  "comentarios",                   // its own note
+  "enviado",                       // its own send; envioCheck already holds it to the 7-day anticipo rule
+  "ultimo_seguimiento_at", "siguiente_revision_at", // its own follow-up clock
+  "docs_solicitados_at", "docs_recordatorio_at",    // it asked the client
+  "ultimo_estatus_cfe_avisado_at", // it told the client (the send itself is checked by whatsapp_send)
+];
+/** type_data keys that are its own bookkeeping; every other key needs evidence. */
+export const TYPE_DATA_LIBRES = ["fecha_envio_gestor"];
+/** Own rules in evidenciaCheck: a forward stage move / a new SI. */
+export const CAMPOS_PROPIOS = ["stage", "numero_si"];
+/** Need evidence (listed so the schema test can tell a forgotten column from a decided one). */
+export const CAMPOS_CON_EVIDENCIA = [
+  "fecha_ingreso", "fecha_resolucion", "gestor_cfe", "subsanacion_active", "fecha_subsanacion", "motivo_subsanacion",
+  "c0b_rechazada", "fecha_c0b_rechazada", "pagado", "costo", "ultimo_estatus_cfe", "ultimo_estatus_cfe_at", "type_data",
+];
+
 export interface TramiteDeps {
   /** PDF text reader (tests stub it). */
   textoPdf?: (href: string) => Promise<string | null>;
@@ -268,13 +290,18 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   const ETAPAS_DEL_CLIENTE = new Set(["medidor_instalado", "sistema_activado", "documentos_recibidos"]);
   const SLOTS_INGRESO = ["Anexo 2", "Comprobante de ingreso"];
   const SLOTS_DE_ETAPA: Record<string, string[]> = { folio_ingresado: SLOTS_INGRESO, en_seguimiento_cfe: SLOTS_INGRESO, ingresado_cfe: SLOTS_INGRESO, ingresado: SLOTS_INGRESO };
-  const CAMPOS_CON_EVIDENCIA = ["fecha_ingreso", "fecha_resolucion", "subsanacion_active", "motivo_subsanacion", "fecha_subsanacion"];
   async function evidenciaCheck(cur: any, patch: Record<string, any>, ev?: { wa_message_id?: string; file_id?: string }): Promise<string | null> {
     const etapa: string | undefined = patch.stage;
     const mueve = etapa !== undefined && etapa !== cur.stage && !ETAPAS_PROPIAS.has(etapa);
     const siNuevo: string | null = patch.numero_si && patch.numero_si !== cur.numero_si ? patch.numero_si : null;
     // These dates drive the SLA clocks: same evidence rule as a stage move.
-    const campos = CAMPOS_CON_EVIDENCIA.filter((k) => k in patch && String(patch[k] ?? "") !== String(cur[k] ?? ""));
+    // Default-deny: every changed field that is not free or ruled above needs evidence.
+    const cambia = (a: unknown, b: unknown) => typeof a === "object" || typeof b === "object"
+      ? JSON.stringify(a ?? null) !== JSON.stringify(b ?? null) : String(a ?? "") !== String(b ?? "");
+    const campos = Object.keys(patch).flatMap((k) =>
+      CAMPOS_LIBRES.includes(k) || CAMPOS_PROPIOS.includes(k) ? []
+      : k === "type_data" ? Object.keys(patch.type_data ?? {}).filter((t) => !TYPE_DATA_LIBRES.includes(t) && cambia(patch.type_data[t], cur.type_data?.[t])).map((t) => `type_data.${t}`)
+      : cambia(patch[k], cur[k]) ? [k] : []);
     // An ingreso comprobante proves only the ingreso date, never a resolution or a subsanación.
     const subs = campos.some((k) => k !== "fecha_ingreso");
     if (!mueve && !siNuevo && !campos.length) return null;

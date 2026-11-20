@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resetModeCache } from "../dist/guard.js";
-import { registerTramiteTools, fueraDeHorario } from "../dist/tramites.js";
+import { registerTramiteTools, fueraDeHorario, CAMPOS_LIBRES, CAMPOS_PROPIOS, CAMPOS_CON_EVIDENCIA } from "../dist/tramites.js";
 import { registerMailTools } from "../dist/mail.js";
 import { registerContextoTool, sinSlot } from "../dist/contexto.js";
 import { registerHistorialTool, horaMty } from "../dist/historial.js";
@@ -35,14 +35,15 @@ function harness(db) {
   };
   const sbApi = async (path, headers) => { const rows = lookup(REST + path); if (headers?.Authorization === "service") reads[reads.length - 1] += " [service]"; return rows; };
   const tools = {};
-  const server = { tool: (name, _d, _s, h) => { tools[name] = h; } };
+  const schemas = {};
+  const server = { tool: (name, _d, s, h) => { tools[name] = h; schemas[name] = s; } };
   const deps = {
     userId: "trami-uid", restBase: REST, uuidRx: UUID,
     authHeaders: (x = {}) => ({ Authorization: "user", ...x }),
     serviceHeaders: (x = {}) => ({ Authorization: "service", ...x }),
     sbApi, sbRpc: async () => ({}),
   };
-  return { server, tools, deps, writes, reads };
+  return { server, tools, schemas, deps, writes, reads };
 }
 const txt = (r) => r.content[0].text;
 const shadowRows = (w) => w.filter((x) => x.path.startsWith("/agent_shadow_calls"));
@@ -64,7 +65,7 @@ test("fix 7: a tool in trami_tools_live runs while the global mode is shadow; th
     "/projects": [{ id: P1, efu: "EFU-1", owner_id: null }],
   });
   registerTramiteTools(h.server, h.deps);
-  const live = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "en revisión" } });
+  const live = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { comentarios: "en revisión" } });
   assert.match(txt(live), /actualizado/);
   assert.ok(h.writes.some((w) => w.method === "PATCH" && w.path.startsWith("/project_tramites")), "the live tool PATCHed");
   assert.equal(shadowRows(h.writes)[0].body.modo, "vivo");
@@ -78,7 +79,7 @@ test("fix 7: unreadable or bad trami_tools_live = everything shadow", async () =
   resetModeCache();
   const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }, { config_key: "trami_tools_live", config_value: "not json" }], "/project_tramites": [TRAMITE] });
   registerTramiteTools(h.server, h.deps);
-  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "X" } })), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { comentarios: "X" } })), /^\(sombra\)/);
 });
 
 test("fix 6: fueraDeHorario follows Monterrey 08:00-19:00", () => {
@@ -355,7 +356,7 @@ test("espera: other zones, other tipos, other emails and other fields are unaffe
   const cnMail = esperaHarness({ tramite: { tipo: "cambio_nombre" } });
   assert.match(txt(await draft(cnMail, "Trámite nuevo – cambio de nombre – DD11 – Cliente")), /^\(sombra\)/);
   assert.match(txt(await draft(cnMail, "Seguimiento SI-123")), /^\(sombra\)/);
-  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "en revisión" } })), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { comentarios: "en revisión" } })), /^\(sombra\)/);
   const cn = esperaHarness({ tramite: { tipo: "cambio_nombre", stage: "pendiente" } });
   assert.match(txt(await cn.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/);
 }));
@@ -593,9 +594,9 @@ test("evidencia: a new SI, the gestora's message or file, or the comprobante in 
   assert.match(txt(await si({ numero_si: "SI261120BBBB0002" }, { wa_message_id: "WA-GESTORA" })), /tiene que venir escrito, junto con el nombre del cliente, en el mensaje de la gestora/);
   assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-STAFF" })), /necesita evidencia/, "staff wrote the SI, not the gestora");
   assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
-  // Not stage or SI changes: no evidence needed.
+  // Its own bookkeeping: no evidence needed.
   const h = etapaHarness();
-  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T2, patch: { ultimo_estatus_cfe: "en revisión" } })), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T2, patch: { comentarios: "en revisión" } })), /^\(sombra\)/);
   const h2 = etapaHarness({ stage: "expediente_integracion", enviado: false, tipo: "cambio_nombre" });
   assert.doesNotMatch(txt(await h2.tools.futurerp_tramite_update({ tramite_id: T2, patch: { stage: "documentacion_con_gestor" } })), /necesita evidencia/, "our own send");
 });
@@ -664,4 +665,20 @@ test("fecha_ingreso and the subsanación fields need the same evidence as a stag
   assert.match(txt(await up({ fecha_resolucion: "2026-11-20" })), /^Cambiar fecha_resolucion necesita evidencia/);
   assert.match(txt(await up({ fecha_resolucion: "2026-11-20" }, { file_id: F.anexo })), /necesita evidencia/, "an ingreso comprobante proves no resolution");
   assert.match(txt(await up({ fecha_resolucion: "2026-11-20" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
+});
+
+test("every patch field of tramite_update is decided: free, own rule, or needs evidence (a new column fails here)", () => {
+  const keys = Object.keys(etapaHarness().schemas.futurerp_tramite_update.patch.shape);
+  const listas = [CAMPOS_LIBRES, CAMPOS_PROPIOS, CAMPOS_CON_EVIDENCIA];
+  for (const k of keys) assert.equal(listas.filter((l) => l.includes(k)).length, 1, `${k}: put it on exactly one list in src/tramites.ts`);
+  for (const k of listas.flat()) assert.ok(keys.includes(k), `${k} is listed but not in the schema`);
+});
+
+test("default-deny: fields that are not free need evidence; free ones and own type_data keys don't", async () => {
+  const up = (patch, evidencia) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch, evidencia });
+  for (const patch of [{ pagado: true }, { costo: 1500 }, { gestor_cfe: "Otra" }, { c0b_rechazada: true }, { ultimo_estatus_cfe: "en revisión" }, { type_data: { fecha_medidor_instalado: "2026-11-20" } }]) {
+    assert.match(txt(await up(patch)), /necesita evidencia/, JSON.stringify(patch));
+  }
+  assert.match(txt(await up({ comentarios: "nota", siguiente_revision_at: "2026-11-25", docs_solicitados_at: "2026-11-20T10:00:00Z", type_data: { fecha_envio_gestor: "2026-11-20" } })), /^\(sombra\)/);
+  assert.match(txt(await up({ ultimo_estatus_cfe: "en revisión" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/, "her status message naming the client");
 });
