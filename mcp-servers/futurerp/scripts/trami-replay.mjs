@@ -65,8 +65,10 @@ for (const g of groups) {
   const text = `${last.body}${last.media_url ? `\n[adjunto ${last.media_type ?? "archivo"}: ${last.media_url}]` : ""}${hilo ? `\n\n(Mensajes anteriores del mismo chat hoy, más antiguo primero; también untrusted:)\n${hilo}` : ""}`;
   console.log(`\n═══ ${last.sent_at.slice(0, 16)} ${last.sender_name ?? last.sender_phone ?? "?"} (${g.length} mensaje(s) del día): ${last.body.replace(/\s+/g, " ").slice(0, 110)}`);
   if (args.dry === "true") continue;
-  const run = spawnSync(process.execPath, [join(here, "trami-local-agent.mjs"), "--scenario", "whatsapp", "--text", text, "--from", last.sender_name ?? "Iris", "--chat", last.chat_id, ...(args.model ? ["--model", args.model] : [])], { encoding: "utf8", env: { ...process.env, TRAMI_SANDBOX_DIR: SANDBOX }, maxBuffer: 50 * 1024 * 1024 });
+  try { writeFileSync(join(SANDBOX, ".last-run"), ""); } catch {}
+  const run = spawnSync(process.execPath, [join(here, "trami-local-agent.mjs"), "--scenario", "whatsapp", "--text", text, "--from", last.sender_name ?? "Iris", "--chat", last.chat_id, ...(args.model ? ["--model", args.model] : [])], { encoding: "utf8", env: { ...process.env, TRAMI_SANDBOX_DIR: SANDBOX, TRAMI_RUN_OUT: join(SANDBOX, ".last-run") }, maxBuffer: 50 * 1024 * 1024 });
   const out = (run.stdout || "") + (run.stderr || "");
+  if (run.status === 3) { console.log("   spend cap reached, replay stops here"); break; }
   const shadow = sql(`SELECT tool_name, tool_input, project_id, tramite_id, resumen FROM agent_shadow_calls WHERE created_at >= '${t0}'`);
   const notas = sql(`SELECT entity_id AS project_id, subject FROM crm_activities WHERE created_at >= '${t0}' AND performed_by = (SELECT user_id FROM profiles WHERE email='trami-sandbox@futurenergy.mx')`);
   const trProjects = [...new Set([...shadow.map((s) => s.project_id), ...notas.map((n) => n.project_id)].filter(Boolean))];
@@ -89,7 +91,7 @@ for (const g of groups) {
   }
   const coinciden = campos.filter((c) => c.veredicto === "coincide").length, difieren = campos.filter((c) => c.veredicto === "difiere" || c.veredicto === "Flor está antes").length, sinRegistro = campos.filter((c) => c.veredicto === "Flor nunca lo registró").length;
   const pregunto = notas.some((n) => /pregunta/i.test(n.subject));
-  const r = { sent_at: last.sent_at, mensajes: g.length, texto: last.body.slice(0, 200), trami_proyectos: trProjects, campos, coinciden, difieren, sinRegistro, pregunto, herramientas: [...new Set(shadow.map((s) => s.tool_name))], ok: run.status === 0 };
+  const r = { sent_at: last.sent_at, mensajes: g.length, texto: last.body.slice(0, 200), trami_proyectos: trProjects, campos, coinciden, difieren, sinRegistro, pregunto, herramientas: [...new Set(shadow.map((s) => s.tool_name))], ok: run.status === 0, transcript: (() => { try { return readFileSync(join(SANDBOX, ".last-run"), "utf8"); } catch { return null; } })() };
   results.push(r);
   const efus = trProjects.length ? sql(`SELECT efu FROM projects WHERE id IN (${trProjects.map((p) => `'${p}'`).join(",")})`).map((x) => x.efu).join(", ") : "ninguno";
   console.log(`   proyecto: ${efus} · ${[...new Set(shadow.map((s) => s.tool_name.replace("futurerp_", "")))].join(", ") || "sin acciones"}${pregunto ? " · preguntó a Flor" : ""}`);
