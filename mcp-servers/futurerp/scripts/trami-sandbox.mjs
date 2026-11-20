@@ -38,9 +38,13 @@ const googleMock = createServer(async (req, res) => {
   const body = await readBody(req); res.setHeader("content-type", "application/json");
   if (req.url === "/token") return res.end(JSON.stringify({ access_token: "ya29.mock", expires_in: 3600 }));
   // Mailbox = <outdir>/gmail-seed.json if an eval scenario wrote one ([{id, from, to, subject, date, text, attachments}]), else empty.
-  // ponytail: the search query is ignored, every seeded message matches; filter by q if a scenario needs two mailboxes.
+  // Seeded messages are sent mail: a drafts or unread search finds none, any other search finds all of them.
+  // ponytail: no real Gmail query parsing (from:/subject: match everything); add it if a scenario needs two mailboxes.
   let seed = []; try { seed = JSON.parse(readFileSync(resolve(OUT, "gmail-seed.json"), "utf8")); } catch {}
-  if (req.url.startsWith("/gmail/v1/users/me/messages?")) return res.end(JSON.stringify({ messages: seed.map((m) => ({ id: m.id })) }));
+  if (req.url.startsWith("/gmail/v1/users/me/messages?")) {
+    const q = new URL(req.url, "http://mock").searchParams.get("q") ?? "";
+    return res.end(JSON.stringify({ messages: /\b(in|label):drafts?\b|\bis:(draft|unread)\b/i.test(q) ? [] : seed.map((m) => ({ id: m.id })) }));
+  }
   const one = req.url.match(/^\/gmail\/v1\/users\/me\/messages\/([^?/]+)/), m = one && seed.find((x) => x.id === decodeURIComponent(one[1]));
   if (m) return res.end(JSON.stringify({ id: m.id, snippet: m.text.slice(0, 160), labelIds: ["SENT"], payload: { mimeType: "multipart/mixed",
     headers: Object.entries({ From: m.from, To: m.to, Subject: m.subject, Date: m.date }).map(([name, value]) => ({ name, value })),
