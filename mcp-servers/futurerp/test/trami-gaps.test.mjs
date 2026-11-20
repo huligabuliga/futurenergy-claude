@@ -301,7 +301,7 @@ function esperaHarness({ zona = "DD11", hist = [{ entered_at: ANTICIPO }], fac =
   registerTramiteTools(h.server, h.deps);
   return h;
 }
-const draft = (h, subject = SUBJ, project_id = P1) => h.tools.futurerp_mail_draft({ to: "gestora@example.com", subject, text: "x", project_id });
+const draft = (h, subject = SUBJ, project_id = P1, tramite_id = T1) => h.tools.futurerp_mail_draft({ to: "gestora@example.com", subject, text: "x", project_id, tramite_id });
 
 test("espera: one constant, 7 days", () => assert.equal(DIAS_ESPERA_ANTICIPO, 7));
 
@@ -345,11 +345,26 @@ test("espera: other zones, other tipos, other emails and other fields are unaffe
     assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/, zona);
   }
   const h = esperaHarness();
-  assert.match(txt(await draft(h, "Trámite nuevo – cambio de nombre – DD11 – Cliente")), /^\(sombra\)/);
+  const cnMail = esperaHarness({ tramite: { tipo: "cambio_nombre" } });
+  assert.match(txt(await draft(cnMail, "Trámite nuevo – cambio de nombre – DD11 – Cliente")), /^\(sombra\)/);
   assert.match(txt(await draft(h, "Seguimiento SI-123")), /^\(sombra\)/);
   assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { numero_si: "SI-1" } })), /^\(sombra\)/);
   const cn = esperaHarness({ tramite: { tipo: "cambio_nombre", stage: "pendiente" } });
   assert.match(txt(await cn.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/);
+}));
+
+test("espera: the exemption comes from the trámite's tipo, never from the subject (QA 3a)", atUtc(DIA(0), async () => {
+  // A bidireccional whose client is called Altamirano / Nombredios / ... still waits.
+  for (const s of ["Trámite nuevo – bidireccional – DD11 – Juan Altamirano", "Trámite nuevo – bidireccional – DD11 – Nombredios", "Trámite nuevo – Bidireccional 220 – UVIE lista"]) {
+    const r = await draft(esperaHarness(), s);
+    assert.equal(r.isError, true, s);
+    assert.match(txt(r), /desde el 2026-11-20/, s);
+  }
+  // A cambio de nombre goes on day 0 whatever the subject says.
+  assert.match(txt(await draft(esperaHarness({ tramite: { tipo: "cambio_nombre" } }), SUBJ)), /^\(sombra\)/);
+  // No tramite_id, or another project's trámite: refused, never waved through.
+  assert.match(txt(await draft(esperaHarness(), SUBJ, P1, "")), /lleva project_id y tramite_id/);
+  assert.match(txt(await draft(esperaHarness({ tramite: { project_id: "33333333-3333-4333-8333-333333333333" } }), SUBJ)), /no es del proyecto/);
 }));
 
 test("espera: the anticipo day is the Monterrey day (21:00 Mty = 03:00 UTC next day)", async () => {
