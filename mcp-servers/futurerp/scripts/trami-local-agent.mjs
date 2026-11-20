@@ -86,7 +86,7 @@ function userMessage() {
   }
 }
 const first = userMessage()
-  + (MAPA?.instruccion?.[TIER] ? `\n\n${MAPA.instruccion[TIER]}` : "")
+  + (MAPA?.escala?.[TIER] && MAPA.instruccion?.[TIER] ? `\n\n${MAPA.instruccion[TIER]}` : "")
   + (process.env.TRAMI_ESCALADO ? `\n\nUna revisión anterior en un modelo más económico lo escaló sin escribir nada. Motivo: ${process.env.TRAMI_ESCALADO}` : "");
 // The cause of this run, in the same shape trami-dispatch stores on agent_sessions.disparador,
 // so the Sombra feed can say "Porque: …" for local runs too.
