@@ -16,7 +16,7 @@ export function registerDocumentTools(server, deps) {
     server.tool("futurerp_read_document", "Read a project file so you can use its contents: a PDF returns its text (and, for a CFE bill, the parsed fields: titular, número de servicio, cuenta, zona from the account number, tarifa, periodo, total, límite de pago, adeudo signals); an image (INE, predial photo, meter) returns a downscaled picture you can look at. Pass the project_files id from futurerp_list_files, or a Firebase URL.", {
         file_id: z.string().uuid().optional().describe("project_files.id"),
         url: z.string().url().optional().describe("Firebase Storage URL (when there is no project_files row)"),
-        max_chars: z.number().int().min(500).max(60000).optional().describe("Cap for the PDF text (default 12000)"),
+        max_chars: z.number().int().min(500).max(60000).optional().describe("Cap for the PDF text (default 12000; 1500 for a parsed CFE bill)"),
     }, async ({ file_id, url, max_chars }) => {
         try {
             let name = "(archivo)", mime = null, href = url ?? null;
@@ -48,12 +48,14 @@ export function registerDocumentTools(server, deps) {
             if (isPdf) {
                 const parsed = await pdfParse(bytes, { max: 10 });
                 const text = parsed.text.replace(/[ \t]+\n/g, "\n").trim();
-                const cap = max_chars ?? 12000;
                 const head = `## ${name} — PDF, ${parsed.numpages} página(s), ${(bytes.length / 1024).toFixed(0)} KB`;
                 if (text.length < 40) {
                     return { content: [{ type: "text", text: `${head}\n\nEl PDF no tiene capa de texto (escaneado). Descárgalo en tu sandbox y conviértelo a imagen para leerlo, o pide el documento en foto.` }] };
                 }
                 const recibo = esRecibo(text) ? parseRecibo(text) : null;
+                // A parsed CFE bill already carries what the expediente needs: keep only the
+                // first lines of raw text (header, titular) unless the caller asks for more.
+                const cap = max_chars ?? (recibo ? 1500 : 12000);
                 const fields = recibo ? `\n\n### Recibo CFE (campos leídos)\n\`\`\`json\n${JSON.stringify(recibo, null, 2)}\n\`\`\`` : "";
                 return { content: [{ type: "text", text: `${head}${fields}\n\n### Texto\n${text.slice(0, cap)}${text.length > cap ? "\n…(recortado)" : ""}` }] };
             }

@@ -38,6 +38,14 @@ export declare function setShadowCheck(server: McpServer, tool: string, check: S
 export declare function describeCall(name: string, a: Record<string, any>): string;
 export declare function logToolError(deps: GuardDeps, name: string, args: unknown, detalle: string): Promise<void>;
 /**
+ * Deterministic rule (was a skill line the model sometimes missed): never write
+ * to the same client twice within 24 h unless the client answered in between.
+ * Counts real sends (whatsapp_messages outbound) AND shadow rows, so the rule
+ * holds in evals too. Groups (@g.us) are not covered: the gestora's group has its own cadence.
+ * Returns the refusal text, or null when the send may go.
+ */
+export declare function repeatedClientMessage(deps: GuardDeps, a: Record<string, any>, nowMs?: number): Promise<string | null>;
+/**
  * server.tool() with the guard: shadow for SHADOW_TOOLS, error logging for
  * every tool it wraps. Typed as McpServer['tool'] so the handlers keep the
  * argument types inferred from their zod schema.

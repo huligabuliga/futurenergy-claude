@@ -170,6 +170,44 @@ export async function logToolError(deps, name, args, detalle) {
     }
 }
 /**
+ * Deterministic rule (was a skill line the model sometimes missed): never write
+ * to the same client twice within 24 h unless the client answered in between.
+ * Counts real sends (whatsapp_messages outbound) AND shadow rows, so the rule
+ * holds in evals too. Groups (@g.us) are not covered: the gestora's group has its own cadence.
+ * Returns the refusal text, or null when the send may go.
+ */
+export async function repeatedClientMessage(deps, a, nowMs = Date.now()) {
+    try {
+        let chat = typeof a.chat_id === "string" ? a.chat_id : null;
+        if (!chat && a.conversation_id && deps.uuidRx.test(a.conversation_id)) {
+            chat = (await deps.sbApi(`/whatsapp_conversations?id=eq.${a.conversation_id}&select=chat_id&limit=1`, deps.serviceHeaders()))?.[0]?.chat_id ?? null;
+        }
+        if (!chat || /@g\.us$/.test(chat))
+            return null;
+        const last10 = chat.replace(/\D/g, "").slice(-10);
+        if (last10.length !== 10)
+            return null;
+        const since = new Date(nowMs - 24 * 3600_000).toISOString();
+        const convs = (await deps.sbApi(`/whatsapp_conversations?chat_id=like.*${last10}@c.us&select=id`, deps.serviceHeaders())) ?? [];
+        const ids = convs.map((c) => c.id).join(",");
+        const [shadow, real] = await Promise.all([
+            deps.sbApi(`/agent_shadow_calls?tool_name=eq.futurerp_whatsapp_send&revertido_at=is.null&created_at=gte.${since}&tool_input->>chat_id=like.*${last10}*&select=created_at&order=created_at.desc&limit=1`, deps.serviceHeaders()).catch(() => []),
+            ids ? deps.sbApi(`/whatsapp_messages?conversation_id=in.(${ids})&direction=eq.outbound&sent_at=gte.${since}&select=sent_at&order=sent_at.desc&limit=1`, deps.serviceHeaders()).catch(() => []) : Promise.resolve([]),
+        ]);
+        const last = [shadow?.[0]?.created_at, real?.[0]?.sent_at].filter(Boolean).sort().pop();
+        if (!last)
+            return null;
+        const answered = ids ? (await deps.sbApi(`/whatsapp_messages?conversation_id=in.(${ids})&direction=eq.inbound&sent_at=gt.${last}&select=id&limit=1`, deps.serviceHeaders()).catch(() => [])) : [];
+        if (answered?.length)
+            return null;
+        const h = Math.max(1, Math.round((nowMs - Date.parse(last)) / 3600_000));
+        return `Sin cambios: ya le escribiste a este cliente hace ${h} h y no ha contestado. No se repite un aviso en menos de 24 h; si hay algo nuevo y urgente, pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia).`;
+    }
+    catch {
+        return null; // ponytail: a failed lookup never blocks a send; the skill rule still applies.
+    }
+}
+/**
  * server.tool() with the guard: shadow for SHADOW_TOOLS, error logging for
  * every tool it wraps. Typed as McpServer['tool'] so the handlers keep the
  * argument types inferred from their zod schema.
@@ -177,6 +215,11 @@ export async function logToolError(deps, name, args, detalle) {
 export function guardedTool(server, deps) {
     const wrapped = (name, description, schema, handler) => server.tool(name, description, schema, async (args, extra) => {
         try {
+            if (name === "futurerp_whatsapp_send") {
+                const refusal = await repeatedClientMessage(deps, args ?? {});
+                if (refusal)
+                    return { content: [{ type: "text", text: refusal }] };
+            }
             if (SHADOW_TOOLS.has(name) && (await tramiMode(deps, name)) === "shadow") {
                 const why = await shadowChecks.get(server)?.get(name)?.(args ?? {});
                 if (why) {
