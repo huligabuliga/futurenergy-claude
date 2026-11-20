@@ -287,13 +287,14 @@ import { esperaAnticipo, DIAS_ESPERA_ANTICIPO } from "../dist/espera.js";
 const ANTICIPO = "2026-11-13T18:00:00Z"; // 12:00 Monterrey, Friday 13
 const DIA = (n) => new Date(Date.parse(ANTICIPO) + n * 86_400_000 + 3600_000).toISOString(); // n days later, 13:00 Mty
 const SUBJ = "Trámite nuevo – bidireccional – DD11 – Cliente Prueba";
-function esperaHarness({ zona = "DD11", hist = [{ entered_at: ANTICIPO }], fac = null, mode = "shadow", tramite = {} } = {}) {
+function esperaHarness({ zona = "DD11", hist = [{ entered_at: ANTICIPO }], fac = null, mode = "shadow", tramite = {}, espera } = {}) {
   resetModeCache();
   const h = harness({
     "/system_config": [{ config_key: "trami_mode", config_value: mode }],
     "/gestoras": [{ email: "gestora@example.com" }],
     "/projects": [{ id: P1, efu: "EFU-1", zona_cfe: zona, fecha_anticipo_completo: fac, clients: {} }],
     "/project_stage_history": hist,
+    "/trami_reglas_zona": espera === undefined ? [] : [{ espera_dias: espera }],
     "/project_tramites": [{ ...TRAMITE, stage: "expediente_integracion", enviado: false, ...tramite }],
   });
   registerMailTools(h.server, h.deps);
@@ -355,4 +356,14 @@ test("espera: the anticipo day is the Monterrey day (21:00 Mty = 03:00 UTC next 
   const sb = async (path) => path.startsWith("/projects") ? [{ id: P1, efu: "E", zona_cfe: "DD10" }] : [{ entered_at: "2026-11-14T03:00:00Z" }];
   assert.match(await esperaAnticipo(sb, {}, P1, Date.parse("2026-11-19T18:00:00Z")), /pagó el 2026-11-13.*desde el 2026-11-20/);
   assert.equal(await esperaAnticipo(sb, {}, P1, Date.parse("2026-11-20T18:00:00Z")), null);
+});
+
+test("espera: Ajustes can raise the wait (10 waits 10) but not lower it (3 still waits 7)", async () => {
+  for (const [espera, n, ok] of [[10, 7, false], [10, 9, false], [10, 10, true], [3, 3, false], [3, 6, false], [3, 7, true], [7, 7, true]]) {
+    await atUtc(DIA(n), async () => {
+      const r = await draft(esperaHarness({ espera }));
+      if (ok) assert.match(txt(r), /^\(sombra\)/, `espera ${espera} day ${n}`);
+      else assert.match(txt(r), new RegExp(`\\(${Math.max(7, espera)} días después`), `espera ${espera} day ${n}`);
+    })();
+  }
 });

@@ -6,7 +6,8 @@
  *
  * The anticipo date is the first time the project entered the stage "anticipo 1 pagado"
  * (project_stage_history.entered_at, Monterrey day); projects.fecha_anticipo_completo is the
- * fallback. last_stage_change_date is empty in prod, so it is not used.
+ * fallback. last_stage_change_date is empty in prod, so it is not used. The wait is
+ * max(trami_reglas_zona.espera_dias, DIAS_ESPERA_ANTICIPO).
  */
 type SbApi = (path: string, headers?: Record<string, string>) => Promise<any>;
 export declare const DIAS_ESPERA_ANTICIPO = 7;

@@ -6,12 +6,13 @@
  *
  * The anticipo date is the first time the project entered the stage "anticipo 1 pagado"
  * (project_stage_history.entered_at, Monterrey day); projects.fecha_anticipo_completo is the
- * fallback. last_stage_change_date is empty in prod, so it is not used.
+ * fallback. last_stage_change_date is empty in prod, so it is not used. The wait is
+ * max(trami_reglas_zona.espera_dias, DIAS_ESPERA_ANTICIPO).
  */
 type SbApi = (path: string, headers?: Record<string, string>) => Promise<any>;
 
-// ponytail: fixed floor from the rule's "1 a 2 semanas". trami_reglas_zona.espera_dias (Ajustes) can be
-// edited by tramitología; read it here instead if they ever set it above or below 7.
+// ponytail: the floor, not the wait. The wait is trami_reglas_zona.espera_dias (tramitología edits it in
+// Ajustes); they can raise it, never lower it under this. The sweep (trami_barrido_delta) uses the same max.
 export const DIAS_ESPERA_ANTICIPO = 7;
 const ZONAS_CON_ESPERA = ["DD10", "DD11"];
 const ANTICIPO_STAGE = "anticipo 1 pagado";
@@ -26,7 +27,9 @@ export async function esperaAnticipo(sbApi: SbApi, headers: Record<string, strin
   const anticipo: string | null = h?.entered_at ? diaMty(Date.parse(h.entered_at)) : p.fecha_anticipo_completo ?? null;
   const quien = `${p.efu ?? p.id} (${p.zona_cfe})`;
   if (!anticipo) return `${quien}: no hay anticipo pagado registrado (etapa "${ANTICIPO_STAGE}"), así que el expediente todavía no va a la gestora. Deja una nota en el timeline y no mandes nada.`;
-  const desde = new Date(Date.parse(anticipo) + DIAS_ESPERA_ANTICIPO * 86_400_000).toISOString().slice(0, 10);
+  const regla = (await sbApi(`/trami_reglas_zona?zona=eq.${encodeURIComponent(p.zona_cfe)}&select=espera_dias&limit=1`, headers).catch(() => null))?.[0];
+  const dias = Math.max(DIAS_ESPERA_ANTICIPO, Number(regla?.espera_dias) || 0);
+  const desde = new Date(Date.parse(anticipo) + dias * 86_400_000).toISOString().slice(0, 10);
   if (desde <= diaMty(now)) return null;
-  return `${quien}: el anticipo se pagó el ${anticipo}; en DD10/DD11 el expediente se manda a la gestora desde el ${desde} (${DIAS_ESPERA_ANTICIPO} días después, nunca antes). Deja una nota en el timeline con esa fecha y no mandes nada hoy, ni correo ni mensaje al grupo.`;
+  return `${quien}: el anticipo se pagó el ${anticipo}; en DD10/DD11 el expediente se manda a la gestora desde el ${desde} (${dias} días después, nunca antes). Deja una nota en el timeline con esa fecha y no mandes nada hoy, ni correo ni mensaje al grupo.`;
 }
