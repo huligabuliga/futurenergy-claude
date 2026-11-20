@@ -10,7 +10,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { generateKeyPairSync, randomBytes } from "node:crypto";
-import { appendFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,7 +37,18 @@ const openwaMock = createServer(async (req, res) => {
 const googleMock = createServer(async (req, res) => {
   const body = await readBody(req); res.setHeader("content-type", "application/json");
   if (req.url === "/token") return res.end(JSON.stringify({ access_token: "ya29.mock", expires_in: 3600 }));
-  if (req.url.startsWith("/gmail/v1/users/me/messages?")) return res.end(JSON.stringify({ messages: [] }));
+  // Mailbox = <outdir>/gmail-seed.json if an eval scenario wrote one ([{id, from, to, subject, date, text, attachments}]), else empty.
+  // Seeded messages are sent mail: a drafts or unread search finds none, any other search finds all of them.
+  // ponytail: no real Gmail query parsing (from:/subject: match everything); add it if a scenario needs two mailboxes.
+  let seed = []; try { seed = JSON.parse(readFileSync(resolve(OUT, "gmail-seed.json"), "utf8")); } catch {}
+  if (req.url.startsWith("/gmail/v1/users/me/messages?")) {
+    const q = new URL(req.url, "http://mock").searchParams.get("q") ?? "";
+    return res.end(JSON.stringify({ messages: /\b(in|label):drafts?\b|\bis:(draft|unread)\b/i.test(q) ? [] : seed.map((m) => ({ id: m.id })) }));
+  }
+  const one = req.url.match(/^\/gmail\/v1\/users\/me\/messages\/([^?/]+)/), m = one && seed.find((x) => x.id === decodeURIComponent(one[1]));
+  if (m) return res.end(JSON.stringify({ id: m.id, snippet: m.text.slice(0, 160), labelIds: ["SENT"], payload: { mimeType: "multipart/mixed",
+    headers: Object.entries({ From: m.from, To: m.to, Subject: m.subject, Date: m.date }).map(([name, value]) => ({ name, value })),
+    parts: [{ mimeType: "text/plain", body: { data: Buffer.from(m.text).toString("base64url") } }, ...(m.attachments ?? []).map((f, i) => ({ filename: f, mimeType: "application/pdf", body: { attachmentId: `att${i}`, size: 200000 } }))] } }));
   if (req.url.startsWith("/upload/gmail/v1/users/me/drafts")) {
     // raw = base64url RFC822; decode the headers + text part for the log
     let decoded = ""; try { const m = JSON.parse(body); decoded = Buffer.from(m.raw ?? "", "base64url").toString("utf8"); } catch { decoded = body.slice(0, 4000); }
