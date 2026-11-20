@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { guardedTool, setShadowCheck } from "./guard.js";
 import { esperaAnticipo } from "./espera.js";
+import { BASE_DOCS, SHARED_OPTIONAL_DOCS } from "./tramites.js";
 
 export interface MailDeps {
   userId: string;
@@ -34,6 +35,7 @@ const TOKEN_URL = process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com
 const GMAIL_BASE = (process.env.GMAIL_API_BASE ?? "https://gmail.googleapis.com").replace(/\/$/, "");
 const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
 const FIREBASE_HOSTS = ["firebasestorage.googleapis.com", "storage.googleapis.com"];
+const FIREBASE_LINK_RX = /https:\/\/(?:firebasestorage|storage)\.googleapis\.com\/[^\s)>"']+/g;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 export function mailConfigured(): boolean {
@@ -190,7 +192,7 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
   );
 
   /** Allowlist + attachment ownership; also run in shadow (guard.shadowChecks). */
-  async function mailCheck({ to, subject, project_id, tramite_id, attachment_file_ids }: { to: string; subject?: string; project_id?: string; tramite_id?: string; attachment_file_ids?: string[] }): Promise<{ error: string } | { addr: string; project: any }> {
+  async function mailCheck({ to, text: body, project_id, tramite_id, attachment_file_ids }: { to: string; text?: string; project_id?: string; tramite_id?: string; attachment_file_ids?: string[] }): Promise<{ error: string } | { addr: string; project: any }> {
     let addr: string;
     try { addr = assertSafeAddress(to, "To").toLowerCase(); } catch (e: any) { return { error: e.message }; }
     const domain = addr.split("@")[1] ?? "";
@@ -204,24 +206,40 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
     const clientEmails = project ? [project.email_facturacion, project.clients?.email].filter(Boolean).map((e: string) => e.toLowerCase()) : [];
     const allowed = domain === "cfe.mx" || gestoras.some((g) => String(g.email ?? "").toLowerCase() === addr) || clientEmails.includes(addr);
     if (!allowed) return { error: `Destinatario no permitido: ${addr}. Solo gestoras registradas, @cfe.mx o el correo del cliente del proyecto indicado.` };
+    const files: any[] = [];
     for (const fid of attachment_file_ids ?? []) {
-      const f = (await sbApi(`/project_files?id=eq.${fid}&select=id,project_id,firebase_url&limit=1`))?.[0];
+      const f = (await sbApi(`/project_files?id=eq.${fid}&select=id,project_id,firebase_url,document_id&limit=1`))?.[0];
       if (!f) return { error: `Archivo ${fid} no existe o no tienes acceso.` };
       if (project && f.project_id !== project.id) return { error: `El archivo ${fid} no pertenece al proyecto ${project.efu ?? project.id}.` };
       if (!FIREBASE_HOSTS.includes(new URL(f.firebase_url).hostname)) return { error: `El archivo ${fid} no está en Firebase Storage.` };
+      files.push(f);
     }
-    // The expediente email ("Trámite nuevo – <tipo> – <zona> – <cliente>") names its trámite; a primary
-    // (bidireccional) one waits for the DD10/DD11 week. The exemption comes from the trámite's tipo, never
-    // from the subject: a client name can contain "alta" or "nombre".
-    const asunto = String(subject ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-    if (/^\s*tramite nuevo\b/.test(asunto)) {
-      if (!project || !tramite_id || !uuidRx.test(tramite_id)) return { error: "Un expediente (asunto 'Trámite nuevo – …') lleva project_id y tramite_id: sin ellos no se puede revisar si ya toca enviarlo." };
-      const t = (await sbApi(`/project_tramites?id=eq.${tramite_id}&select=id,project_id,tipo&limit=1`))?.[0];
-      if (!t || t.project_id !== project.id) return { error: `El trámite ${tramite_id} no existe o no es del proyecto ${project.efu ?? project.id}.` };
-      if (String(t.tipo ?? "").startsWith("primary")) {
-        const espera = await esperaAnticipo(sbApi, serviceHeaders(), project.id);
-        if (espera) return { error: espera };
+    if (clientEmails.includes(addr)) return { addr, project };
+
+    // To a gestora or CFE every email names its trámite; the DD10/DD11 wait follows that trámite's tipo,
+    // never the subject, and every attached or linked file must belong to that trámite.
+    if (!tramite_id || !uuidRx.test(tramite_id)) return { error: "Todo correo a una gestora o a CFE lleva tramite_id (el trámite del que trata; un correo por trámite). Sin él no se puede revisar si ya toca enviarlo." };
+    const t = (await sbApi(`/project_tramites?id=eq.${tramite_id}&select=id,project_id,tipo,enviado&limit=1`))?.[0];
+    if (!t || (project && t.project_id !== project.id)) return { error: `El trámite ${tramite_id} no existe o no es del proyecto ${project?.efu ?? project_id ?? "indicado"}.` };
+    for (const url of String(body ?? "").match(FIREBASE_LINK_RX) ?? []) {
+      const f = (await sbApi(`/project_files?firebase_url=eq.${encodeURIComponent(url)}&select=id,project_id,firebase_url,document_id&limit=1`))?.[0];
+      if (f) files.push(f);
+    }
+    const propios = new Set([...(BASE_DOCS[t.tipo] ?? []), ...SHARED_OPTIONAL_DOCS]);
+    let otros: any[] | null = null;
+    for (const f of files) {
+      if (f.project_id !== t.project_id) return { error: `El archivo ${f.id} no es del proyecto de este trámite.` };
+      const links: any[] = (await sbApi(`/tramite_file_links?file_id=eq.${f.id}&select=tramite_id,doc_key`)) ?? [];
+      if (links.length && !links.some((l) => l.tramite_id === t.id)) return { error: `El archivo ${f.id} está vinculado a otro trámite (${links[0].doc_key}), no al ${t.tipo} que nombras: un correo por trámite, con sus propios archivos.` };
+      if (!links.length && f.document_id) {
+        const slot = (await sbApi(`/project_documents?id=eq.${f.document_id}&select=name&limit=1`))?.[0]?.name;
+        const lista: any[] = (otros ??= ((await sbApi(`/project_tramites?project_id=eq.${t.project_id}&select=id,tipo`)) ?? []).filter((x: any) => x.id !== t.id));
+        if (slot && !propios.has(slot) && lista.some((x: any) => (BASE_DOCS[x.tipo] ?? []).includes(slot))) return { error: `El archivo ${f.id} es del documento "${slot}", que pide otro trámite y no el ${t.tipo} que nombras: un correo por trámite, con sus propios archivos.` };
       }
+    }
+    if (String(t.tipo ?? "").startsWith("primary") && !t.enviado) {
+      const espera = await esperaAnticipo(sbApi, serviceHeaders(), t.project_id);
+      if (espera) return { error: espera };
     }
     return { addr, project };
   }
@@ -229,18 +247,18 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
 
   tool(
     "futurerp_mail_draft",
-    "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated. An expediente (subject 'Trámite nuevo – …', project_id and tramite_id required) for a bidireccional in a DD10/DD11 project is refused until 7 days after the anticipo; the error gives the date to put in the timeline note.",
+    "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated. Every email to a gestora or @cfe.mx carries tramite_id (one email per trámite); while that trámite is an unsent bidireccional in a DD10/DD11 project it is refused until 7 days after the anticipo (the error gives the date for the timeline note), and every attached or Firebase-linked project file must belong to that trámite (not linked to, or in a document slot of, another trámite).",
     {
       to: z.string().email(),
       subject: z.string().min(3).max(200),
       text: z.string().min(1).max(20000),
       project_id: z.string().optional().describe("Project uuid or EFU; required when writing to the client, and used for the timeline note"),
-      tramite_id: z.string().uuid().optional().describe("The trámite this email is about; required for an expediente (subject 'Trámite nuevo – …')"),
+      tramite_id: z.string().uuid().optional().describe("The trámite this email is about; required for every email to a gestora or @cfe.mx"),
       attachment_file_ids: z.array(z.string().uuid()).max(10).optional().describe("project_files ids to attach"),
     },
     async ({ to, subject, text: bodyText, project_id, tramite_id, attachment_file_ids }) => {
       try {
-        const chk = await mailCheck({ to, subject, project_id, tramite_id, attachment_file_ids });
+        const chk = await mailCheck({ to, text: bodyText, project_id, tramite_id, attachment_file_ids });
         if ("error" in chk) return fail(chk.error);
         const { addr, project } = chk;
 

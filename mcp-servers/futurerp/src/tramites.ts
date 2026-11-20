@@ -14,6 +14,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { guardedTool, setShadowCheck } from "./guard.js";
 import { esperaAnticipo } from "./espera.js";
+import { plantillaDe, listaPlantillas } from "./plantillas.js";
 
 export interface TramiteDeps {
   userId: string;
@@ -68,7 +69,7 @@ const ACTIVITY_TYPES = ["note", "status_change", "call", "email", "meeting", "as
 /** Base (non-conditional) document slots the app seeds on create, per tipo. */
 const BIDIRECCIONAL_DOCS = ["Recibo CFE", "INE del titular"];
 const FACTIBILIDAD_DOCS = ["Recibo CFE", "INE del titular", "Predial o escrituras", "Foto medidor con lecturas", "Foto preparación nuevo servicio"];
-const BASE_DOCS: Record<string, string[]> = {
+export const BASE_DOCS: Record<string, string[]> = {
   primary_bidireccional_dd11: BIDIRECCIONAL_DOCS,
   primary_dd10: BIDIRECCIONAL_DOCS,
   primary_dd12: BIDIRECCIONAL_DOCS,
@@ -83,7 +84,7 @@ const BASE_DOCS: Record<string, string[]> = {
   baja_servicio: ["Recibo CFE", "INE del titular"],
   uvie_uiie: ["Recibo CFE", "INE del titular"],
 };
-const SHARED_OPTIONAL_DOCS = ["Imagenes Instalacion", "Comprobante de ingreso"];
+export const SHARED_OPTIONAL_DOCS = ["Imagenes Instalacion", "Comprobante de ingreso"];
 
 /** Columns the agent may patch. Everything else on the row is owned by triggers or people. */
 const UPDATABLE = [
@@ -191,15 +192,93 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     const marca = (patch.enviado === true && !cur.enviado) || (envio >= 0 && patch.stage !== undefined && stages.indexOf(patch.stage) >= envio && stages.indexOf(cur.stage) < envio);
     return marca ? esperaAnticipo(sbApi, serviceHeaders(), cur.project_id) : null;
   }
+  // ── Provenance: a file "came" in a WhatsApp message when its firebase_url is that inbound message's media_url ──
+  async function chatEsDeGestora(conversationId: string): Promise<boolean> {
+    const c = (await sbApi(`/whatsapp_conversations?id=eq.${conversationId}&select=chat_id&limit=1`, serviceHeaders()))?.[0];
+    return !!c && (await gestorasDe(String(c.chat_id ?? ""))).some((g) => g.activo);
+  }
+  /** An inbound message by wa_message_id: its media and whether an active gestora sent it. */
+  async function mensaje(waId: string): Promise<{ media_url: string | null; deGestora: boolean } | null> {
+    const m = (await sbApi(`/whatsapp_messages?wa_message_id=eq.${encodeURIComponent(waId)}&direction=eq.inbound&select=conversation_id,media_url&limit=1`, serviceHeaders()))?.[0];
+    return m ? { media_url: m.media_url ?? null, deGestora: await chatEsDeGestora(m.conversation_id) } : null;
+  }
+  /** A project file plus where it came from (any inbound WhatsApp message / an active gestora's). */
+  async function archivo(fileId: string): Promise<any | null> {
+    if (!uuidRx.test(fileId)) return null;
+    const f = (await sbApi(`/project_files?id=eq.${fileId}&select=id,project_id,firebase_url,uploaded_by&limit=1`, serviceHeaders()))?.[0];
+    if (!f) return null;
+    const msgs: any[] = f.firebase_url ? ((await sbApi(`/whatsapp_messages?media_url=eq.${encodeURIComponent(f.firebase_url)}&direction=eq.inbound&select=conversation_id&limit=20`, serviceHeaders())) ?? []) : [];
+    let deGestora = false;
+    for (const m of msgs) if (await chatEsDeGestora(m.conversation_id)) { deGestora = true; break; }
+    return { ...f, porWhatsapp: msgs.length > 0, deGestora, dePersona: !!f.uploaded_by && f.uploaded_by !== userId };
+  }
+
+  /**
+   * A stage only moves on evidence: a NEW numero_si in the same patch; an inbound message or a file
+   * from an active gestora; a file this trámite already holds in that stage's slot (the comprobante);
+   * for the client-side stages (meter, documents received), a photo/document the client or installer
+   * sent. Our own steps (sending the expediente, asking for documents) need none.
+   */
+  const ETAPAS_PROPIAS = new Set(["documentacion_con_gestor", "enviado_a_gestor", "solicitar_documentos"]);
+  const ETAPAS_DEL_CLIENTE = new Set(["medidor_instalado", "sistema_activado", "documentos_recibidos"]);
+  const SLOTS_INGRESO = ["Anexo 2", "Comprobante de ingreso"];
+  const SLOTS_DE_ETAPA: Record<string, string[]> = { folio_ingresado: SLOTS_INGRESO, en_seguimiento_cfe: SLOTS_INGRESO, ingresado_cfe: SLOTS_INGRESO, ingresado: SLOTS_INGRESO };
+  async function evidenciaCheck(cur: any, patch: { stage?: string; numero_si?: string }, ev?: { wa_message_id?: string; file_id?: string }): Promise<string | null> {
+    const etapa = patch.stage;
+    if (etapa === undefined || etapa === cur.stage || ETAPAS_PROPIAS.has(etapa)) return null;
+    if (patch.numero_si && patch.numero_si !== cur.numero_si) return null;
+    if (ev?.wa_message_id && (await mensaje(ev.wa_message_id))?.deGestora) return null;
+    if (ev?.file_id) {
+      const f = await archivo(ev.file_id);
+      if (f && f.project_id === cur.project_id) {
+        if (f.deGestora) return null;
+        // ponytail: an installer's upload counts by uploaded_by alone; tie it to a meter slot if that proves too loose.
+        if (ETAPAS_DEL_CLIENTE.has(etapa) && (f.porWhatsapp || f.dePersona)) return null;
+        const slots = SLOTS_DE_ETAPA[etapa];
+        if (slots) {
+          const links: any[] = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
+          if (links.some((l) => slots.includes(l.doc_key))) return null;
+        }
+      }
+    }
+    const cual = ETAPAS_DEL_CLIENTE.has(etapa)
+      ? "evidencia.file_id de la foto o documento que mandó el cliente o el instalador"
+      : `el numero_si nuevo en el mismo patch, evidencia.wa_message_id de un mensaje que ELLA mandó en su chat, o evidencia.file_id de un archivo que ella mandó${SLOTS_DE_ETAPA[etapa] ? ` o que el trámite ya tiene en ${SLOTS_DE_ETAPA[etapa].join(" / ")}` : ""}`;
+    return `Cambiar la etapa a ${etapa} necesita evidencia: ${cual}. Sin eso no se mueve la etapa: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true), citando por qué crees que ya cambió.`;
+  }
+
+  /**
+   * A file is linked to a trámite only when it arrived in the triggering message (evidencia.wa_message_id
+   * whose media is that file), or when a person uploaded it to the project and it goes into one of
+   * this trámite's own document slots (the expediente list tramitología asks for).
+   */
+  async function vinculoCheck(t: any, a: { file_id?: string; url?: string; doc_key?: string; evidencia?: { wa_message_id?: string } }): Promise<string | null> {
+    let f: any = null;
+    if (a.file_id) {
+      f = await archivo(a.file_id);
+      if (!f || f.project_id !== t.project_id) return `El archivo ${a.file_id} no existe o no es del proyecto de este trámite.`;
+    }
+    const u = f?.firebase_url ?? a.url;
+    if (a.evidencia?.wa_message_id && u) {
+      const m = await mensaje(a.evidencia.wa_message_id);
+      if (m?.media_url && m.media_url === u) return null;
+    }
+    if (f?.dePersona && (BASE_DOCS[t.tipo] ?? []).includes(String(a.doc_key ?? ""))) return null;
+    return `Solo vinculas un archivo que llegó en el mensaje que estás atendiendo (evidencia.wa_message_id de ese mensaje, cuyo adjunto es este archivo) o uno que una persona subió al proyecto para un documento del expediente de este trámite (${(BASE_DOCS[t.tipo] ?? []).join(", ") || "sin lista"}). Si no, no lo vincules: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true).`;
+  }
+  setShadowCheck(server, "futurerp_tramite_link_file", async (a) => {
+    const t = a.tramite_id && uuidRx.test(a.tramite_id) ? (await sbApi(`/project_tramites?id=eq.${a.tramite_id}&select=id,project_id,tipo&limit=1`))?.[0] : null;
+    return t ? vinculoCheck(t, a) : null;
+  });
   setShadowCheck(server, "futurerp_tramite_update", async (a) => {
     const cur = a.tramite_id && uuidRx.test(a.tramite_id) ? (await sbApi(`/project_tramites?id=eq.${a.tramite_id}&select=*&limit=1`))?.[0] : null;
-    return cur ? envioCheck(cur, a.patch ?? {}, a.reingreso) : null;
+    return cur ? (await envioCheck(cur, a.patch ?? {}, a.reingreso)) ?? evidenciaCheck(cur, a.patch ?? {}, a.evidencia) : null;
   });
 
   // ── futurerp_tramite_update ───────────────────────────────────────────────
   tool(
     "futurerp_tramite_update",
-    "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list (except a re-ingreso: reingreso=true + motivo lets the stage go back, never to the first stage, and keeps the previous numero_si / fecha_ingreso in type_data.ingresos_anteriores), unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by; on a DD10/DD11 primary it (and any stage from documentacion_con_gestor on) is refused until 7 days after the anticipo. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.",
+    "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list (except a re-ingreso: reingreso=true + motivo lets the stage go back, never to the first stage, and keeps the previous numero_si / fecha_ingreso in type_data.ingresos_anteriores), unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by; on a DD10/DD11 primary it (and any stage from documentacion_con_gestor on) is refused until 7 days after the anticipo. Any other stage change needs evidence: a new numero_si in the patch, or the gestora's message / file (evidencia.wa_message_id / evidencia.file_id), or the comprobante already in this trámite's Anexo 2 slot; meter installed / documents received take the client's or installer's photo as evidencia.file_id. Without it, ask tramitología instead. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.",
     {
       tramite_id: z.string().uuid(),
       patch: z.object({
@@ -228,8 +307,12 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
       }).describe("Only the fields to change"),
       motivo: z.string().optional().describe("Why (goes into the timeline entries)"),
       reingreso: z.boolean().optional().describe("true = CFE cancelled or returned the ingreso and it is filed again: allows a backward stage move (needs motivo) and archives the previous SI and date"),
+      evidencia: z.object({
+        wa_message_id: z.string().optional().describe("wa_message_id of the gestora's inbound message that reports the change"),
+        file_id: z.string().uuid().optional().describe("project_files.id of the file that proves it (e.g. the comprobante de ingreso)"),
+      }).optional().describe("Required for any stage change except documentacion_con_gestor, unless the patch sets a new numero_si"),
     },
-    async ({ tramite_id, patch, motivo, reingreso }) => {
+    async ({ tramite_id, patch, motivo, reingreso, evidencia }) => {
       try {
         const rows: any[] = await sbApi(`/project_tramites?id=eq.${tramite_id}&select=*&limit=1`);
         const cur = rows[0];
@@ -252,6 +335,8 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
           const hist = Array.isArray(cur.type_data?.ingresos_anteriores) ? cur.type_data.ingresos_anteriores : [];
           patch.type_data = { ...(patch.type_data ?? {}), ingresos_anteriores: [...hist, prev] };
         }
+        const sinEvidencia = await evidenciaCheck(cur, patch, evidencia);
+        if (sinEvidencia) return fail(sinEvidencia);
 
         const update: Record<string, unknown> = {};
         const changes: { field: string; from: unknown; to: unknown }[] = [];
@@ -446,18 +531,23 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_tramite_link_file ────────────────────────────────────────────
   tool(
     "futurerp_tramite_link_file",
-    "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Use doc_key 'Anexo 2' for the gestora's ingreso PDF (the Anexo 2 is the comprobante de ingreso).",
+    "Attach a file to a trámite under a document slot (doc_key), like the trámite card's 'Vincular'. Either an existing project_files id, or a Firebase Storage URL + name to register first. Idempotent on (tramite, file). Only a file that arrived in the message you are handling (evidencia.wa_message_id; its attachment must be this file), or one a person uploaded to the project going into one of this trámite's own document slots; otherwise ask tramitología. Use doc_key 'Anexo 2' for the gestora's ingreso PDF (the Anexo 2 is the comprobante de ingreso).",
     {
       tramite_id: z.string().uuid(),
       file_id: z.string().uuid().optional().describe("Existing project_files.id"),
       url: z.string().url().optional().describe("Firebase Storage URL of a file not yet registered"),
       name: z.string().optional().describe("File name when registering by url"),
       doc_key: z.string().describe("Document slot, e.g. 'Anexo 2' (comprobante de ingreso), 'Recibo CFE', 'Imagenes Instalacion'"),
+      evidencia: z.object({
+        wa_message_id: z.string().optional().describe("wa_message_id of the inbound message whose attachment is this file"),
+      }).optional().describe("Required unless a person uploaded the file to the project and doc_key is one of this trámite's own document slots"),
     },
-    async ({ tramite_id, file_id, url, name, doc_key }) => {
+    async ({ tramite_id, file_id, url, name, doc_key, evidencia }) => {
       try {
         const [t] = await sbApi(`/project_tramites?id=eq.${tramite_id}&select=id,project_id,tipo&limit=1`);
         if (!t) return fail(`No existe el trámite ${tramite_id} (o no tienes acceso).`);
+        const sinOrigen = await vinculoCheck(t, { file_id, url, doc_key, evidencia });
+        if (sinOrigen) return fail(sinOrigen);
         let fileId = file_id;
         if (!fileId) {
           if (!url || !name) return fail("Indica file_id, o url + name.");
@@ -523,15 +613,20 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
    * Gestoras are data (public.gestoras): a gestora who is no longer active is
    * never written to, and the only groups Trami writes to are active gestoras'.
    */
-  async function gestoraTargetCheck(chat: string): Promise<string | null> {
+  /** The active gestoras a chat belongs to (group id in whatsapp_chat_ids, or her phone for a 1:1). */
+  async function gestorasDe(chat: string): Promise<any[]> {
     const gs: any[] = (await sbApi(`/gestoras?select=nombre,activo,telefono,whatsapp_chat_ids`, serviceHeaders()).catch(() => null)) ?? [];
     const d10 = (x: string | null | undefined) => String(x ?? "").replace(/\D/g, "").slice(-10);
-    const de = gs.filter((g) => (g.whatsapp_chat_ids ?? []).includes(chat) || (chat.endsWith("@c.us") && g.telefono && d10(g.telefono) === d10(chat)));
-    if (de.length && !de.some((g) => g.activo)) return `Ese chat es de ${de[0].nombre}, que ya no es gestora activa: no se le escribe. Pregunta a tramitología quién lleva ahora ese trámite.`;
-    if (chat.endsWith("@g.us") && !de.some((g) => g.activo)) return "Solo escribes a grupos de una gestora activa (public.gestoras.whatsapp_chat_ids).";
-    return null;
+    return gs.filter((g) => (g.whatsapp_chat_ids ?? []).includes(chat) || (chat.endsWith("@c.us") && g.telefono && d10(g.telefono) === d10(chat)));
   }
-  async function waCheck({ conversation_id, chat_id, media_url }: { conversation_id?: string; chat_id?: string; media_url?: string }): Promise<{ error: string } | { ch: any; sentLastHour: number }> {
+  async function gestoraTargetCheck(chat: string): Promise<{ error: string | null; gestora: boolean }> {
+    const de = await gestorasDe(chat);
+    const gestora = de.some((g) => g.activo);
+    if (de.length && !gestora) return { gestora, error: `Ese chat es de ${de[0].nombre}, que ya no es gestora activa: no se le escribe. Pregunta a tramitología quién lleva ahora ese trámite.` };
+    if (chat.endsWith("@g.us") && !gestora) return { gestora, error: "Solo escribes a grupos de una gestora activa (public.gestoras.whatsapp_chat_ids)." };
+    return { gestora, error: null };
+  }
+  async function waCheck({ conversation_id, chat_id, media_url, text: body }: { conversation_id?: string; chat_id?: string; media_url?: string; text?: string }): Promise<{ error: string } | { ch: any; sentLastHour: number }> {
     const hora = fueraDeHorario(Date.now());
     if (hora) return { error: hora };
     if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname)) return { error: "Solo se adjuntan archivos del Storage de Firebase." };
@@ -549,8 +644,12 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     } else {
       return { error: "Indica conversation_id o chat_id." };
     }
-    const gestoraErr = await gestoraTargetCheck(target);
-    if (gestoraErr) return { error: gestoraErr };
+    const dest = await gestoraTargetCheck(target);
+    if (dest.error) return { error: dest.error };
+    // A client only ever gets one of the allowed templates (plantillas_cliente.json); gestoras are not restricted.
+    if (!dest.gestora && !plantillaDe(body ?? "")) {
+      return { error: "Ese mensaje no es una de las plantillas para clientes, así que no se manda. A un cliente sólo van las plantillas de la descripción de futurerp_whatsapp_send, con cada hueco lleno y sin agregar nada. Si el caso pide decirle otra cosa, no le escribas: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true) y deja el texto propuesto en la nota." };
+    }
     // Rate limit: outbound rows on this channel in the last hour.
     const since = new Date(Date.now() - 3600_000).toISOString();
     const convIds: string[] = ((await sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&select=id`, serviceHeaders())) ?? []).map((c: any) => c.id);
@@ -567,7 +666,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_whatsapp_send ────────────────────────────────────────────────
   tool(
     "futurerp_whatsapp_send",
-    "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media, never to an inactive gestora, groups only if they belong to an active gestora. The message is recorded in the inbox like any outbound.",
+    `Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media, never to an inactive gestora, groups only if they belong to an active gestora. To a CLIENT (any chat that is not an active gestora's) the text must be exactly one of these templates with its huecos filled, nothing added; anything else is refused: ${listaPlantillas()} Messages to gestoras are free text. The message is recorded in the inbox like any outbound.`,
     {
       conversation_id: z.string().uuid().optional(),
       chat_id: z.string().optional().describe("Phone digits (E.164 without +) or a WhatsApp chat id (…@c.us / …@g.us)"),
@@ -578,7 +677,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     async ({ conversation_id, chat_id, text: body, media_url, media_name }) => {
       try {
         if (!OPENWA_API_URL || !OPENWA_API_KEY) return fail("El gateway de WhatsApp no está configurado en el MCP (OPENWA_API_URL / OPENWA_API_KEY).");
-        const chk = await waCheck({ conversation_id, chat_id, media_url });
+        const chk = await waCheck({ conversation_id, chat_id, media_url, text: body });
         if ("error" in chk) return fail(chk.error);
         const { ch, sentLastHour } = chk;
 

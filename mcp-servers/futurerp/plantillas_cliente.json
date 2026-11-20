@@ -1,0 +1,27 @@
+{
+  "_nota": "Únicos mensajes que Trami puede mandarle a un cliente por WhatsApp. Los lee el guard de futurerp_whatsapp_send (src/plantillas.ts) y los muestra en la descripción de esa herramienta; la skill avisar-cliente dice cuándo va cada uno. Los {huecos} sólo aceptan su formato (ver huecos). Cambiar un texto aquí cambia lo que el guard acepta.",
+  "presentacion": "Soy la asistente de tramitología de Future Energy, te estaré enviando actualizaciones de tus trámites con CFE.",
+  "huecos": {
+    "nombre": "nombre de pila del cliente, hasta 4 palabras (sólo letras)",
+    "si": "número SI, p. ej. SI2608060791002",
+    "fecha": "día y mes en palabras, p. ej. 6 de agosto"
+  },
+  "plantillas": [
+    { "id": "ingreso", "cuando": "Plantilla 2: la gestora mandó el número SI. Primera vez que el cliente sabe de su trámite.",
+      "texto": "Hola {nombre}, buen día. Te informamos que tu trámite ya fue ingresado y está en proceso interno con CFE. *N° de Seguimiento*: {si}. *Fecha de ingreso*: {fecha}. Normalmente CFE tarda de 2 a 4 meses; te vamos avisando." },
+    { "id": "adeudo", "cuando": "Plantilla 3: CFE no ingresa el trámite por adeudo. Sin montos, sin pedir comprobante.",
+      "texto": "Hola {nombre}, buen día. Para continuar con tu trámite ante CFE el servicio debe estar al corriente: apóyanos realizando el pago lo antes posible directo en un cajero de CFE para que el pago se refleje de inmediato y poder continuar con el trámite. Nos avisas por aquí cuando esté hecho." },
+    { "id": "orden_medidor", "cuando": "Plantilla 4: CFE emitió la orden del medidor.",
+      "texto": "Hola {nombre}, buen día. CFE ya emitió la orden para instalar tu medidor; la instalación viene en camino. Te vamos avisando." },
+    { "id": "confirmar_medidor", "cuando": "Plantilla 5: pedir que confirme si ya le cambiaron el medidor.",
+      "texto": "Hola {nombre}, buen día. ¿Nos confirmas si CFE ya te cambió el medidor? Con eso seguimos con tu trámite." },
+    { "id": "estatus", "cuando": "Respuesta: el cliente pregunta cómo va y el trámite ya tiene SI.",
+      "texto": "Hola {nombre}, buen día. Tu trámite sigue en proceso con CFE. *N° de Seguimiento*: {si}. Normalmente CFE tarda de 2 a 4 meses; te vamos avisando." },
+    { "id": "estatus_sin_si", "cuando": "Respuesta: el cliente pregunta cómo va y aún no hay SI.",
+      "texto": "Hola {nombre}, buen día. Tu expediente está en revisión; en cuanto quede ingresado con CFE te mandamos el número de seguimiento." },
+    { "id": "recibido", "cuando": "Respuesta: el cliente mandó el documento que se le pidió.",
+      "texto": "Gracias {nombre}, lo recibimos." },
+    { "id": "pago_reportado", "cuando": "Respuesta: el cliente dice que ya pagó el adeudo de CFE.",
+      "texto": "Gracias {nombre}, ya le avisamos a la gestora para que retome tu trámite." }
+  ]
+}
