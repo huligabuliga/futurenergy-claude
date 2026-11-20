@@ -250,13 +250,14 @@ export function registerTramiteTools(server, deps) {
     const ETAPAS_DEL_CLIENTE = new Set(["medidor_instalado", "sistema_activado", "documentos_recibidos"]);
     const SLOTS_INGRESO = ["Anexo 2", "Comprobante de ingreso"];
     const SLOTS_DE_ETAPA = { folio_ingresado: SLOTS_INGRESO, en_seguimiento_cfe: SLOTS_INGRESO, ingresado_cfe: SLOTS_INGRESO, ingresado: SLOTS_INGRESO };
-    const CAMPOS_CON_EVIDENCIA = ["fecha_ingreso", "subsanacion_active", "motivo_subsanacion", "fecha_subsanacion"];
+    const CAMPOS_CON_EVIDENCIA = ["fecha_ingreso", "fecha_resolucion", "subsanacion_active", "motivo_subsanacion", "fecha_subsanacion"];
     async function evidenciaCheck(cur, patch, ev) {
         const etapa = patch.stage;
         const mueve = etapa !== undefined && etapa !== cur.stage && !ETAPAS_PROPIAS.has(etapa);
         const siNuevo = patch.numero_si && patch.numero_si !== cur.numero_si ? patch.numero_si : null;
         // These dates drive the SLA clocks: same evidence rule as a stage move.
         const campos = CAMPOS_CON_EVIDENCIA.filter((k) => k in patch && String(patch[k] ?? "") !== String(cur[k] ?? ""));
+        // An ingreso comprobante proves only the ingreso date, never a resolution or a subsanación.
         const subs = campos.some((k) => k !== "fecha_ingreso");
         if (!mueve && !siNuevo && !campos.length)
             return null;

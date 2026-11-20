@@ -660,4 +660,8 @@ test("fecha_ingreso and the subsanación fields need the same evidence as a stag
   assert.match(txt(await up({ fecha_ingreso: "2026-11-10" }, { file_id: F.anexo })), /^\(sombra\)/, "the comprobante dates the ingreso");
   assert.match(txt(await up({ subsanacion_active: true, motivo_subsanacion: "adeudo" }, { file_id: F.anexo })), /necesita evidencia/, "an ingreso comprobante proves no subsanación");
   assert.match(txt(await up({ subsanacion_active: true, motivo_subsanacion: "adeudo" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
+  // QA round 4: fecha_resolucion too.
+  assert.match(txt(await up({ fecha_resolucion: "2026-11-20" })), /^Cambiar fecha_resolucion necesita evidencia/);
+  assert.match(txt(await up({ fecha_resolucion: "2026-11-20" }, { file_id: F.anexo })), /necesita evidencia/, "an ingreso comprobante proves no resolution");
+  assert.match(txt(await up({ fecha_resolucion: "2026-11-20" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
 });
