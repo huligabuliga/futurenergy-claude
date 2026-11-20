@@ -29,7 +29,8 @@ const PROVIDER = args.provider || (process.env.ANTHROPIC_API_KEY ? "anthropic" :
 // Default model and effort: the ones agents/trami.md pins for Managed Agents, so a local run costs what production would.
 const agentFront = readFileSync(join(TRAMI_DIR, "agents/trami.md"), "utf8").split(/\n---\n/)[0];
 const MODEL = args.model || process.env.TRAMI_MODEL || (PROVIDER === "openai" ? "gpt-5" : agentFront.match(/^\s+id:\s*(\S+)/m)?.[1] ?? "claude-opus-5-5");
-const EFFORT = args.effort || process.env.TRAMI_EFFORT || agentFront.match(/^\s+effort:\s*(\S+)/m)?.[1] || "high";
+// Haiku: no effort, as trami_sesion.ts overrides it in production (model: { id } only).
+const EFFORT = /haiku/.test(MODEL) ? null : args.effort || process.env.TRAMI_EFFORT || agentFront.match(/^\s+effort:\s*(\S+)/m)?.[1] || "high";
 // $/MTok: input, output, cache read, cache write (5 min). Unknown model → Opus prices (overestimates).
 const PRICES = { "claude-opus-5-5": [4, 20, 0.2, 5], "claude-sonnet-5-5": [2, 10, 0.1, 2.5], "claude-haiku-5-5": [0.1, 0.5, 0.01, 0.125] };
 const usd = (u) => { const [i, o, r, w] = PRICES[MODEL] ?? PRICES["claude-opus-5-5"]; return (u.input * i + u.output * o + (u.cacheRead ?? 0) * r + (u.cacheWrite ?? 0) * w) / 1e6; };
@@ -149,7 +150,7 @@ if (PROVIDER === "anthropic") {
     const cachedTools = tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t));
     // Sliding breakpoint on the latest message: the whole conversation so far is served from cache next turn.
     const msgs = messages.map((m, i) => i === messages.length - 1 && Array.isArray(m.content) ? { ...m, content: m.content.map((b, j) => (j === m.content.length - 1 ? { ...b, cache_control: { type: "ephemeral" } } : b)) } : m);
-    const res = await client.messages.create({ model: MODEL, max_tokens: 16000, output_config: { effort: EFFORT }, system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }], tools: cachedTools, messages: msgs });
+    const res = await client.messages.create({ model: MODEL, max_tokens: 16000, ...(EFFORT ? { output_config: { effort: EFFORT } } : {}), system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }], tools: cachedTools, messages: msgs });
     usage.input += res.usage?.input_tokens ?? 0; usage.output += res.usage?.output_tokens ?? 0; usage.cacheRead = (usage.cacheRead ?? 0) + (res.usage?.cache_read_input_tokens ?? 0); usage.cacheWrite = (usage.cacheWrite ?? 0) + (res.usage?.cache_creation_input_tokens ?? 0);
     messages.push({ role: "assistant", content: res.content });
     const uses = res.content.filter((b) => b.type === "tool_use");
