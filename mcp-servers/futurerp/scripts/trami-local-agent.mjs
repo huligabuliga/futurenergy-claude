@@ -9,6 +9,7 @@
 //   node scripts/trami-local-agent.mjs --scenario rutina --name barrido-manana   # any trami/deployments/*.md
 //   node scripts/trami-local-agent.mjs --message "texto libre"           # any instruction
 //   node scripts/trami-local-agent.mjs --dry …                            # no model call: prints prompt size + tools
+//   TRAMI_TIER=haiku TRAMI_MODEL=claude-haiku-5-5 node scripts/trami-local-agent.mjs …   # a tier as dispatch opens it (Haiku: no write tools); TRAMI_ESCALADO=<motivo> = the escalated rerun
 //   OPENAI_API_KEY=… node scripts/trami-local-agent.mjs --provider openai --model gpt-5 …   # plumbing test with another model
 //
 // Needs scripts/trami-sandbox.mjs running (TRAMI_MODE=shadow by default) and
@@ -58,7 +59,11 @@ await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clien
 const mcpTools = (await mcp("tools/list")).result.tools;
 // Same tool set as Managed Agents: only the futurerp tools agents/trami.md enables.
 const enabled = new Set([...agentMd.matchAll(/\{ name: (futurerp_\w+),\s+enabled: true/g)].map((m) => m[1]));
-const tools = mcpTools.filter((t) => enabled.size === 0 || enabled.has(t.name)).map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema }));
+// Model tiers (pronto supabase/functions/_shared/trami_modelos.json, the one map): Haiku runs read-only.
+const TIER = process.env.TRAMI_TIER || "";
+const MAPA = TIER ? JSON.parse(readFileSync(join(TRAMI_DIR, "../supabase/functions/_shared/trami_modelos.json"), "utf8")) : null;
+const readOnly = TIER === "haiku" ? new Set(MAPA.escritura) : new Set();
+const tools = mcpTools.filter((t) => (enabled.size === 0 || enabled.has(t.name)) && !readOnly.has(t.name)).map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema }));
 const missing = [...enabled].filter((n) => !mcpTools.some((t) => t.name === n));
 if (missing.length) console.warn(`agent.md enables tools the sandbox does not serve: ${missing.join(", ")}`);
 
@@ -80,7 +85,9 @@ function userMessage() {
     default: return args.message ?? "Preséntate y di qué harías hoy.";
   }
 }
-const first = userMessage();
+const first = userMessage()
+  + (MAPA?.instruccion?.[TIER] ? `\n\n${MAPA.instruccion[TIER]}` : "")
+  + (process.env.TRAMI_ESCALADO ? `\n\nUna revisión anterior en un modelo más económico lo escaló sin escribir nada. Motivo: ${process.env.TRAMI_ESCALADO}` : "");
 // The cause of this run, in the same shape trami-dispatch stores on agent_sessions.disparador,
 // so the Sombra feed can say "Porque: …" for local runs too.
 function disparador() {
