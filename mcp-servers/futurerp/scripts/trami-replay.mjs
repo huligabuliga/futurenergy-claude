@@ -2,7 +2,7 @@
 // each with the real model, scored against what Flor actually did in the ERP
 // around the same date (crm_activities field_update on project_tramites).
 //
-//   ANTHROPIC_API_KEY=… node scripts/trami-replay.mjs --days 90 --limit 20 [--model claude-opus-5-5] [--dry]
+//   ANTHROPIC_API_KEY=… node scripts/trami-replay.mjs --days 90 --limit 20 [--model claude-opus-5-5] [--at 2026-09-21T23:16,…] [--dry]
 //
 // Needs trami-sandbox.mjs running in SHADOW mode. Output: a table per message
 // (project Trami chose vs project Flor touched, fields proposed vs fields Flor
@@ -43,7 +43,9 @@ for (const m of [...msgs].sort((a, b) => a.sent_at.localeCompare(b.sent_at))) {
   if (!groupsMap.has(k)) groupsMap.set(k, []);
   groupsMap.get(k).push(m);
 }
-const groups = [...groupsMap.values()];
+// --at 2026-09-21T23:16,… keeps only the sessions whose last message was sent at that minute (UTC), to rerun a few cases.
+const AT = args.at ? args.at.split(",").map((x) => x.trim()) : null;
+const groups = [...groupsMap.values()].filter((g) => !AT || AT.some((p) => new Date(g[g.length - 1].sent_at).toISOString().startsWith(p)));
 console.log(`${groups.length} sesión(es) (chat + día)`);
 
 // 2. What Flor did: trámite field updates per project, with dates.
