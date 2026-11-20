@@ -14,6 +14,7 @@ import { z } from "zod";
 import { guardedTool, setShadowCheck } from "./guard.js";
 import { esperaAnticipo } from "./espera.js";
 import { leerPlantilla, listaPlantillas } from "./plantillas.js";
+import { textoPdf } from "./documents.js";
 const OPENWA_API_URL = (process.env.OPENWA_API_URL ?? "").replace(/\/$/, "");
 const OPENWA_API_KEY = process.env.OPENWA_API_KEY ?? "";
 const WA_SENDS_PER_HOUR = 20;
@@ -87,6 +88,7 @@ const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerTramiteTools(server, deps) {
     const { userId, restBase, uuidRx, authHeaders, serviceHeaders, sbApi, sbRpc } = deps;
+    const leerPdf = deps.textoPdf ?? textoPdf;
     const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
     async function sbWrite(method, path, body, prefer = "return=representation") {
         const res = await fetch(`${restBase}${path}`, { method, headers: authHeaders({ Prefer: prefer }), body: JSON.stringify(body) });
@@ -217,17 +219,24 @@ export function registerTramiteTools(server, deps) {
         };
     }
     const sinEspacios = (s) => String(s ?? "").replace(/\s+/g, "").toUpperCase();
-    const traeSi = (texto, si) => !!si && sinEspacios(texto).includes(sinEspacios(si));
+    /** The SI appears as a whole token (a truncated or longer SI is another SI). */
+    const traeSi = (texto, si) => !!si && String(texto ?? "").toUpperCase().split(/[^A-Z0-9-]+/).includes(sinEspacios(si));
+    // Words that say nothing about who the client is ("Comercializadora del Norte SA de CV").
+    const VACIAS = new Set(["del", "las", "los", "por", "para", "con", "san", "santa", "grupo", "comercializadora", "servicios", "norte", "sur", "mexico", "sapi", "constructora", "inmobiliaria"]);
     /**
-     * A text names this trámite when it carries one of its SIs, or two words of the client's name
-     * (the whole name if it has one word); gestoras write the name as on the recibo, one word may differ.
+     * A text names this client by two words of the client's name or razón social (the whole name if it
+     * has one word; gestoras write the name as on the recibo, one word may differ), or by the trámite's
+     * CURRENT SI. A new SI never names the trámite by itself: it could be another client's.
      */
-    function nombraTramite(texto, nombres, sis) {
-        if (sis.some((si) => traeSi(texto, si)))
+    function nombraTramite(texto, nombres, siActual) {
+        if (traeSi(texto, siActual))
             return true;
+        return nombraCliente(texto, nombres);
+    }
+    function nombraCliente(texto, nombres) {
         const palabras = new Set(plano(texto).split(/[^a-zñ]+/));
         return nombres.some((n) => {
-            const w = plano(n).split(/[^a-zñ]+/).filter((x) => x.length >= 3);
+            const w = plano(n).split(/[^a-zñ]+/).filter((x) => x.length >= 3 && !VACIAS.has(x));
             return w.length > 0 && w.filter((x) => palabras.has(x)).length >= Math.min(2, w.length);
         });
     }
@@ -248,9 +257,10 @@ export function registerTramiteTools(server, deps) {
         if (!mueve && !siNuevo)
             return null;
         const cli = await clienteDe(cur.project_id);
-        const nombra = (t) => nombraTramite(t, cli.nombres, [cur.numero_si, siNuevo]);
+        // A message storing a NEW SI must name the client: the SI alone could belong to anyone.
+        const nombra = (t) => siNuevo ? nombraCliente(t, cli.nombres) : nombraTramite(t, cli.nombres, cur.numero_si);
         // valida: the evidence is from the right person AND about this trámite. conSi: the new SI is written in it.
-        let valida = false, conSi = false;
+        let valida = false, conSi = false, pdfIlegible = false;
         if (ev?.wa_message_id) {
             const m = await mensaje(ev.wa_message_id);
             if (m?.deGestora && nombra(m.body)) {
@@ -264,13 +274,17 @@ export function registerTramiteTools(server, deps) {
                 const links = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
                 const deElla = f.msgs.filter((m) => m.deGestora);
                 if (links.some((l) => SLOTS_INGRESO.includes(l.doc_key)) && (!mueve || SLOTS_DE_ETAPA[etapa])) {
-                    // ponytail: the comprobante was linked from her message; the SI is inside the PDF, not read here.
+                    // The comprobante was linked from her message; a new SI is taken only from its readable text.
                     valida = true;
-                    conSi = true;
+                    if (siNuevo) {
+                        const t = f.firebase_url ? await leerPdf(f.firebase_url) : null;
+                        conSi = !!t && traeSi(t, siNuevo);
+                        pdfIlegible = !t;
+                    }
                 }
                 else if (deElla.length && (links.length > 0 || deElla.some((m) => nombra(m.body)))) {
                     valida = true;
-                    conSi = deElla.some((m) => traeSi(m.body, siNuevo));
+                    conSi = deElla.some((m) => traeSi(m.body, siNuevo) && nombraCliente(m.body, cli.nombres));
                 }
                 else if (mueve && ETAPAS_DEL_CLIENTE.has(etapa) && (f.msgs.some((m) => cli.tels.includes(m.sender)) || f.dePersona)) {
                     // ponytail: an installer's upload counts by uploaded_by alone; tie it to a meter slot if that proves too loose.
@@ -281,11 +295,13 @@ export function registerTramiteTools(server, deps) {
         if (valida && (!siNuevo || conSi))
             return null;
         const que = mueve ? `Cambiar la etapa a ${etapa}` : `Poner el numero_si ${siNuevo}`;
-        const cual = valida
-            ? `el numero_si ${siNuevo} tiene que venir escrito en el mensaje de la gestora que pasas como evidencia (o en el comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
-            : mueve && ETAPAS_DEL_CLIENTE.has(etapa)
-                ? "evidencia.file_id de la foto o documento que mandó el cliente desde su teléfono, o que subió el instalador al proyecto"
-                : `evidencia.wa_message_id de un mensaje que mandó la gestora (desde su número, no otra persona del grupo) y que nombra a este cliente o su SI, o evidencia.file_id de un archivo que ella mandó para este trámite${SLOTS_DE_ETAPA[etapa ?? ""] || !mueve ? " o del comprobante ya vinculado en Anexo 2 / Comprobante de ingreso" : ""}; un numero_si nuevo tiene que venir escrito en esa evidencia`;
+        const cual = valida && pdfIlegible
+            ? `el comprobante vinculado no tiene texto legible (escaneado), así que el numero_si ${siNuevo} no se puede comprobar; no lo guardes por tu cuenta`
+            : valida
+                ? `el numero_si ${siNuevo} tiene que venir escrito en el mensaje de la gestora que pasas como evidencia (o en el comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
+                : mueve && ETAPAS_DEL_CLIENTE.has(etapa)
+                    ? "evidencia.file_id de la foto o documento que mandó el cliente desde su teléfono, o que subió el instalador al proyecto"
+                    : `evidencia.wa_message_id de un mensaje que mandó la gestora (desde su número, no otra persona del grupo) y que nombra a este cliente o su SI, o evidencia.file_id de un archivo que ella mandó para este trámite${SLOTS_DE_ETAPA[etapa ?? ""] || !mueve ? " o del comprobante ya vinculado en Anexo 2 / Comprobante de ingreso" : ""}; un numero_si nuevo tiene que venir escrito en esa evidencia`;
         return `${que} necesita evidencia: ${cual}. Sin eso no se cambia: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true), citando por qué crees que ya cambió.`;
     }
     /**

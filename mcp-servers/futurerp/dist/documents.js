@@ -10,6 +10,24 @@ import { esRecibo, parseRecibo } from "./recibo.js";
 const require = createRequire(import.meta.url);
 // pdf-parse is CommonJS; its index.js runs a debug self-test on import, so load lib/ directly.
 const pdfParse = require("pdf-parse/lib/pdf-parse.js");
+/** The text layer of a Firebase-stored PDF, or null when it can't be downloaded or has none (scanned). */
+export async function textoPdf(href) {
+    try {
+        if (!/^https:\/\/firebasestorage\.googleapis\.com\//.test(href))
+            return null;
+        const r = await fetch(href);
+        if (!r.ok)
+            return null;
+        const bytes = Buffer.from(await r.arrayBuffer());
+        if (bytes.length > MAX_BYTES || bytes.subarray(0, 4).toString() !== "%PDF")
+            return null;
+        const text = (await pdfParse(bytes, { max: 10 })).text.trim();
+        return text.length >= 40 ? text : null;
+    }
+    catch {
+        return null;
+    }
+}
 const MAX_BYTES = 25 * 1024 * 1024;
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerDocumentTools(server, deps) {

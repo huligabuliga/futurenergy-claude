@@ -1,5 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 export interface TramiteDeps {
+    /** PDF text reader (tests stub it). */
+    textoPdf?: (href: string) => Promise<string | null>;
     userId: string;
     restBase: string;
     uuidRx: RegExp;

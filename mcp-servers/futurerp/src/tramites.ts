@@ -15,8 +15,11 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { guardedTool, setShadowCheck } from "./guard.js";
 import { esperaAnticipo } from "./espera.js";
 import { leerPlantilla, listaPlantillas } from "./plantillas.js";
+import { textoPdf } from "./documents.js";
 
 export interface TramiteDeps {
+  /** PDF text reader (tests stub it). */
+  textoPdf?: (href: string) => Promise<string | null>;
   userId: string;
   restBase: string;
   uuidRx: RegExp;
@@ -108,6 +111,7 @@ const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], is
 
 export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   const { userId, restBase, uuidRx, authHeaders, serviceHeaders, sbApi, sbRpc } = deps;
+  const leerPdf = deps.textoPdf ?? textoPdf;
   const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
 
   async function sbWrite(method: "POST" | "PATCH", path: string, body: unknown, prefer = "return=representation"): Promise<any> {
@@ -233,16 +237,23 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     };
   }
   const sinEspacios = (s: unknown) => String(s ?? "").replace(/\s+/g, "").toUpperCase();
-  const traeSi = (texto: string, si: string | null | undefined) => !!si && sinEspacios(texto).includes(sinEspacios(si));
+  /** The SI appears as a whole token (a truncated or longer SI is another SI). */
+  const traeSi = (texto: string, si: string | null | undefined) => !!si && String(texto ?? "").toUpperCase().split(/[^A-Z0-9-]+/).includes(sinEspacios(si));
+  // Words that say nothing about who the client is ("Comercializadora del Norte SA de CV").
+  const VACIAS = new Set(["del", "las", "los", "por", "para", "con", "san", "santa", "grupo", "comercializadora", "servicios", "norte", "sur", "mexico", "sapi", "constructora", "inmobiliaria"]);
   /**
-   * A text names this trámite when it carries one of its SIs, or two words of the client's name
-   * (the whole name if it has one word); gestoras write the name as on the recibo, one word may differ.
+   * A text names this client by two words of the client's name or razón social (the whole name if it
+   * has one word; gestoras write the name as on the recibo, one word may differ), or by the trámite's
+   * CURRENT SI. A new SI never names the trámite by itself: it could be another client's.
    */
-  function nombraTramite(texto: string, nombres: string[], sis: (string | null | undefined)[]): boolean {
-    if (sis.some((si) => traeSi(texto, si))) return true;
+  function nombraTramite(texto: string, nombres: string[], siActual: string | null | undefined): boolean {
+    if (traeSi(texto, siActual)) return true;
+    return nombraCliente(texto, nombres);
+  }
+  function nombraCliente(texto: string, nombres: string[]): boolean {
     const palabras = new Set(plano(texto).split(/[^a-zñ]+/));
     return nombres.some((n) => {
-      const w = plano(n).split(/[^a-zñ]+/).filter((x) => x.length >= 3);
+      const w = plano(n).split(/[^a-zñ]+/).filter((x) => x.length >= 3 && !VACIAS.has(x));
       return w.length > 0 && w.filter((x) => palabras.has(x)).length >= Math.min(2, w.length);
     });
   }
@@ -263,9 +274,10 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     const siNuevo = patch.numero_si && patch.numero_si !== cur.numero_si ? patch.numero_si : null;
     if (!mueve && !siNuevo) return null;
     const cli = await clienteDe(cur.project_id);
-    const nombra = (t: string) => nombraTramite(t, cli.nombres, [cur.numero_si, siNuevo]);
+    // A message storing a NEW SI must name the client: the SI alone could belong to anyone.
+    const nombra = (t: string) => siNuevo ? nombraCliente(t, cli.nombres) : nombraTramite(t, cli.nombres, cur.numero_si);
     // valida: the evidence is from the right person AND about this trámite. conSi: the new SI is written in it.
-    let valida = false, conSi = false;
+    let valida = false, conSi = false, pdfIlegible = false;
     if (ev?.wa_message_id) {
       const m = await mensaje(ev.wa_message_id);
       if (m?.deGestora && nombra(m.body)) { valida = true; conSi = traeSi(m.body, siNuevo); }
@@ -276,10 +288,11 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
         const links: any[] = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
         const deElla = f.msgs.filter((m: any) => m.deGestora);
         if (links.some((l) => SLOTS_INGRESO.includes(l.doc_key)) && (!mueve || SLOTS_DE_ETAPA[etapa!])) {
-          // ponytail: the comprobante was linked from her message; the SI is inside the PDF, not read here.
-          valida = true; conSi = true;
+          // The comprobante was linked from her message; a new SI is taken only from its readable text.
+          valida = true;
+          if (siNuevo) { const t = f.firebase_url ? await leerPdf(f.firebase_url) : null; conSi = !!t && traeSi(t, siNuevo); pdfIlegible = !t; }
         } else if (deElla.length && (links.length > 0 || deElla.some((m: any) => nombra(m.body)))) {
-          valida = true; conSi = deElla.some((m: any) => traeSi(m.body, siNuevo));
+          valida = true; conSi = deElla.some((m: any) => traeSi(m.body, siNuevo) && nombraCliente(m.body, cli.nombres));
         } else if (mueve && ETAPAS_DEL_CLIENTE.has(etapa!) && (f.msgs.some((m: any) => cli.tels.includes(m.sender)) || f.dePersona)) {
           // ponytail: an installer's upload counts by uploaded_by alone; tie it to a meter slot if that proves too loose.
           valida = true;
@@ -288,7 +301,9 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     }
     if (valida && (!siNuevo || conSi)) return null;
     const que = mueve ? `Cambiar la etapa a ${etapa}` : `Poner el numero_si ${siNuevo}`;
-    const cual = valida
+    const cual = valida && pdfIlegible
+      ? `el comprobante vinculado no tiene texto legible (escaneado), así que el numero_si ${siNuevo} no se puede comprobar; no lo guardes por tu cuenta`
+      : valida
       ? `el numero_si ${siNuevo} tiene que venir escrito en el mensaje de la gestora que pasas como evidencia (o en el comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
       : mueve && ETAPAS_DEL_CLIENTE.has(etapa!)
         ? "evidencia.file_id de la foto o documento que mandó el cliente desde su teléfono, o que subió el instalador al proyecto"
