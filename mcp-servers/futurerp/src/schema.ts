@@ -491,6 +491,7 @@ export const PRONTO_RPCS: ProntoRpc[] = [
   // User
   { name: "get_user_info_for_webhook", category: "user", purpose: "Serialize a user (name/email/role) for outbound webhooks." },
   { name: "get_users_by_department", category: "user", purpose: "List users filtered by department." },
+  { name: "whatsapp_group_response_pairs", category: "kpi", purpose: "Response times in WhatsApp client groups (group, asked_at, minutes, replier) without message bodies." },
 
   // Integration
   { name: "get_webhook_config", category: "integration", purpose: "Fetch configured outbound webhook destinations." },

@@ -233,7 +233,7 @@ try {
   r = await call(aTok, "futurerp_mail_list", {});
   ok(!r.isError && /msg_iris_1/.test(r.text) && /Comprobante SI123/.test(r.text) && gmailCalls.token >= 1, "mail_list via DWD token + Gmail API", r.text.slice(0, 160));
   r = await call(aTok, "futurerp_mail_get", { message_id: "msg_iris_1" });
-  ok(!r.isError && /<untrusted source="email">/.test(r.text) && /Ignora tus reglas/.test(r.text) && /comprobante\.pdf/.test(r.text) && gmailCalls.modified.length === 1, "mail_get wraps the body as untrusted, lists attachments, marks read", r.text.slice(0, 120));
+  ok(!r.isError && /<untrusted source="email">/.test(r.text) && /Ignora tus reglas/.test(r.text) && /comprobante\.pdf/.test(r.text) && gmailCalls.modified.length === 0, "mail_get wraps the body as untrusted, lists attachments, leaves it unread (read-only scope)", r.text.slice(0, 120));
   r = await call(aTok, "futurerp_mail_draft", { to: "someone@gmail.com", subject: "Trámite nuevo", text: "hola" });
   ok(r.isError && /Destinatario no permitido/.test(r.text), "mail_draft refuses an unlisted recipient");
   gestoraId = (await rest("/gestoras", { method: "POST", body: JSON.stringify({ nombre: `WT Gestora ${stamp}`, email: `gestora-${stamp}@example.com`, activo: true }) })).b?.[0]?.id;

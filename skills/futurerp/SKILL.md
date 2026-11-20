@@ -45,6 +45,37 @@ Knowledge of Future Energy's internal ERP — **pronto-resolver-61**, a React 18
 | `futurerp_get_related` | Child rows by FK. E.g. ticket_activities for a ticket. |
 | `futurerp_recent_records` | Last N rows of any table. Default order: `created_at.desc`. |
 
+### Writing (only with the `mcp.write` permission)
+Visible only to users whose FuturERP role has **MCP FuturERP (Claude): editar y crear registros** (`mcp.write`, set in `/admin/permisos`; admins always pass). Writes run with the user's own token, so RLS, triggers and audit columns behave exactly as in the app: if they can't edit it in FuturERP, the tool returns "No changes" or a permission error.
+
+| Tool | Purpose |
+|---|---|
+| `futurerp_update_record` | `table`, `filters` (required), `patch`, `dry_run?`. Max 20 rows per call. Returns before/after. |
+| `futurerp_insert_record` | `table`, `row`. Returns the created row. |
+| `futurerp_lead_set_stage` | `lead_id`, `stage`, `reason?` (required for `descalificado`). Same as clicking the stage in the lead: status + "Cambio de etapa" in Actividad; descalificar also cancels the next contact. **Use this, not update_record, to move a lead.** |
+| `futurerp_lead_schedule_next_contact` | `lead_id`, `at` (Monterrey time if no offset), `note?`, `si_pero?`, `vendor_qualification?`, `project_amount?`. Same as the "Siguiente contacto" dialog: replaces the reminder, saves `next_contact_*`, syncs Google Calendar. **Use this, not update_record, for next_contact_*.** |
+
+- Use `dry_run: true` first whenever the filter isn't by `id`.
+- CRM notes: `futurerp_insert_record` into `crm_activities` with `entity_type:'lead'`, `entity_id`, `activity_type:'note'`, `description`. Reminders: insert into `reminders` (`user_id` = the user, `title`, `remind_at`).
+- Off-limits: role/permission tables (`crm_roles`, `user_crm_roles`, `crm_role_stage_moves`), `system_config`, ledgers, `is_admin`, audit columns, secret-like columns. Change those in the app.
+- Every write lands in `mcp_write_log` with the previous values (report "Cambios hechos desde Claude"). Undo = `futurerp_update_record` with the `before` values.
+
+### Nancy's catalog (only with the `nancy.catalog.manage` permission)
+Three tools for whoever can edit `/nancy/catalogo` (Marketing, directors, Sistemas, admins). They call the same RPCs as the screen with the user's token, so the catalog's own review decides what can be published.
+
+- `futurerp_nancy_catalogo`: what Nancy quotes today, the draft and its blockers, any scheduled change. Call it first.
+- `futurerp_nancy_paquete_guardar`: create (`nuevo`) or change (`paquete` = name fragment or id) a package or promotion **in the draft**. Only the fields passed change: `precio`, `bateria_kwh`, `paneles`, `watts_por_panel`, `equipo` (replaces the list), `incluye`, `respaldo`, `nota_para_nancy`, `vigente_desde`, `vigente_hasta` (null clears), `al_terminar`, `flyer_url` / `flyer_base64` (JPG/PNG ≤5 MB; Drive share links OK), `quitar_flyer`, `dejar_de_ofrecer`.
+- `futurerp_nancy_catalogo_publicar`: `accion` = `publicar` (now, or `cuando` in Monterrey time; needs `codigo`, the draft code the read and save tools print, so a draft that changed since the person saw it is refused), `cancelar_programado`, `quitar_paquete`, `descartar_borrador`.
+
+Flow: read → guardar → show the person the draft summary and blockers → publish only after their explicit yes. Publishing reaches real prospects within a minute. The three base packages can't be withdrawn and a promotion on them must return to the previous price; a price can't repeat another package's.
+
+### Uploading files (only with the `mcp.upload` permission)
+`futurerp_upload_file` appears for users with **MCP FuturERP (Claude): subir archivos** (`mcp.upload`, `/admin/permisos`; admins always pass). It stores the file in the ERP's Firebase bucket with the user's own Firebase session and inserts the attachment row with their token, so it only works where they could attach the file in the app.
+
+- Args: `table`, `values` (link columns), `file_name`, and exactly one of `url` (public https, Google Drive share links OK, ≤50 MB) or `base64` (≤10 MB); `mime_type?`.
+- Targets: `lead_files` {lead_id, document_type?}, `project_files` {project_id, document_id?}, `ticket_activities` {ticket_id, content?} (posts a comment with the file), `requisicion_attachments`, `expense_files`, any other `*_files` / `*_attachments` table. URL, name, size, MIME, type and uploader columns are filled automatically.
+- HEIC/HEIF is refused (ask for JPEG/PNG). If the row is refused, the uploaded blob is deleted again. Each upload is logged in `mcp_write_log` (op insert).
+
 ### Search
 | Tool | Purpose |
 |---|---|

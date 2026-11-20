@@ -34,6 +34,10 @@ import { registerMailTools } from "./mail.js";
 import { registerDocumentTools } from "./documents.js";
 import { registerOpsTools } from "./ops.js";
 import { registerContextoTool } from "./contexto.js";
+import { registerWriteTools } from "./writes.js";
+import { registerUploadTools } from "./uploads.js";
+import { registerCatalogTools } from "./catalogo.js";
+import { registerLeadActionTools } from "./leadActions.js";
 // Load .env from server root (fallback if env vars not passed by MCP client)
 try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -355,17 +359,20 @@ async function resolveAuthInfo(token) {
         throw new InsufficientScopeError("No tienes una cuenta activa de FuturERP.");
     }
     const isAdmin = profRow.is_admin === true;
-    const [leadsViewAll, dronesManage, tramitesManage] = await Promise.all([
+    const [leadsViewAll, dronesManage, tramitesManage, mcpWrite, mcpUpload, nancyCatalog] = await Promise.all([
         hasCrmPermission(user.id, "leads.view_all"),
         hasCrmPermission(user.id, "drones.manage"),
         hasCrmPermission(user.id, "tramites.manage"),
+        hasCrmPermission(user.id, "mcp.write"),
+        hasCrmPermission(user.id, "mcp.upload"),
+        hasCrmPermission(user.id, "nancy.catalog.manage"),
     ]);
     const info = {
         token,
         clientId: claims.client_id ?? "session",
         scopes: [],
         expiresAt: typeof claims.exp === "number" ? claims.exp : undefined,
-        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, tramitesManage },
+        extra: { userId: user.id, email: user.email ?? "", isAdmin, leadsViewAll, dronesManage, tramitesManage, mcpWrite, mcpUpload, nancyCatalog },
     };
     if (authCache.size > 500)
         authCache.clear();
@@ -2151,6 +2158,7 @@ export function buildServer(auth) {
         dashboard_operativo_projects: { perm: "operaciones.access", desc: "Operational projects board (no args)" },
         dashboard_operativo_stage_avg: { perm: "operaciones.access", desc: "Avg time per project stage (no args)" },
         dashboard_operativo_mtto_pendientes: { perm: "operaciones.access", desc: "Pending maintenance (no args)" },
+        whatsapp_group_response_pairs: { perm: "operaciones.access", desc: "WhatsApp client-group response times, no message bodies (p_from, p_to: YYYY-MM-DD, p_to inclusive, max 92 days)" },
         dashboard_bot_ventas: { perm: "dashboards.citas_bot.view", desc: "Bot-attributed sales (p_from, p_to ISO optional)" },
         dashboard_citas_bot: { perm: "dashboards.citas_bot.view", desc: "Citas-bot dashboard (no args)" },
         dashboard_citas_bot_escalations: { perm: "dashboards.citas_bot.view", desc: "Citas-bot escalations (no args)" },
@@ -2199,12 +2207,16 @@ export function buildServer(auth) {
             if (!res.ok) {
                 return { content: [{ type: "text", text: `RPC ${name} failed ${res.status}: ${text.slice(0, 400)}` }], isError: true };
             }
+            // Pretty-print small results; big ones (e.g. whatsapp_group_response_pairs for a whole
+            // month) stay compact so that artifacts can still parse them. Hard cap keeps a runaway
+            // payload from flooding an LLM client.
             let pretty = text;
             try {
-                pretty = JSON.stringify(JSON.parse(text), null, 2);
+                const parsed = JSON.parse(text);
+                pretty = text.length > 20000 ? JSON.stringify(parsed) : JSON.stringify(parsed, null, 2);
             }
             catch { }
-            const clipped = pretty.length > 20000 ? pretty.slice(0, 20000) + "\n… (truncated)" : pretty;
+            const clipped = pretty.length > 300000 ? pretty.slice(0, 300000) + "\n… (truncated)" : pretty;
             return { content: [{ type: "text", text: "## " + name + "\n\n```json\n" + clipped + "\n```" }] };
         }
         catch (e) {
@@ -2905,6 +2917,45 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
             sbApi,
         });
     }
+    // Generic WRITE tools: only for the `mcp.write` permission (picked in /admin/permisos). The writes
+    // run with the caller's token, so RLS decides per row exactly as in the app.
+    if (auth.extra?.mcpWrite === true) {
+        registerWriteTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            filtersSchema: FiltersSchema,
+            filtersToQs,
+        });
+        registerLeadActionTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            supabaseUrl: SUPABASE_URL,
+        });
+    }
+    // File UPLOAD: only for `mcp.upload`. Storage rules + RLS on the attachment row decide, as in the app.
+    if (auth.extra?.mcpUpload === true) {
+        registerUploadTools(server, {
+            userId: auth.extra?.userId ?? "",
+            restBase: REST_BASE,
+            authHeaders,
+            serviceHeaders,
+            supabaseUrl: SUPABASE_URL,
+            publishableKey: SUPABASE_PUBLISHABLE_KEY,
+            userToken: () => reqCtx.getStore()?.token,
+            tableColumns: async (t) => {
+                const props = (await sbOpenApi())?.definitions?.[t]?.properties;
+                return props ? Object.keys(props) : null;
+            },
+        });
+    }
+    // Nancy's catalog: the same permission as /nancy/catalogo, and the same RPCs with the caller's token.
+    if (auth.extra?.nancyCatalog === true) {
+        registerCatalogTools(server, { restBase: REST_BASE, authHeaders, supabaseUrl: SUPABASE_URL });
+    }
     return server;
 } // end buildServer
 // ── HTTP entrypoint ───────────────────────────────────────
@@ -2914,7 +2965,9 @@ async function main() {
         throw new Error("Set SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) — needed to validate user tokens.");
     }
     const app = express();
-    app.use(express.json({ limit: "4mb" }));
+    // POST /mcp parses its (larger, base64 uploads) body only after the bearer check; everything else 4 MB.
+    const smallJson = express.json({ limit: "4mb" });
+    app.use((req, res, next) => (req.method === "POST" && req.path === "/mcp" ? next() : smallJson(req, res, next)));
     // One line per request in Railway logs: method, path, status, ms, and — for 401/403 — the reason
     // (taken from the WWW-Authenticate header we set; never the token). Cheap, and the only way to see
     // what a remote client (claude.ai) actually did.
@@ -2993,7 +3046,7 @@ async function main() {
             return;
         }
         next();
-    }, bearer, async (req, res) => {
+    }, bearer, express.json({ limit: "16mb" }), async (req, res) => {
         const auth = req.auth;
         const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
         if (toolName) {
