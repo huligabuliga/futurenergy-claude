@@ -349,16 +349,15 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
       subject: z.string().max(200),
       description: z.string().max(4000).optional(),
       pregunta_para_tramitologia: z.boolean().optional().describe("true = also notify everyone with tramites.manage"),
-      pregunta_para_flor: z.boolean().optional().describe("Deprecated alias of pregunta_para_tramitologia"),
     },
-    async ({ project_id, activity_type, subject, description, pregunta_para_tramitologia, pregunta_para_flor }) => {
-      const pregunta = !!(pregunta_para_tramitologia || pregunta_para_flor);
+    async ({ project_id, activity_type, subject, description, pregunta_para_tramitologia }) => {
+      const pregunta = !!pregunta_para_tramitologia;
       try {
         let p: { id: string; efu: string | null } | null = null;
         if (project_id) {
           p = await projectRow(project_id, "id,efu");
           if (!p) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-          await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp", pregunta_para_tramitologia: pregunta, pregunta_para_flor: pregunta } });
+          await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp", pregunta_para_tramitologia: pregunta } });
         } else if (!pregunta) {
           return fail("Falta project_id (solo puede omitirse con pregunta_para_tramitologia=true).");
         }
@@ -389,7 +388,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_ticket_create ────────────────────────────────────────────────
   tool(
     "futurerp_ticket_create",
-    "Open a ticket to the project's vendor (projects.owner_id), like the app's 'Nuevo ticket': area = the vendor's department, SLA 2 business days, the vendor gets a 'ticket_assigned' notification. Use it for documents the expediente is missing (Flor's rule: the vendor first, the client only if the vendor is slow). Logs a note on the project timeline.",
+    "Open a ticket to the project's vendor (projects.owner_id), like the app's 'Nuevo ticket': area = the vendor's department, SLA 2 business days, the vendor gets a 'ticket_assigned' notification. Use it for documents the expediente is missing (tramitología's rule: the vendor first, the client only if the vendor is slow). Logs a note on the project timeline.",
     {
       project_id: z.string().describe("Project uuid or EFU code"),
       asunto: z.string().max(200),

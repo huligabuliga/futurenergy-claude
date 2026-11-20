@@ -40,7 +40,7 @@ export function registerOpsTools(server: McpServer, deps: { sbRpc: (name: string
 
   server.tool(
     "futurerp_trami_stats",
-    "Trami's own numbers for a period: sessions per trigger/status and per day, gated calls per tool and outcome, shadow-mode rows with tramitología's agreement per tool, expedientes sent, median hours from anticipo to send, documents requested, questions to Flor, gestora messages, errors by type; plus current health (stuck outbox rows, long-open sessions, failed sessions, pending Buzón, ungraded shadow rows, last errors). Needs tramites.access.",
+    "Trami's own numbers for a period: sessions per trigger/status and per day, gated calls per tool and outcome, shadow-mode rows with tramitología's agreement per tool, expedientes sent, median hours from anticipo to send, documents requested, questions to tramitología, gestora messages, errors by type; plus current health (stuck outbox rows, long-open sessions, failed sessions, pending Buzón, ungraded shadow rows, last errors). Needs tramites.access.",
     { days: z.number().int().min(1).max(365).default(1).describe("Window in days (1 = today's report)") },
     async ({ days }) => {
       try {

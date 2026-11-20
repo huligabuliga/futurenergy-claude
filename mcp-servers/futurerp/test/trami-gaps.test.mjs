@@ -260,8 +260,8 @@ test("gestoras: contexto names the gestora per zona + tipo with her notes, and s
   assert.match(txt(await h2.tools.futurerp_tramite_contexto({ project_id: P1 })), /SIN ZONA CFE: no se puede saber la gestora/);
 });
 
-test("gestoras: pregunta_para_tramitologia notifies tramites.manage; old pregunta_para_flor still works", async () => {
-  for (const flag of ["pregunta_para_tramitologia", "pregunta_para_flor"]) {
+test("gestoras: pregunta_para_tramitologia notifies tramites.manage", async () => {
+  for (const flag of ["pregunta_para_tramitologia"]) {
     resetModeCache();
     const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "live" }], "/user_crm_roles": [{ user_id: "u-a" }, { user_id: "u-b" }] });
     const rpcs = [];
@@ -271,4 +271,13 @@ test("gestoras: pregunta_para_tramitologia notifies tramites.manage; old pregunt
     assert.match(txt(r), /Pregunta enviada a 2 persona/, flag);
     assert.deepEqual(rpcs.find((x) => x.name === "create_notification")?.args.p_user_ids, ["u-a", "u-b"]);
   }
+});
+
+// Gestoras are data and tramitología is a permission: no person's name in anything the model reads.
+test("no Iris or Flor in the MCP sources (tool descriptions, replies, comments)", async () => {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const dir = new URL("../src/", import.meta.url);
+  const hits = readdirSync(dir).filter((f) => f.endsWith(".ts")).flatMap((f) =>
+    readFileSync(new URL(f, dir), "utf8").split("\n").map((l, i) => [f, i + 1, l]).filter(([, , l]) => /\b(Iris|Flor)\b/.test(l)).map(([f, n]) => `${f}:${n}`));
+  assert.deepEqual(hits, []);
 });
