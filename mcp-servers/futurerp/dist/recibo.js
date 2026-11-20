@@ -43,7 +43,7 @@ export function parseRecibo(text, hoy = new Date()) {
     // Every bill prints an "ADEUDO ANTERIOR" line; it only matters when the amount is not zero.
     const adeudoRaw = u.match(/(?:ADEUDO|SALDO) ANTERIOR[^\d$\n]*\n?\s*\$?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
     const adeudo_anterior = adeudoRaw != null ? Number(adeudoRaw.replace(/,/g, "")) : null;
-    // Flor: "Adeudo anterior" next to a "Su pago" of the same amount is a paid balance, not a debt.
+    // Tramitología rule: "Adeudo anterior" next to a "Su pago" of the same amount is a paid balance, not a debt.
     const pagoRaw = u.match(/SU PAGO[^\d$\n]*\n?\s*-?\s*\$?\s*-?\s*([\d,]+(?:\.\d+)?)/)?.[1] ?? null;
     const su_pago = pagoRaw != null ? Number(pagoRaw.replace(/,/g, "")) : null;
     const adeudo_vigente = adeudo_anterior == null ? null : Math.max(0, adeudo_anterior - (su_pago ?? 0));

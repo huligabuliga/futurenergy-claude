@@ -168,7 +168,7 @@ export const PRONTO_TABLES: ProntoTable[] = [
   { name: "sales_targets", category: "finance", purpose: "Team/individual sales goal definitions." },
   { name: "financial_config", category: "finance", purpose: "Payment terms / currency / tax settings." },
   { name: "suppliers", category: "finance", purpose: "Supplier directory." },
-  { name: "gestoras", category: "finance", purpose: "Gestoras (financing partners) directory." },
+  { name: "gestoras", category: "project", purpose: "Gestoras: the people who file CFE trámites for us. Routed by zonas + tipos (first active by nombre, like the Bandeja); whatsapp_chat_ids, email, telefono; notas_trami = how she writes. Only activo = true are current." },
 
   // Catalog
   { name: "catalog_categories", category: "catalog", purpose: "Catalog item categories (panels, inversores, materiales)." },

@@ -108,7 +108,7 @@ test("fix 6: a shadow WhatsApp without own channel, or over 20/h, is refused; a 
   assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "5218100000000", text: "hola" })), /Tope alcanzado: 20/);
 
   resetModeCache();
-  h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [] });
+  h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [], "/gestoras": [{ nombre: "Gestora A", activo: true, whatsapp_chat_ids: ["120363420531947860@g.us"] }] });
   registerTramiteTools(h.server, h.deps);
   assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "120363420531947860@g.us", text: "hola" })), /^\(sombra\)/);
   assert.equal(shadowRows(h.writes)[0].body.modo, undefined, "shadow row (default modo sombra)");
@@ -210,4 +210,65 @@ test("fix 2: a chat that is not a gestora's goes through the caller's RLS; none 
   assert.equal(r.isError, true);
   assert.ok(!h.reads.find((x) => x.startsWith("/whatsapp_conversations")).endsWith("[service]"));
   assert.equal(horaMty("2026-11-20T06:30:00Z"), "20/11 00:30");
+});
+
+// ── Gestoras are data: inactive gestora is never written to; routing by zona + tipo ──
+const GESTORAS = [
+  { nombre: "Gestora Vieja", activo: false, telefono: "5218112767099", whatsapp_chat_ids: ["5218112767099@c.us", "120363420531947860@g.us"] },
+  { nombre: "Gestora Nueva", activo: true, telefono: "5218100000001", whatsapp_chat_ids: ["120363000000000001@g.us"] },
+];
+const sendHarness = () => harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1", chat_id: "120363420531947860@g.us" }], "/clients": [], "/gestoras": GESTORAS });
+
+test("gestoras: an inactive gestora's group, 1:1 or phone is refused even in shadow; the active one's group is shadowed", atUtc("2026-11-20T18:00:00Z", async () => {
+  for (const args of [{ chat_id: "120363420531947860@g.us" }, { chat_id: "5218112767099" }, { conversation_id: "33333333-3333-4333-8333-333333333333" }]) {
+    resetModeCache();
+    const h = sendHarness();
+    registerTramiteTools(h.server, h.deps);
+    const r = await h.tools.futurerp_whatsapp_send({ ...args, text: "hola" });
+    assert.match(txt(r), /Gestora Vieja, que ya no es gestora activa/, JSON.stringify(args));
+    assert.equal(shadowRows(h.writes).length, 0, "no shadow row for a refused send");
+  }
+  resetModeCache();
+  const h = sendHarness();
+  registerTramiteTools(h.server, h.deps);
+  assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "120363000000000001@g.us", text: "hola" })), /^\(sombra\)/);
+  resetModeCache();
+  const h2 = sendHarness();
+  registerTramiteTools(h2.server, h2.deps);
+  assert.match(txt(await h2.tools.futurerp_whatsapp_send({ chat_id: "120363999999999999@g.us", text: "hola" })), /Solo escribes a grupos de una gestora activa/);
+}));
+
+test("gestoras: contexto names the gestora per zona + tipo with her notes, and says NINGUNA when nobody covers it", async () => {
+  const rpc = (path) => {
+    if (path.includes("p_tipo=cambio_nombre")) return { id: "g2", nombre: "Gestora Nueva", email: "nueva@example.com", whatsapp_chat_ids: ["120363000000000001@g.us"], notas_trami: "Escribe en mayúsculas\nPaga el jueves" };
+    return { id: null, nombre: null }; // PostgREST shape of a NULL composite
+  };
+  const h = harness({
+    "/projects": [{ id: P1, efu: "EFU-1", name: "Proyecto", zona_cfe: "DD10", clients: {} }],
+    "/project_tramites": [{ id: T1, tipo: "cambio_nombre", stage: "deteccion" }, { id: "t2", tipo: "primary_dd10", stage: "expediente_integracion" }, { id: "t3", tipo: "cambio_tarifa", stage: "concluido" }],
+    "/rpc/trami_gestora_para": rpc,
+  });
+  registerContextoTool(h.server, h.deps);
+  const out = txt(await h.tools.futurerp_tramite_contexto({ project_id: P1 }));
+  assert.match(out, /- DD10\/cambio_nombre: Gestora Nueva · correo nueva@example\.com · chats 120363000000000001@g\.us/);
+  assert.match(out, /Notas de la gestora: Escribe en mayúsculas \/ Paga el jueves/);
+  assert.match(out, /- DD10\/primary_dd10: NINGUNA gestora activa\. Pregunta a tramitología/);
+  assert.doesNotMatch(out, /cambio_tarifa:/, "closed trámites are not routed");
+
+  const h2 = harness({ "/projects": [{ id: P1, efu: "E", name: "P", zona_cfe: null, clients: {} }] });
+  registerContextoTool(h2.server, h2.deps);
+  assert.match(txt(await h2.tools.futurerp_tramite_contexto({ project_id: P1 })), /SIN ZONA CFE: no se puede saber la gestora/);
+});
+
+test("gestoras: pregunta_para_tramitologia notifies tramites.manage; old pregunta_para_flor still works", async () => {
+  for (const flag of ["pregunta_para_tramitologia", "pregunta_para_flor"]) {
+    resetModeCache();
+    const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "live" }], "/user_crm_roles": [{ user_id: "u-a" }, { user_id: "u-b" }] });
+    const rpcs = [];
+    h.deps.sbRpc = async (name, args) => { rpcs.push({ name, args }); return {}; };
+    registerTramiteTools(h.server, h.deps);
+    const r = await h.tools.futurerp_activity_add({ subject: "¿A quién se manda?", [flag]: true });
+    assert.match(txt(r), /Pregunta enviada a 2 persona/, flag);
+    assert.deepEqual(rpcs.find((x) => x.name === "create_notification")?.args.p_user_ids, ["u-a", "u-b"]);
+  }
 });

@@ -5,7 +5,7 @@
  * it WOULD do in agent_shadow_calls (modo 'sombra') and returns a "(sombra)"
  * result; nothing is written, sent or mailed. 'live' → the tool runs and the
  * same table gets a modo 'vivo' row with the previous values (antes) and the
- * tool's reply, so the panel shows what was done and can undo it. Flor grades
+ * tool's reply, so the panel shows what was done and can undo it. Tramitología grades
  * both (trami_shadow_verdict); trami_stats() reports the agreement per tool.
  * Either way a tool error lands in bot_error_log (fase 'trami').
  */
@@ -28,7 +28,7 @@ export declare const resetModeCache: () => void;
 /**
  * Checks a tool must pass even in shadow (send window, rate limit, own channel,
  * mail allowlist): a shadow call that live would refuse is refused the same way,
- * so Flor never grades an action that could not have happened.
+ * so tramitología never grades an action that could not have happened.
  * Return a reason to refuse, or null. Per server: each session's checks read
  * through that session's token.
  */

@@ -4,6 +4,32 @@
  * full row dump plus five follow-up queries. Reads go through the user's RLS.
  */
 import { z } from "zod";
+/** Primary trámite tipo of a CFE zona (the tipo the Bandeja routes with when a project has no trámite yet). */
+export const PRIMARIO_DE_ZONA = {
+    DD10: "primary_dd10", DD11: "primary_bidireccional_dd11", DD12: "primary_dd12", DD06: "primary_dd06", foraneo: "primary_foraneo",
+};
+/**
+ * "## Gestora" lines for each (zona, tipo): resolved by trami_gestora_para(), the
+ * server twin of the Bandeja's matchGestora (active only, first by nombre). No
+ * gestora = say so; Trami asks tramitología and writes to nobody.
+ */
+export async function gestoraLines(sbApi, zona, tipos) {
+    if (!zona)
+        return ["- SIN ZONA CFE: no se puede saber la gestora; fija la zona (o pregunta a tramitología) antes de escribirle a nadie."];
+    const pares = tipos.length ? [...new Set(tipos)] : [PRIMARIO_DE_ZONA[zona]].filter(Boolean);
+    const out = [];
+    for (const tipo of pares) {
+        const g = await sbApi(`/rpc/trami_gestora_para?p_zona=${encodeURIComponent(zona)}&p_tipo=${encodeURIComponent(tipo)}`).catch(() => null);
+        const row = Array.isArray(g) ? g[0] : g;
+        if (!row?.id) {
+            out.push(`- ${zona}/${tipo}: NINGUNA gestora activa. Pregunta a tramitología a quién se manda (pregunta_para_tramitologia=true); no escribas a nadie más.`);
+            continue;
+        }
+        out.push(`- ${zona}/${tipo}: ${row.nombre} · correo ${row.email ?? "—"} · chats ${(row.whatsapp_chat_ids ?? []).join(", ") || "ninguno"}`);
+        out.push(`  Notas de la gestora: ${row.notas_trami ? String(row.notas_trami).replace(/\s*\n\s*/g, " / ") : "sin notas: si no entiendes cómo escribe, pregunta a tramitología"}`);
+    }
+    return out;
+}
 const EXPEDIENTE_SLOTS = new Set([
     "Recibo CFE", "Recibo de luz", "INE del titular", "INE Para Cambio De Medidor", "INE del Firmante", "INE nuevo titular",
     "Predial", "Escrituras", "Predial o escrituras", "Acta Constitutiva", "Documentos Adicionales",
@@ -55,7 +81,7 @@ export function registerContextoTool(server, deps) {
                 }
             }
             catch { /* a missing channel or RLS just means "unknown"; say so */
-                waTrami = "no se pudo leer (trátalo como si nunca le hubieras escrito y pregunta a Flor si dudas)";
+                waTrami = "no se pudo leer (trátalo como si nunca le hubieras escrito y pregunta a tramitología si dudas)";
             }
             const requeridos = [...new Set([...(p.tramites_requeridos_manual ?? []), ...(p.tramites_requeridos_vtecnica ?? [])])];
             const lat = p.proyecto_latitude ?? p.instalacion_latitude, lng = p.proyecto_longitude ?? p.instalacion_longitude;
@@ -82,6 +108,7 @@ export function registerContextoTool(server, deps) {
             }
             const linked = new Set((linkRows ?? []).map((l) => l.project_files?.id).filter(Boolean));
             const sueltos = sinSlot(files ?? [], (did) => (did ? nameOf.get(did) : null), linked);
+            const gestora = await gestoraLines(deps.sbApi, p.zona_cfe ?? null, (tramites ?? []).filter((t) => !["sistema_activado", "concluido"].includes(t.stage)).map((t) => t.tipo));
             const paneles = (bom ?? []).filter((b) => b.catalog_items?.category === "Paneles");
             const micros = (bom ?? []).filter((b) => ["Microinversores", "Inversores"].includes(b.catalog_items?.category));
             const kw = paneles.reduce((s, b) => s + Number(b.quantity) * Number(b.catalog_items?.watts_per_unit ?? 0), 0) / 1000;
@@ -95,6 +122,9 @@ export function registerContextoTool(server, deps) {
                 "",
                 `## Trámites (${(tramites ?? []).length})`,
                 ...((tramites ?? []).length ? tramites.map((t) => `- ${t.tipo} · etapa ${t.stage} · id ${t.id}${t.enviado ? ` · enviado ${String(t.enviado_at).slice(0, 10)}` : ""}${t.numero_si ? ` · SI ${t.numero_si}` : ""}${t.fecha_ingreso ? ` · ingreso ${t.fecha_ingreso}` : ""}${t.gestor_cfe ? ` · gestor ${t.gestor_cfe}` : ""}${t.subsanacion_active ? ` · EN SUBSANACIÓN: ${t.motivo_subsanacion ?? ""}` : ""}${t.docs_solicitados_at ? ` · docs pedidos ${String(t.docs_solicitados_at).slice(0, 10)}` : ""}${t.siguiente_revision_at ? ` · revisar ${t.siguiente_revision_at}` : ""}${t.ultimo_estatus_cfe ? ` · CFE: ${t.ultimo_estatus_cfe}` : ""}${t.pagado ? ` · pagado $${t.costo ?? "?"}` : ""}`) : ["- ninguno"]),
+                "",
+                "## Gestora (de public.gestoras por zona + tipo; solo a ella se le escribe de este trámite)",
+                ...gestora,
                 "",
                 "## Expediente (slot → archivos; usa el id con futurerp_read_document o como adjunto)",
                 ...[...porSlot.entries()].map(([slot, v]) => `- ${slot}${v.requerido ? " (requerido)" : ""}: ${v.archivos.length ? v.archivos.map((a) => `${a.nombre} [${a.id}${a.tipo ? `, ${a.tipo}` : ""}${a.kb ? `, ${a.kb} KB` : ""}]`).join("; ") : "VACÍO"}`),

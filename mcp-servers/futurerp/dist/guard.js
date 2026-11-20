@@ -190,7 +190,7 @@ export function guardedTool(server, deps) {
                     headers: deps.serviceHeaders({ Prefer: "return=minimal" }),
                     body: JSON.stringify({ agent: "trami", tool_name: name, tool_input: args ?? {}, resumen, user_id: deps.userId, ...ids }),
                 });
-                return { content: [{ type: "text", text: `(sombra) ${resumen}. Trami está en modo sombra: la acción quedó registrada para que Flor la califique y NO se ejecutó. Sigue con el resto del trabajo como si se hubiera hecho; no la repitas.` }] };
+                return { content: [{ type: "text", text: `(sombra) ${resumen}. Trami está en modo sombra: la acción quedó registrada para que tramitología la califique y NO se ejecutó. Sigue con el resto del trabajo como si se hubiera hecho; no la repitas.` }] };
             }
             // Live: snapshot first, run, then write the ledger row (modo 'vivo') the
             // panel's Bitácora shows and trami_revertir_accion() undoes.

@@ -5,7 +5,7 @@
  * touch, `created_by` / `updated_by` are stamped by the audit trigger, and
  * the guards here only add what the UI enforces client-side (forward-only
  * stages, no-op on unchanged values, catalog enums). Registered only for
- * users with `tramites.manage` (Trami's ERP user, Flor).
+ * users with `tramites.manage` (Trami's ERP user and the tramitología team).
  *
  * Stage lists, labels and document catalog mirror pronto-resolver-61:
  * src/types/tramite.ts and src/config/tramiteRequirements.ts. Keep in sync.
@@ -342,26 +342,28 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_activity_add ─────────────────────────────────────────────────
   tool(
     "futurerp_activity_add",
-    "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for Flor. A question for Flor goes with pregunta_para_flor=true: every tramites.manage holder gets a notification pointing at the project, so the question is not just a silent note. Without a project (e.g. a gestora message that matches nothing) pass pregunta_para_flor=true and omit project_id: only the notification is sent.",
+    "Write a note on a project's timeline (crm_activities, performed_by = you). Use it to explain decisions, record what the gestora said (quoted), or leave a question for tramitología (the tramites.manage team, never one person). A question goes with pregunta_para_tramitologia=true: every tramites.manage holder gets a notification pointing at the project, so the question is not just a silent note. Without a project (e.g. a gestora message that matches nothing) pass pregunta_para_tramitologia=true and omit project_id: only the notification is sent.",
     {
-      project_id: z.string().optional().describe("Project uuid or EFU code; optional only when pregunta_para_flor is true"),
+      project_id: z.string().optional().describe("Project uuid or EFU code; optional only when pregunta_para_tramitologia is true"),
       activity_type: z.enum(ACTIVITY_TYPES).default("note"),
       subject: z.string().max(200),
       description: z.string().max(4000).optional(),
-      pregunta_para_flor: z.boolean().optional().describe("true = also notify everyone with tramites.manage"),
+      pregunta_para_tramitologia: z.boolean().optional().describe("true = also notify everyone with tramites.manage"),
+      pregunta_para_flor: z.boolean().optional().describe("Deprecated alias of pregunta_para_tramitologia"),
     },
-    async ({ project_id, activity_type, subject, description, pregunta_para_flor }) => {
+    async ({ project_id, activity_type, subject, description, pregunta_para_tramitologia, pregunta_para_flor }) => {
+      const pregunta = !!(pregunta_para_tramitologia || pregunta_para_flor);
       try {
         let p: { id: string; efu: string | null } | null = null;
         if (project_id) {
           p = await projectRow(project_id, "id,efu");
           if (!p) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-          await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp", pregunta_para_flor: !!pregunta_para_flor } });
-        } else if (!pregunta_para_flor) {
-          return fail("Falta project_id (solo puede omitirse con pregunta_para_flor=true).");
+          await logActivity(p.id, activity_type, subject, description ?? null, { metadata: { source: "mcp", pregunta_para_tramitologia: pregunta, pregunta_para_flor: pregunta } });
+        } else if (!pregunta) {
+          return fail("Falta project_id (solo puede omitirse con pregunta_para_tramitologia=true).");
         }
         let avisados = 0;
-        if (pregunta_para_flor) {
+        if (pregunta) {
           const rows: any[] = await sbApi(`/user_crm_roles?select=user_id,crm_roles!inner(id)&crm_roles.permissions=cs.${encodeURIComponent(JSON.stringify({ "tramites.manage": true }))}`, serviceHeaders());
           const ids = [...new Set((rows ?? []).map((r) => r.user_id).filter(Boolean))];
           if (ids.length) {
@@ -398,7 +400,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
       try {
         const p = await projectRow(project_id, "id,efu,name,owner_id");
         if (!p) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-        if (!p.owner_id) return fail(`El proyecto ${p.efu ?? p.id} no tiene vendedor asignado: pregunta a Flor a quién pedirle.`);
+        if (!p.owner_id) return fail(`El proyecto ${p.efu ?? p.id} no tiene vendedor asignado: pregunta a tramitología a quién pedirle.`);
         const [v]: any[] = await sbApi(`/profiles?user_id=eq.${p.owner_id}&select=user_id,first_name,last_name,department&limit=1`, serviceHeaders());
         const nombre = [v?.first_name, v?.last_name].filter(Boolean).join(" ") || "Vendedor";
         const area = v?.department || "Ventas";
@@ -499,21 +501,38 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
    * format. Also run in shadow (guard.setShadowCheck), so a shadow send that live
    * would refuse is refused too.
    */
+  /**
+   * Gestoras are data (public.gestoras): a gestora who is no longer active is
+   * never written to, and the only groups Trami writes to are active gestoras'.
+   */
+  async function gestoraTargetCheck(chat: string): Promise<string | null> {
+    const gs: any[] = (await sbApi(`/gestoras?select=nombre,activo,telefono,whatsapp_chat_ids`, serviceHeaders()).catch(() => null)) ?? [];
+    const d10 = (x: string | null | undefined) => String(x ?? "").replace(/\D/g, "").slice(-10);
+    const de = gs.filter((g) => (g.whatsapp_chat_ids ?? []).includes(chat) || (chat.endsWith("@c.us") && g.telefono && d10(g.telefono) === d10(chat)));
+    if (de.length && !de.some((g) => g.activo)) return `Ese chat es de ${de[0].nombre}, que ya no es gestora activa: no se le escribe. Pregunta a tramitología quién lleva ahora ese trámite.`;
+    if (chat.endsWith("@g.us") && !de.some((g) => g.activo)) return "Solo escribes a grupos de una gestora activa (public.gestoras.whatsapp_chat_ids).";
+    return null;
+  }
   async function waCheck({ conversation_id, chat_id, media_url }: { conversation_id?: string; chat_id?: string; media_url?: string }): Promise<{ error: string } | { ch: any; sentLastHour: number }> {
     const hora = fueraDeHorario(Date.now());
     if (hora) return { error: hora };
     if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname)) return { error: "Solo se adjuntan archivos del Storage de Firebase." };
     const ch = (await sbApi(`/whatsapp_channels?vendor_user_id=eq.${userId}&active=is.true&select=id,session_id,connection_status,label&limit=1`))?.[0];
     if (!ch) return { error: "No tienes una sesión de WhatsApp propia (whatsapp_channels.vendor_user_id). Trami solo escribe desde su número." };
+    let target: string;
     if (conversation_id) {
-      const convo = (await sbApi(`/whatsapp_conversations?id=eq.${conversation_id}&channel_id=eq.${ch.id}&select=id&limit=1`))?.[0];
+      const convo = (await sbApi(`/whatsapp_conversations?id=eq.${conversation_id}&channel_id=eq.${ch.id}&select=id,chat_id&limit=1`))?.[0];
       if (!convo) return { error: "Esa conversación no es de tu número." };
+      target = String(convo.chat_id ?? "");
     } else if (chat_id) {
       const cid = chat_id.includes("@") ? chat_id : `${chat_id.replace(/\D/g, "")}@c.us`;
       if (!/^\d{10,15}@c\.us$|^\d+@g\.us$/.test(cid)) return { error: `chat_id inválido: ${chat_id}` };
+      target = cid;
     } else {
       return { error: "Indica conversation_id o chat_id." };
     }
+    const gestoraErr = await gestoraTargetCheck(target);
+    if (gestoraErr) return { error: gestoraErr };
     // Rate limit: outbound rows on this channel in the last hour.
     const since = new Date(Date.now() - 3600_000).toISOString();
     const convIds: string[] = ((await sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&select=id`, serviceHeaders())) ?? []).map((c: any) => c.id);
@@ -530,7 +549,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_whatsapp_send ────────────────────────────────────────────────
   tool(
     "futurerp_whatsapp_send",
-    "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media. The message is recorded in the inbox like any outbound.",
+    "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media, never to an inactive gestora, groups only if they belong to an active gestora. The message is recorded in the inbox like any outbound.",
     {
       conversation_id: z.string().uuid().optional(),
       chat_id: z.string().optional().describe("Phone digits (E.164 without +) or a WhatsApp chat id (…@c.us / …@g.us)"),

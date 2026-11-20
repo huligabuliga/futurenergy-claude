@@ -24,14 +24,14 @@ export function registerOpsTools(server: McpServer, deps: { sbRpc: (name: string
 
   server.tool(
     "futurerp_trami_lecciones",
-    "Flor's corrections of your past actions (shadow mode grades): what you proposed, whether she would have done the same (correcto / parcial / incorrecto) and what she would have done instead. Read them at the start of every session; they override your own judgement and your memory.",
+    "Tramitología's corrections of your past actions (shadow mode grades, from tramites.manage holders): what you proposed, whether they would have done the same (correcto / parcial / incorrecto) and what they would have done instead. Read them at the start of every session; they override your own judgement and your memory.",
     { limit: z.number().int().min(1).max(200).default(40) },
     async ({ limit }) => {
       try {
         const rows: any[] = (await deps.sbRpc("trami_lecciones", { p_limit: limit })) ?? [];
-        if (!rows.length) return { content: [{ type: "text" as const, text: "Sin lecciones todavía: Flor no ha corregido ninguna acción." }] };
-        const lines = rows.map((r) => `- [${r.verdict}] ${r.proyecto ? `${r.proyecto} (${r.efu}) · ` : ""}${r.resumen}\n  Flor: ${r.verdict_nota ?? "(sin nota)"}`);
-        return { content: [{ type: "text" as const, text: `## Lecciones de Flor (${rows.length}, correcciones primero)\n${lines.join("\n")}` }] };
+        if (!rows.length) return { content: [{ type: "text" as const, text: "Sin lecciones todavía: tramitología no ha corregido ninguna acción." }] };
+        const lines = rows.map((r) => `- [${r.verdict}] ${r.proyecto ? `${r.proyecto} (${r.efu}) · ` : ""}${r.resumen}\n  Tramitología: ${r.verdict_nota ?? "(sin nota)"}`);
+        return { content: [{ type: "text" as const, text: `## Lecciones de tramitología (${rows.length}, correcciones primero)\n${lines.join("\n")}` }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `No se pudieron leer las lecciones: ${e?.message ?? e}` }], isError: true as const };
       }
@@ -40,7 +40,7 @@ export function registerOpsTools(server: McpServer, deps: { sbRpc: (name: string
 
   server.tool(
     "futurerp_trami_stats",
-    "Trami's own numbers for a period: sessions per trigger/status and per day, gated calls per tool and outcome, shadow-mode rows with Flor's agreement per tool, expedientes sent, median hours from anticipo to send, documents requested, questions to Flor, gestora messages, errors by type; plus current health (stuck outbox rows, long-open sessions, failed sessions, pending Buzón, ungraded shadow rows, last errors). Needs tramites.access.",
+    "Trami's own numbers for a period: sessions per trigger/status and per day, gated calls per tool and outcome, shadow-mode rows with tramitología's agreement per tool, expedientes sent, median hours from anticipo to send, documents requested, questions to Flor, gestora messages, errors by type; plus current health (stuck outbox rows, long-open sessions, failed sessions, pending Buzón, ungraded shadow rows, last errors). Needs tramites.access.",
     { days: z.number().int().min(1).max(365).default(1).describe("Window in days (1 = today's report)") },
     async ({ days }) => {
       try {

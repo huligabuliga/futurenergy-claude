@@ -141,7 +141,7 @@ export function registerMailTools(server, deps) {
     const tool = guardedTool(server, { userId, restBase, uuidRx, sbApi, serviceHeaders });
     const mailbox = process.env.TRAMI_MAILBOX ?? "";
     tool("futurerp_mail_list", `List messages in the trámites mailbox (${mailbox || "not configured"}) with a Gmail search query. Default: unread mail. Returns id, from, to, subject, date and the snippet; open one with futurerp_mail_get.`, {
-        query: z.string().optional().describe("Gmail search, e.g. 'is:unread', 'from:irisreyna335@gmail.com newer_than:7d', 'from:@cfe.mx'"),
+        query: z.string().optional().describe("Gmail search, e.g. 'is:unread', 'from:<gestora email> newer_than:7d', 'from:@cfe.mx'"),
         max: z.number().int().min(1).max(50).optional().describe("Default 20"),
     }, async ({ query, max }) => {
         try {

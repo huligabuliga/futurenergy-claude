@@ -2,11 +2,11 @@
  * futurerp_whatsapp_historial: the messages of one WhatsApp chat (the inbox
  * tables whatsapp_conversations / whatsapp_messages, every channel the chat
  * lives on) between two dates. Built for the Thursday desglose and for
- * re-reading what Iris said in her group; futurerp_whatsapp_conversation reads
+ * re-reading what the gestora said in her group; futurerp_whatsapp_conversation reads
  * the sales-bot tables instead and never sees these chats.
  *
  * Access: a gestora's chat (public.gestoras.whatsapp_chat_ids) is read with the
- * service key, because it usually sits on Flor's channel, not Trami's. Any
+ * service key, because it usually sits on a tramitología person's channel, not Trami's. Any
  * other chat goes through the caller's RLS (own channel, or whatsapp.view_all).
  * Every read lands in the Bitácora as modo 'lectura' (not graded).
  */
@@ -20,7 +20,7 @@ export function horaMty(iso) {
     return `${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 export function registerHistorialTool(server, deps) {
-    server.tool("futurerp_whatsapp_historial", "Read the WhatsApp messages of ONE chat (a gestora's group like Iris's …@g.us, Iris's 1:1, or a client chat on your own number) between two dates, oldest first, with sender and attachments. Use it for the Thursday desglose (the week's payment list Iris posted) and to re-read what the gestora said before acting. Dates are Monterrey days, YYYY-MM-DD, inclusive; default the last 7 days. The read is logged in the Bitácora.", {
+    server.tool("futurerp_whatsapp_historial", "Read the WhatsApp messages of ONE chat (an ACTIVE gestora's group …@g.us or 1:1 …@c.us from public.gestoras.whatsapp_chat_ids, or a client chat on your own number) between two dates, oldest first, with sender and attachments. Use it for the Thursday desglose (the week's payment list Iris posted) and to re-read what the gestora said before acting. Dates are Monterrey days, YYYY-MM-DD, inclusive; default the last 7 days. The read is logged in the Bitácora.", {
         chat_id: z.string().regex(/^\d+@(g|c)\.us$/).describe("WhatsApp chat id: …@g.us (group) or …@c.us (1:1)"),
         desde: z.string().regex(fecha).optional().describe("First day, YYYY-MM-DD (default: 7 days ago)"),
         hasta: z.string().regex(fecha).optional().describe("Last day, YYYY-MM-DD (default: today)"),

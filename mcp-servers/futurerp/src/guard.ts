@@ -5,7 +5,7 @@
  * it WOULD do in agent_shadow_calls (modo 'sombra') and returns a "(sombra)"
  * result; nothing is written, sent or mailed. 'live' → the tool runs and the
  * same table gets a modo 'vivo' row with the previous values (antes) and the
- * tool's reply, so the panel shows what was done and can undo it. Flor grades
+ * tool's reply, so the panel shows what was done and can undo it. Tramitología grades
  * both (trami_shadow_verdict); trami_stats() reports the agreement per tool.
  * Either way a tool error lands in bot_error_log (fase 'trami').
  */
@@ -53,7 +53,7 @@ export const resetModeCache = () => { modeCache = { at: 0, mode: "shadow", live:
 /**
  * Checks a tool must pass even in shadow (send window, rate limit, own channel,
  * mail allowlist): a shadow call that live would refuse is refused the same way,
- * so Flor never grades an action that could not have happened.
+ * so tramitología never grades an action that could not have happened.
  * Return a reason to refuse, or null. Per server: each session's checks read
  * through that session's token.
  */
@@ -214,7 +214,7 @@ export function guardedTool(server: McpServer, deps: GuardDeps): McpServer["tool
             headers: deps.serviceHeaders({ Prefer: "return=minimal" }),
             body: JSON.stringify({ agent: "trami", tool_name: name, tool_input: args ?? {}, resumen, user_id: deps.userId, ...ids }),
           });
-          return { content: [{ type: "text" as const, text: `(sombra) ${resumen}. Trami está en modo sombra: la acción quedó registrada para que Flor la califique y NO se ejecutó. Sigue con el resto del trabajo como si se hubiera hecho; no la repitas.` }] };
+          return { content: [{ type: "text" as const, text: `(sombra) ${resumen}. Trami está en modo sombra: la acción quedó registrada para que tramitología la califique y NO se ejecutó. Sigue con el resto del trabajo como si se hubiera hecho; no la repitas.` }] };
         }
         // Live: snapshot first, run, then write the ledger row (modo 'vivo') the
         // panel's Bitácora shows and trami_revertir_accion() undoes.
