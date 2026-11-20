@@ -194,7 +194,7 @@ export async function logToolError(deps: GuardDeps, name: string, args: unknown,
  * Deterministic rule (was a skill line the model sometimes missed): never write
  * to the same client twice within 24 h unless the client answered in between.
  * Counts real sends (whatsapp_messages outbound) AND shadow rows, so the rule
- * holds in evals too. Groups (@g.us) are not covered: Iris's group has its own cadence.
+ * holds in evals too. Groups (@g.us) are not covered: the gestora's group has its own cadence.
  * Returns the refusal text, or null when the send may go.
  */
 export async function repeatedClientMessage(deps: GuardDeps, a: Record<string, any>, nowMs = Date.now()): Promise<string | null> {
@@ -218,7 +218,7 @@ export async function repeatedClientMessage(deps: GuardDeps, a: Record<string, a
     const answered: any[] = ids ? (await deps.sbApi(`/whatsapp_messages?conversation_id=in.(${ids})&direction=eq.inbound&sent_at=gt.${last}&select=id&limit=1`, deps.serviceHeaders()).catch(() => [])) : [];
     if (answered?.length) return null;
     const h = Math.max(1, Math.round((nowMs - Date.parse(last)) / 3600_000));
-    return `Sin cambios: ya le escribiste a este cliente hace ${h} h y no ha contestado. No se repite un aviso en menos de 24 h; si hay algo nuevo y urgente, pregúntale a Flor con futurerp_activity_add (pregunta_para_flor).`;
+    return `Sin cambios: ya le escribiste a este cliente hace ${h} h y no ha contestado. No se repite un aviso en menos de 24 h; si hay algo nuevo y urgente, pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia).`;
   } catch {
     return null; // ponytail: a failed lookup never blocks a send; the skill rule still applies.
   }
