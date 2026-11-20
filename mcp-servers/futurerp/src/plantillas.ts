@@ -25,18 +25,27 @@ const reglas = data.plantillas.map((p) => {
   let src = esc(norm(p.texto));
   // The introduction goes only in the first message, right after the greeting.
   if (p.texto.startsWith(SALUDO)) src = src.replace(esc(SALUDO), `${esc(SALUDO)}(?: ${esc(norm(data.presentacion))})?`);
+  let i = 0;
   src = src.replace(/\\\{(\w+)\\\}/g, (_, h) => {
     if (!HUECO[h]) throw new Error(`plantillas_cliente.json: hueco desconocido {${h}} en ${p.id}`);
-    return `(?:${HUECO[h]})`;
+    return `(?<${h}_${i++}>${HUECO[h]})`;
   });
   return { id: p.id, rx: new RegExp(`^${src}$`, "u") };
 });
 
-/** The id of the template `text` is, or null. */
-export function plantillaDe(text: string): string | null {
+/** The template `text` is and what fills each hueco ({nombre: ["Ana"], si: [...]}), or null. */
+export function leerPlantilla(text: string): { id: string; huecos: Record<string, string[]> } | null {
   const t = norm(text);
-  return reglas.find((r) => r.rx.test(t))?.id ?? null;
+  for (const r of reglas) {
+    const m = r.rx.exec(t);
+    if (!m) continue;
+    const huecos: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(m.groups ?? {})) (huecos[k.replace(/_\d+$/, "")] ??= []).push(v);
+    return { id: r.id, huecos };
+  }
+  return null;
 }
+export const plantillaDe = (text: string): string | null => leerPlantilla(text)?.id ?? null;
 
 /** For the tool description: each template with when it goes. */
 export function listaPlantillas(): string {

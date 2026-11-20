@@ -49,6 +49,11 @@ const shadowRows = (w) => w.filter((x) => x.path.startsWith("/agent_shadow_calls
 // 12:00 Monterrey = 18:00 UTC; 22:00 Monterrey = 04:00 UTC next day.
 const atUtc = (iso, fn) => async () => { const real = Date.now; Date.now = () => Date.parse(iso); try { await fn(); } finally { Date.now = real; } };
 
+const GESTORA_TEL = "5218100000009";
+const gestoraDice = (body) => ({
+  "/gestoras": [{ nombre: "Gestora A", email: "gestora@example.com", activo: true, telefono: GESTORA_TEL, whatsapp_chat_ids: ["120363420531947860@g.us"] }],
+  "/whatsapp_messages": [{ conversation_id: "cv-g", media_url: null, body, sender_phone: GESTORA_TEL }],
+});
 const TRAMITE = { id: T1, project_id: P1, tipo: "primary_bidireccional_dd11", stage: "en_seguimiento_cfe", numero_si: "SI-OLD", fecha_ingreso: "2026-10-01", type_data: {} };
 
 test("fix 7: a tool in trami_tools_live runs while the global mode is shadow; the rest stays shadow", async () => {
@@ -59,7 +64,7 @@ test("fix 7: a tool in trami_tools_live runs while the global mode is shadow; th
     "/projects": [{ id: P1, efu: "EFU-1", owner_id: null }],
   });
   registerTramiteTools(h.server, h.deps);
-  const live = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { numero_si: "SI-NEW" } });
+  const live = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "en revisión" } });
   assert.match(txt(live), /actualizado/);
   assert.ok(h.writes.some((w) => w.method === "PATCH" && w.path.startsWith("/project_tramites")), "the live tool PATCHed");
   assert.equal(shadowRows(h.writes)[0].body.modo, "vivo");
@@ -73,7 +78,7 @@ test("fix 7: unreadable or bad trami_tools_live = everything shadow", async () =
   resetModeCache();
   const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }, { config_key: "trami_tools_live", config_value: "not json" }], "/project_tramites": [TRAMITE] });
   registerTramiteTools(h.server, h.deps);
-  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { numero_si: "X" } })), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "X" } })), /^\(sombra\)/);
 });
 
 test("fix 6: fueraDeHorario follows Monterrey 08:00-19:00", () => {
@@ -101,11 +106,11 @@ test("fix 6: a shadow WhatsApp without own channel, or over 20/h, is refused; a 
   assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "5218100000000", text: "hola" })), /sesión de WhatsApp propia/);
 
   resetModeCache();
-  h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [] });
+  h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [], "/gestoras": [{ nombre: "Gestora A", activo: true, whatsapp_chat_ids: ["120363420531947860@g.us"] }] });
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => String(url).includes("/whatsapp_messages") ? new Response("[]", { headers: { "content-range": "0-0/20" } }) : realFetch(url, init);
   registerTramiteTools(h.server, h.deps);
-  assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "5218100000000", text: "Gracias Ana, lo recibimos." })), /Tope alcanzado: 20/);
+  assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: "120363420531947860@g.us", text: "hola" })), /Tope alcanzado: 20/);
 
   resetModeCache();
   h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }], "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [], "/gestoras": [{ nombre: "Gestora A", activo: true, whatsapp_chat_ids: ["120363420531947860@g.us"] }] });
@@ -128,13 +133,13 @@ test("fix 6: a shadow mail draft to a non-allowed address is refused", async () 
 
 test("fix 3: re-ingreso goes back with motivo and archives the previous SI; plain update still forward-only", async () => {
   resetModeCache();
-  const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "live" }], "/project_tramites": [TRAMITE] });
+  const h = harness({ "/system_config": [{ config_key: "trami_mode", config_value: "live" }], "/project_tramites": [TRAMITE], ...gestoraDice("Reingresado, nuevo SI-NEW") });
   registerTramiteTools(h.server, h.deps);
   assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { stage: "folio_ingresado" } })), /nunca se mueve hacia atrás.*reingreso=true/);
   assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { stage: "folio_ingresado" }, reingreso: true })), /necesita motivo/);
   assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { stage: "expediente_integracion" }, reingreso: true, motivo: "CFE canceló la orden" })), /no regresa a expediente_integracion/);
 
-  const ok = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { stage: "folio_ingresado", numero_si: "SI-NEW", fecha_ingreso: "2026-11-20" }, reingreso: true, motivo: "Iris: cancelaron la orden, reingresado" });
+  const ok = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { stage: "folio_ingresado", numero_si: "SI-NEW", fecha_ingreso: "2026-11-20" }, reingreso: true, motivo: "Iris: cancelaron la orden, reingresado", evidencia: { wa_message_id: "WA-G" } });
   assert.match(txt(ok), /actualizado/);
   const patch = h.writes.find((w) => w.method === "PATCH" && w.path.startsWith("/project_tramites")).body;
   assert.equal(patch.stage, "folio_ingresado");
@@ -313,9 +318,9 @@ for (const [n, ok] of [[0, false], [6, false], [7, true]]) {
     else { assert.equal(r.isError, true); assert.match(txt(r), /anticipo se pagó el 2026-11-13.*desde el 2026-11-20.*nota en el timeline/); }
   }));
   test(`espera: enviado=true / documentacion_con_gestor on day ${n} is ${ok ? "allowed" : "refused"}`, atUtc(DIA(n), async () => {
-    const h = esperaHarness();
+    const h = esperaHarness({ extra: gestoraDice("Ingresado SI261118DA76F1EE") });
     for (const patch of [{ enviado: true }, { stage: "documentacion_con_gestor" }, { stage: "folio_ingresado", numero_si: "SI261118DA76F1EE" }]) {
-      const r = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch });
+      const r = await h.tools.futurerp_tramite_update({ tramite_id: T1, patch, evidencia: { wa_message_id: "WA-G" } });
       if (ok) assert.match(txt(r), /^\(sombra\)/, JSON.stringify(patch));
       else assert.match(txt(r), /desde el 2026-11-20/, JSON.stringify(patch));
     }
@@ -350,7 +355,7 @@ test("espera: other zones, other tipos, other emails and other fields are unaffe
   const cnMail = esperaHarness({ tramite: { tipo: "cambio_nombre" } });
   assert.match(txt(await draft(cnMail, "Trámite nuevo – cambio de nombre – DD11 – Cliente")), /^\(sombra\)/);
   assert.match(txt(await draft(cnMail, "Seguimiento SI-123")), /^\(sombra\)/);
-  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { numero_si: "SI-1" } })), /^\(sombra\)/);
+  assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T1, patch: { ultimo_estatus_cfe: "en revisión" } })), /^\(sombra\)/);
   const cn = esperaHarness({ tramite: { tipo: "cambio_nombre", stage: "pendiente" } });
   assert.match(txt(await cn.tools.futurerp_tramite_update({ tramite_id: T1, patch: { enviado: true } })), /^\(sombra\)/);
 }));
@@ -424,12 +429,15 @@ const GRUPO = "120363420531947860@g.us";
 const CLIENTE = "528100000001"; // G18's chat, phone replaced
 const INTRO = "Soy la asistente de tramitología de Future Energy, te estaré enviando actualizaciones de tus trámites con CFE.";
 const INGRESO = (nombre, extra = "") => `Hola ${nombre}, buen día.${extra} Te informamos que tu trámite ya fue ingresado y está en proceso interno con CFE. *N° de Seguimiento*: SI2608060791002. *Fecha de ingreso*: 6 de agosto. Normalmente CFE tarda de 2 a 4 meses; te vamos avisando.`;
+const CLIENTE_DB = { first_name: "Nombre", last_name: "Cliente", mobile_phone: CLIENTE, phone: null };
 function waHarness() {
   resetModeCache();
   const h = harness({
     "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }],
     "/whatsapp_channels": [{ id: "ch1" }], "/whatsapp_conversations": [{ id: "c1" }], "/clients": [],
-    "/gestoras": [{ nombre: "Gestora A", activo: true, whatsapp_chat_ids: [GRUPO] }],
+    "/gestoras": [{ nombre: "Gestora A", activo: true, telefono: GESTORA_TEL, whatsapp_chat_ids: [GRUPO] }],
+    "/project_tramites": [{ ...TRAMITE, numero_si: "SI2608060791002" }],
+    "/projects": [{ id: P1, razon_social: null, clients: CLIENTE_DB }],
   });
   registerTramiteTools(h.server, h.deps);
   return h;
@@ -452,11 +460,25 @@ test("G18: the exact off-template client message is refused and points to tramit
   const h = waHarness();
   // G18's text, client name replaced: introduction + template 2 + an invented sentence about the oficio.
   const g18 = "Hola Nombre Cliente, buen día. Soy la asistente de tramitología de Future Energy, te estaré enviando actualizaciones de tus trámites con CFE. Te informamos que tu trámite ya fue ingresado y está en proceso con CFE. *N° de Seguimiento*: SI2608060791002. *Fecha de ingreso*: 6 de agosto. Hoy CFE emitió el oficio de resolución y estamos atendiendo el siguiente paso (la inspección). Normalmente CFE tarda de 2 a 4 meses; te vamos avisando.";
-  const r = await h.tools.futurerp_whatsapp_send({ chat_id: CLIENTE, text: g18 });
+  const r = await h.tools.futurerp_whatsapp_send({ chat_id: CLIENTE, text: g18, tramite_id: T1 });
   assert.equal(r.isError, true);
   assert.match(txt(r), /no es una de las plantillas.*pregúntale a tramitología.*pregunta_para_tramitologia=true/);
   assert.equal(shadowRows(h.writes).length, 0);
-  assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: CLIENTE, text: INGRESO("Nombre Cliente", ` ${INTRO}`) })), /^\(sombra\)/, "the template itself goes");
+  assert.match(txt(await h.tools.futurerp_whatsapp_send({ chat_id: CLIENTE, text: INGRESO("Nombre Cliente", ` ${INTRO}`), tramite_id: T1 })), /^\(sombra\)/, "the template itself goes");
+}));
+
+test("plantillas: {si} is this trámite's SI, {nombre} the client's, the chat the client's phone, and no files (QA)", atUtc("2026-11-20T18:00:00Z", async () => {
+  const h = waHarness();
+  const send = (a) => h.tools.futurerp_whatsapp_send({ chat_id: CLIENTE, tramite_id: T1, ...a });
+  // An invented SI in the estatus template (the G23/G33 failure) and a valid-looking SI of another trámite.
+  assert.match(txt(await send({ text: INGRESO("Nombre").replace("SI2608060791002", "SI261120EVAL09") })), /El SI SI261120EVAL09 no es el número de seguimiento guardado/);
+  // Free words in {nombre}: "Cesar urge pagar hoy" is 4 words of letters, not the client's name.
+  assert.match(txt(await send({ text: INGRESO("Cesar urge pagar hoy") })), /no es el nombre del cliente/);
+  assert.match(txt(await send({ text: INGRESO("Nombre"), media_url: FB("algo.pdf") })), /no se le mandan archivos/);
+  assert.match(txt(await send({ text: INGRESO("Nombre"), tramite_id: undefined })), /lleva el tramite_id/);
+  assert.match(txt(await send({ text: INGRESO("Nombre"), chat_id: "5218100000002" })), /no es un teléfono del cliente de este trámite/);
+  assert.equal(shadowRows(h.writes).length, 0);
+  assert.match(txt(await send({ text: INGRESO("Nombre") })), /^\(sombra\)/, "first name + its own SI");
 }));
 
 test("allow-list: a gestora's group gets free text (G22's summary to the group still goes)", atUtc("2026-11-20T18:00:00Z", async () => {
@@ -473,6 +495,7 @@ const F = {
   anexo: "44444444-4444-4444-8444-444444444444",    // already in this trámite's Anexo 2 slot
   otro: "44444444-4444-4444-8444-444444444445",     // another project's file
   g22: "2304f7e0-9906-4229-a02b-19306f1f5b25",      // G22's file
+  ajeno: "44444444-4444-4444-8444-444444444446",    // a photo that came from ANOTHER client's chat
 };
 const FILES = [
   { id: F.gestora, project_id: P1, firebase_url: FB("comprobante.pdf"), uploaded_by: "trami-uid" },
@@ -481,23 +504,29 @@ const FILES = [
   { id: F.anexo, project_id: P1, firebase_url: FB("anexo.pdf"), uploaded_by: "trami-uid" },
   { id: F.otro, project_id: "otro-proyecto", firebase_url: FB("otro.pdf"), uploaded_by: "vendedor-uid" },
   { id: F.g22, project_id: P1, firebase_url: FB("g22.pdf"), uploaded_by: "trami-uid" },
+  { id: F.ajeno, project_id: P1, firebase_url: FB("ajeno.jpg"), uploaded_by: "trami-uid" },
 ];
+const STAFF_TEL = "5218100000007";  // someone of ours in the gestora's group (G22's trigger was Ana Karen's question)
 const MSGS = [
-  { wa: "WA-GESTORA", cv: "cv-g", media: FB("comprobante.pdf") },
-  { wa: "WA-CLIENTE", cv: "cv-c", media: FB("medidor.jpg") },
+  { wa: "WA-GESTORA", cv: "cv-g", sender: GESTORA_TEL, media: FB("comprobante.pdf"), body: "Ingresado Nombre Cliente, SI261120AAAA0001" },
+  { wa: "WA-GESTORA-OTRO", cv: "cv-g", sender: GESTORA_TEL, media: null, body: "Ingresado Pedro Otro Persona, SI261120ZZZZ0009" },
+  { wa: "WA-STAFF", cv: "cv-g", sender: STAFF_TEL, media: FB("staff.pdf"), body: "¿Ya quedó ingresado Nombre Cliente? Su SI es SI261120AAAA0001" },
+  { wa: "WA-CLIENTE", cv: "cv-c", sender: null, media: FB("medidor.jpg"), body: "" },
+  { wa: "WA-AJENO", cv: "cv-x", sender: null, media: FB("ajeno.jpg"), body: "" },
 ];
 function etapaHarness(tramite = {}) {
   resetModeCache();
   const h = harness({
     "/system_config": [{ config_key: "trami_mode", config_value: "shadow" }],
     "/project_tramites": [{ ...TRAMITE, id: T2, stage: "documentacion_con_gestor", numero_si: "SI261118DA76F1EE", fecha_ingreso: "2026-11-18", enviado: true, ...tramite }],
-    "/gestoras": [{ nombre: "Gestora A", activo: true, whatsapp_chat_ids: [GRUPO] }],
+    "/gestoras": [{ nombre: "Gestora A", activo: true, telefono: GESTORA_TEL, whatsapp_chat_ids: [GRUPO] }],
+    "/projects": [{ id: P1, razon_social: null, clients: CLIENTE_DB }],
     "/whatsapp_messages": (p) => {
       if (!p.includes("direction=eq.inbound")) return [];
-      const m = MSGS.find((x) => p.includes(`wa_message_id=eq.${x.wa}`) || p.includes(`media_url=eq.${encodeURIComponent(x.media)}`));
-      return m ? [{ conversation_id: m.cv, media_url: m.media }] : [];
+      return MSGS.filter((x) => p.includes(`wa_message_id=eq.${x.wa}&`) || (x.media && p.includes(`media_url=eq.${encodeURIComponent(x.media)}`)))
+        .map((m) => ({ conversation_id: m.cv, media_url: m.media, body: m.body, sender_phone: m.sender }));
     },
-    "/whatsapp_conversations": (p) => [{ chat_id: p.includes("cv-g") ? GRUPO : `${CLIENTE}@c.us` }],
+    "/whatsapp_conversations": (p) => [{ chat_id: p.includes("cv-g") ? GRUPO : p.includes("cv-x") ? "5218100000002@c.us" : `${CLIENTE}@c.us` }],
     "/project_files": (p) => FILES.filter((f) => p.includes(f.id)),
     "/tramite_file_links": (p) => p.includes(F.anexo) ? [{ tramite_id: T2, doc_key: "Anexo 2" }] : [],
   });
@@ -509,7 +538,7 @@ test("G22: the exact stage move without evidence is refused and becomes a questi
   const h = etapaHarness();
   const r = await h.tools.futurerp_tramite_update({ tramite_id: T2, patch: { stage: "en_seguimiento_cfe" }, motivo: "La gestora mandó el comprobante de ingreso con SI SI261118DA76F1EE (18/11); el trámite ya tenía SI y fecha de ingreso pero seguía en documentacion_con_gestor." });
   assert.equal(r.isError, true);
-  assert.match(txt(r), /necesita evidencia: el numero_si nuevo.*pregúntale a tramitología/);
+  assert.match(txt(r), /necesita evidencia: .*mandó la gestora \(desde su número.*pregúntale a tramitología/);
   assert.equal(shadowRows(h.writes).length, 0);
   // Re-sending the SI it already had is not a new SI.
   assert.equal((await h.tools.futurerp_tramite_update({ tramite_id: T2, patch: { stage: "en_seguimiento_cfe", numero_si: "SI261118DA76F1EE" } })).isError, true);
@@ -518,8 +547,13 @@ test("G22: the exact stage move without evidence is refused and becomes a questi
 test("evidencia: a new SI, the gestora's message or file, or the comprobante in Anexo 2 moves the stage; nothing else does", async () => {
   const mueve = (extra) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch: { stage: "en_seguimiento_cfe", ...(extra.patch ?? {}) }, evidencia: extra.evidencia });
   for (const [why, extra, ok] of [
-    ["new SI in the patch", { patch: { numero_si: "SI261120AAAA0001" } }, true],
-    ["gestora's inbound message", { evidencia: { wa_message_id: "WA-GESTORA" } }, true],
+    ["a new SI written in her message", { patch: { numero_si: "SI261120AAAA0001" }, evidencia: { wa_message_id: "WA-GESTORA" } }, true],
+    ["a new SI written in the message that carried her file", { patch: { numero_si: "SI261120AAAA0001" }, evidencia: { file_id: F.gestora } }, true],
+    ["an invented SI, no evidence", { patch: { numero_si: "SI261120AAAA0001" } }, false],
+    ["an SI that is not in her message", { patch: { numero_si: "SI261120BBBB0002" }, evidencia: { wa_message_id: "WA-GESTORA" } }, false],
+    ["gestora's message naming this client", { evidencia: { wa_message_id: "WA-GESTORA" } }, true],
+    ["gestora's message about another client", { evidencia: { wa_message_id: "WA-GESTORA-OTRO" } }, false],
+    ["Ana Karen's question in the gestora's group (G22's trigger)", { evidencia: { wa_message_id: "WA-STAFF" } }, false],
     ["file the gestora sent", { evidencia: { file_id: F.gestora } }, true],
     ["file already in this trámite's Anexo 2", { evidencia: { file_id: F.anexo } }, true],
     ["our own (outbound) message", { evidencia: { wa_message_id: "WA-NUESTRO" } }, false],
@@ -540,7 +574,14 @@ test("evidencia: a new SI, the gestora's message or file, or the comprobante in 
   assert.match(txt(await medidor(undefined)), /necesita evidencia: evidencia.file_id de la foto/);
   assert.match(txt(await medidor({ wa_message_id: "WA-CLIENTE" })), /necesita evidencia/, "a client message without the photo as file");
   assert.match(txt(await medidor({ file_id: F.otro })), /necesita evidencia/);
-  // Not stage changes: no evidence needed.
+  assert.match(txt(await medidor({ file_id: F.ajeno })), /necesita evidencia/, "a photo from another client's chat");
+  // An SI alone (no stage) needs the same evidence; an SI not in it is refused by name.
+  const si = (patch, evidencia) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch, evidencia });
+  assert.match(txt(await si({ numero_si: "SI261120BBBB0002" })), /Poner el numero_si SI261120BBBB0002 necesita evidencia/);
+  assert.match(txt(await si({ numero_si: "SI261120BBBB0002" }, { wa_message_id: "WA-GESTORA" })), /tiene que venir escrito en el mensaje de la gestora/);
+  assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-STAFF" })), /necesita evidencia/, "staff wrote the SI, not the gestora");
+  assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
+  // Not stage or SI changes: no evidence needed.
   const h = etapaHarness();
   assert.match(txt(await h.tools.futurerp_tramite_update({ tramite_id: T2, patch: { ultimo_estatus_cfe: "en revisión" } })), /^\(sombra\)/);
   const h2 = etapaHarness({ stage: "expediente_integracion", enviado: false, tipo: "cambio_nombre" });
@@ -560,6 +601,9 @@ test("link_file: G22's exact call is refused; only a file from the triggering me
   // A client's attachment registered by url: needs its message.
   assert.match(txt(await link({ url: FB("medidor.jpg"), name: "medidor.jpg", doc_key: "Imagenes Instalacion", evidencia: { wa_message_id: "WA-CLIENTE" } })), /^\(sombra\)/);
   assert.match(txt(await link({ url: FB("medidor.jpg"), name: "medidor.jpg", doc_key: "Imagenes Instalacion" })), no);
+  // Same, from another client's chat, or a staff member's PDF in her group: not this trámite's (QA (h)).
+  assert.match(txt(await link({ url: FB("ajeno.jpg"), name: "ajeno.jpg", doc_key: "Imagenes Instalacion", evidencia: { wa_message_id: "WA-AJENO" } })), no);
+  assert.match(txt(await link({ url: FB("staff.pdf"), name: "staff.pdf", doc_key: "Anexo 2", evidencia: { wa_message_id: "WA-STAFF" } })), no);
   // A salesperson's upload into the bidireccional's own document list (expediente flow): yes; into Anexo 2: no.
   assert.match(txt(await link({ file_id: F.persona, doc_key: "Recibo CFE" })), /^\(sombra\)/);
   assert.match(txt(await link({ file_id: F.persona, doc_key: "Anexo 2" })), no);

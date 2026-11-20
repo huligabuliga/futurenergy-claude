@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { guardedTool, setShadowCheck } from "./guard.js";
 import { esperaAnticipo } from "./espera.js";
-import { plantillaDe, listaPlantillas } from "./plantillas.js";
+import { leerPlantilla, listaPlantillas } from "./plantillas.js";
 
 export interface TramiteDeps {
   userId: string;
@@ -193,24 +193,58 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     return marca ? esperaAnticipo(sbApi, serviceHeaders(), cur.project_id) : null;
   }
   // ── Provenance: a file "came" in a WhatsApp message when its firebase_url is that inbound message's media_url ──
-  async function chatEsDeGestora(conversationId: string): Promise<boolean> {
-    const c = (await sbApi(`/whatsapp_conversations?id=eq.${conversationId}&select=chat_id&limit=1`, serviceHeaders()))?.[0];
-    return !!c && (await gestorasDe(String(c.chat_id ?? ""))).some((g) => g.activo);
+  const d10 = (x: unknown) => String(x ?? "").replace(/\D/g, "").slice(-10);
+  const plano = (s: unknown) => String(s ?? "").normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+  /**
+   * Who sent an inbound message, by phone: sender_phone (groups), or the chat itself for a 1:1.
+   * A group message with no sender_phone has no known sender, so it is nobody's evidence.
+   */
+  async function leerMensajes(filtro: string): Promise<{ media_url: string | null; body: string; sender: string; deGestora: boolean }[]> {
+    const rows: any[] = (await sbApi(`/whatsapp_messages?${filtro}&direction=eq.inbound&select=conversation_id,media_url,body,sender_phone&limit=20`, serviceHeaders())) ?? [];
+    if (!rows.length) return [];
+    const tels = new Set(((await sbApi(`/gestoras?activo=is.true&select=telefono,activo`, serviceHeaders())) ?? []).filter((g: any) => g.activo).map((g: any) => d10(g.telefono)).filter((t: string) => t.length === 10));
+    const out = [];
+    for (const m of rows) {
+      let sender = d10(m.sender_phone);
+      if (!sender) {
+        const c = (await sbApi(`/whatsapp_conversations?id=eq.${m.conversation_id}&select=chat_id&limit=1`, serviceHeaders()))?.[0];
+        sender = String(c?.chat_id ?? "").endsWith("@c.us") ? d10(c.chat_id) : "";
+      }
+      out.push({ media_url: m.media_url ?? null, body: String(m.body ?? ""), sender, deGestora: sender.length === 10 && tels.has(sender) });
+    }
+    return out;
   }
-  /** An inbound message by wa_message_id: its media and whether an active gestora sent it. */
-  async function mensaje(waId: string): Promise<{ media_url: string | null; deGestora: boolean } | null> {
-    const m = (await sbApi(`/whatsapp_messages?wa_message_id=eq.${encodeURIComponent(waId)}&direction=eq.inbound&select=conversation_id,media_url&limit=1`, serviceHeaders()))?.[0];
-    return m ? { media_url: m.media_url ?? null, deGestora: await chatEsDeGestora(m.conversation_id) } : null;
-  }
-  /** A project file plus where it came from (any inbound WhatsApp message / an active gestora's). */
+  const mensaje = async (waId: string) => (await leerMensajes(`wa_message_id=eq.${encodeURIComponent(waId)}`))[0] ?? null;
+  /** A project file plus the inbound messages that carried it. */
   async function archivo(fileId: string): Promise<any | null> {
     if (!uuidRx.test(fileId)) return null;
     const f = (await sbApi(`/project_files?id=eq.${fileId}&select=id,project_id,firebase_url,uploaded_by&limit=1`, serviceHeaders()))?.[0];
     if (!f) return null;
-    const msgs: any[] = f.firebase_url ? ((await sbApi(`/whatsapp_messages?media_url=eq.${encodeURIComponent(f.firebase_url)}&direction=eq.inbound&select=conversation_id&limit=20`, serviceHeaders())) ?? []) : [];
-    let deGestora = false;
-    for (const m of msgs) if (await chatEsDeGestora(m.conversation_id)) { deGestora = true; break; }
-    return { ...f, porWhatsapp: msgs.length > 0, deGestora, dePersona: !!f.uploaded_by && f.uploaded_by !== userId };
+    const msgs = f.firebase_url ? await leerMensajes(`media_url=eq.${encodeURIComponent(f.firebase_url)}`) : [];
+    return { ...f, msgs, dePersona: !!f.uploaded_by && f.uploaded_by !== userId };
+  }
+  /** The project's client: the names a gestora may write (client, razón social) and the client's phones. */
+  async function clienteDe(projectId: string): Promise<{ nombres: string[]; tels: string[] }> {
+    const p = (await sbApi(`/projects?id=eq.${projectId}&select=razon_social,clients(first_name,last_name,name,phone,mobile_phone)&limit=1`, serviceHeaders()))?.[0];
+    const c = p?.clients ?? {};
+    return {
+      nombres: [[c.first_name, c.last_name].filter(Boolean).join(" "), c.name, p?.razon_social].filter(Boolean),
+      tels: [c.mobile_phone, c.phone].map(d10).filter((t) => t.length === 10),
+    };
+  }
+  const sinEspacios = (s: unknown) => String(s ?? "").replace(/\s+/g, "").toUpperCase();
+  const traeSi = (texto: string, si: string | null | undefined) => !!si && sinEspacios(texto).includes(sinEspacios(si));
+  /**
+   * A text names this trámite when it carries one of its SIs, or two words of the client's name
+   * (the whole name if it has one word); gestoras write the name as on the recibo, one word may differ.
+   */
+  function nombraTramite(texto: string, nombres: string[], sis: (string | null | undefined)[]): boolean {
+    if (sis.some((si) => traeSi(texto, si))) return true;
+    const palabras = new Set(plano(texto).split(/[^a-zñ]+/));
+    return nombres.some((n) => {
+      const w = plano(n).split(/[^a-zñ]+/).filter((x) => x.length >= 3);
+      return w.length > 0 && w.filter((x) => palabras.has(x)).length >= Math.min(2, w.length);
+    });
   }
 
   /**
@@ -225,26 +259,41 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   const SLOTS_DE_ETAPA: Record<string, string[]> = { folio_ingresado: SLOTS_INGRESO, en_seguimiento_cfe: SLOTS_INGRESO, ingresado_cfe: SLOTS_INGRESO, ingresado: SLOTS_INGRESO };
   async function evidenciaCheck(cur: any, patch: { stage?: string; numero_si?: string }, ev?: { wa_message_id?: string; file_id?: string }): Promise<string | null> {
     const etapa = patch.stage;
-    if (etapa === undefined || etapa === cur.stage || ETAPAS_PROPIAS.has(etapa)) return null;
-    if (patch.numero_si && patch.numero_si !== cur.numero_si) return null;
-    if (ev?.wa_message_id && (await mensaje(ev.wa_message_id))?.deGestora) return null;
-    if (ev?.file_id) {
+    const mueve = etapa !== undefined && etapa !== cur.stage && !ETAPAS_PROPIAS.has(etapa);
+    const siNuevo = patch.numero_si && patch.numero_si !== cur.numero_si ? patch.numero_si : null;
+    if (!mueve && !siNuevo) return null;
+    const cli = await clienteDe(cur.project_id);
+    const nombra = (t: string) => nombraTramite(t, cli.nombres, [cur.numero_si, siNuevo]);
+    // valida: the evidence is from the right person AND about this trámite. conSi: the new SI is written in it.
+    let valida = false, conSi = false;
+    if (ev?.wa_message_id) {
+      const m = await mensaje(ev.wa_message_id);
+      if (m?.deGestora && nombra(m.body)) { valida = true; conSi = traeSi(m.body, siNuevo); }
+    }
+    if (!valida && ev?.file_id) {
       const f = await archivo(ev.file_id);
       if (f && f.project_id === cur.project_id) {
-        if (f.deGestora) return null;
-        // ponytail: an installer's upload counts by uploaded_by alone; tie it to a meter slot if that proves too loose.
-        if (ETAPAS_DEL_CLIENTE.has(etapa) && (f.porWhatsapp || f.dePersona)) return null;
-        const slots = SLOTS_DE_ETAPA[etapa];
-        if (slots) {
-          const links: any[] = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
-          if (links.some((l) => slots.includes(l.doc_key))) return null;
+        const links: any[] = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
+        const deElla = f.msgs.filter((m: any) => m.deGestora);
+        if (links.some((l) => SLOTS_INGRESO.includes(l.doc_key)) && (!mueve || SLOTS_DE_ETAPA[etapa!])) {
+          // ponytail: the comprobante was linked from her message; the SI is inside the PDF, not read here.
+          valida = true; conSi = true;
+        } else if (deElla.length && (links.length > 0 || deElla.some((m: any) => nombra(m.body)))) {
+          valida = true; conSi = deElla.some((m: any) => traeSi(m.body, siNuevo));
+        } else if (mueve && ETAPAS_DEL_CLIENTE.has(etapa!) && (f.msgs.some((m: any) => cli.tels.includes(m.sender)) || f.dePersona)) {
+          // ponytail: an installer's upload counts by uploaded_by alone; tie it to a meter slot if that proves too loose.
+          valida = true;
         }
       }
     }
-    const cual = ETAPAS_DEL_CLIENTE.has(etapa)
-      ? "evidencia.file_id de la foto o documento que mandó el cliente o el instalador"
-      : `el numero_si nuevo en el mismo patch, evidencia.wa_message_id de un mensaje que ELLA mandó en su chat, o evidencia.file_id de un archivo que ella mandó${SLOTS_DE_ETAPA[etapa] ? ` o que el trámite ya tiene en ${SLOTS_DE_ETAPA[etapa].join(" / ")}` : ""}`;
-    return `Cambiar la etapa a ${etapa} necesita evidencia: ${cual}. Sin eso no se mueve la etapa: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true), citando por qué crees que ya cambió.`;
+    if (valida && (!siNuevo || conSi)) return null;
+    const que = mueve ? `Cambiar la etapa a ${etapa}` : `Poner el numero_si ${siNuevo}`;
+    const cual = valida
+      ? `el numero_si ${siNuevo} tiene que venir escrito en el mensaje de la gestora que pasas como evidencia (o en el comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
+      : mueve && ETAPAS_DEL_CLIENTE.has(etapa!)
+        ? "evidencia.file_id de la foto o documento que mandó el cliente desde su teléfono, o que subió el instalador al proyecto"
+        : `evidencia.wa_message_id de un mensaje que mandó la gestora (desde su número, no otra persona del grupo) y que nombra a este cliente o su SI, o evidencia.file_id de un archivo que ella mandó para este trámite${SLOTS_DE_ETAPA[etapa ?? ""] || !mueve ? " o del comprobante ya vinculado en Anexo 2 / Comprobante de ingreso" : ""}; un numero_si nuevo tiene que venir escrito en esa evidencia`;
+    return `${que} necesita evidencia: ${cual}. Sin eso no se cambia: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true), citando por qué crees que ya cambió.`;
   }
 
   /**
@@ -261,10 +310,11 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     const u = f?.firebase_url ?? a.url;
     if (a.evidencia?.wa_message_id && u) {
       const m = await mensaje(a.evidencia.wa_message_id);
-      if (m?.media_url && m.media_url === u) return null;
+      // The message carried this very file, and came from an active gestora or this trámite's client.
+      if (m?.media_url && m.media_url === u && (m.deGestora || (await clienteDe(t.project_id)).tels.includes(m.sender))) return null;
     }
     if (f?.dePersona && (BASE_DOCS[t.tipo] ?? []).includes(String(a.doc_key ?? ""))) return null;
-    return `Solo vinculas un archivo que llegó en el mensaje que estás atendiendo (evidencia.wa_message_id de ese mensaje, cuyo adjunto es este archivo) o uno que una persona subió al proyecto para un documento del expediente de este trámite (${(BASE_DOCS[t.tipo] ?? []).join(", ") || "sin lista"}). Si no, no lo vincules: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true).`;
+    return `Solo vinculas un archivo que llegó en el mensaje que estás atendiendo (evidencia.wa_message_id de ese mensaje, cuyo adjunto es este archivo y que mandó la gestora o el cliente de este trámite desde su teléfono) o uno que una persona subió al proyecto para un documento del expediente de este trámite (${(BASE_DOCS[t.tipo] ?? []).join(", ") || "sin lista"}). Si no, no lo vincules: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true).`;
   }
   setShadowCheck(server, "futurerp_tramite_link_file", async (a) => {
     const t = a.tramite_id && uuidRx.test(a.tramite_id) ? (await sbApi(`/project_tramites?id=eq.${a.tramite_id}&select=id,project_id,tipo&limit=1`))?.[0] : null;
@@ -626,7 +676,7 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     if (chat.endsWith("@g.us") && !gestora) return { gestora, error: "Solo escribes a grupos de una gestora activa (public.gestoras.whatsapp_chat_ids)." };
     return { gestora, error: null };
   }
-  async function waCheck({ conversation_id, chat_id, media_url, text: body }: { conversation_id?: string; chat_id?: string; media_url?: string; text?: string }): Promise<{ error: string } | { ch: any; sentLastHour: number }> {
+  async function waCheck({ conversation_id, chat_id, media_url, text: body, tramite_id }: { conversation_id?: string; chat_id?: string; media_url?: string; text?: string; tramite_id?: string }): Promise<{ error: string } | { ch: any; sentLastHour: number }> {
     const hora = fueraDeHorario(Date.now());
     if (hora) return { error: hora };
     if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname)) return { error: "Solo se adjuntan archivos del Storage de Firebase." };
@@ -646,9 +696,22 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
     }
     const dest = await gestoraTargetCheck(target);
     if (dest.error) return { error: dest.error };
-    // A client only ever gets one of the allowed templates (plantillas_cliente.json); gestoras are not restricted.
-    if (!dest.gestora && !plantillaDe(body ?? "")) {
-      return { error: "Ese mensaje no es una de las plantillas para clientes, así que no se manda. A un cliente sólo van las plantillas de la descripción de futurerp_whatsapp_send, con cada hueco lleno y sin agregar nada. Si el caso pide decirle otra cosa, no le escribas: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true) y deja el texto propuesto en la nota." };
+    // A client only ever gets one of the allowed templates (plantillas_cliente.json), filled with THIS
+    // trámite's data, and no files; gestoras are not restricted.
+    if (!dest.gestora) {
+      const pregunta = "Si el caso pide decirle otra cosa, no le escribas: pregúntale a tramitología con futurerp_activity_add (pregunta_para_tramitologia=true) y deja el texto propuesto en la nota.";
+      const p = leerPlantilla(body ?? "");
+      if (!p) return { error: `Ese mensaje no es una de las plantillas para clientes, así que no se manda. A un cliente sólo van las plantillas de la descripción de futurerp_whatsapp_send, con cada hueco lleno y sin agregar nada. ${pregunta}` };
+      if (media_url) return { error: `A un cliente no se le mandan archivos: sólo el texto de la plantilla. ${pregunta}` };
+      const t = tramite_id && uuidRx.test(tramite_id) ? (await sbApi(`/project_tramites?id=eq.${tramite_id}&select=id,project_id,numero_si&limit=1`, serviceHeaders()))?.[0] : null;
+      if (!t) return { error: "Todo mensaje a un cliente lleva el tramite_id del trámite del que le hablas: con él se revisan el nombre y el SI de la plantilla." };
+      const cli = await clienteDe(t.project_id);
+      if (!target.endsWith("@c.us") || !cli.tels.includes(d10(target))) return { error: `Ese chat no es un teléfono del cliente de este trámite (el del proyecto). ${pregunta}` };
+      const malSi = (p.huecos.si ?? []).find((si) => !t.numero_si || sinEspacios(si) !== sinEspacios(t.numero_si));
+      if (malSi) return { error: `El SI ${malSi} no es el número de seguimiento guardado en este trámite (${t.numero_si ?? "sin SI todavía"}): no se manda.` };
+      const delCliente = new Set(cli.nombres.flatMap((n) => plano(n).split(/[^a-zñ]+/)));
+      const malNombre = (p.huecos.nombre ?? []).find((n) => !plano(n).split(/[^a-zñ]+/).filter(Boolean).every((w) => delCliente.has(w)));
+      if (malNombre) return { error: `"${malNombre}" no es el nombre del cliente de este proyecto: en {nombre} va su nombre como está en el ERP. ${pregunta}` };
     }
     // Rate limit: outbound rows on this channel in the last hour.
     const since = new Date(Date.now() - 3600_000).toISOString();
@@ -666,18 +729,19 @@ export function registerTramiteTools(server: McpServer, deps: TramiteDeps) {
   // ── futurerp_whatsapp_send ────────────────────────────────────────────────
   tool(
     "futurerp_whatsapp_send",
-    `Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media, never to an inactive gestora, groups only if they belong to an active gestora. To a CLIENT (any chat that is not an active gestora's) the text must be exactly one of these templates with its huecos filled, nothing added; anything else is refused: ${listaPlantillas()} Messages to gestoras are free text. The message is recorded in the inbox like any outbound.`,
+    `Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media, never to an inactive gestora, groups only if they belong to an active gestora. To a CLIENT (any chat that is not an active gestora's): pass tramite_id; the chat must be a phone of that project's client, no media, and the text exactly one of these templates with {si} = that trámite's numero_si and {nombre} = the client's name in the ERP, nothing added; anything else is refused: ${listaPlantillas()} Messages to gestoras are free text. The message is recorded in the inbox like any outbound.`,
     {
       conversation_id: z.string().uuid().optional(),
       chat_id: z.string().optional().describe("Phone digits (E.164 without +) or a WhatsApp chat id (…@c.us / …@g.us)"),
       text: z.string().min(1).max(4096),
       media_url: z.string().url().optional().describe("Firebase Storage URL (PDF or image)"),
       media_name: z.string().optional().describe("File name shown to the recipient"),
+      tramite_id: z.string().uuid().optional().describe("Required for a client: the trámite you are telling them about ({si} and {nombre} are checked against it)"),
     },
-    async ({ conversation_id, chat_id, text: body, media_url, media_name }) => {
+    async ({ conversation_id, chat_id, text: body, media_url, media_name, tramite_id }) => {
       try {
         if (!OPENWA_API_URL || !OPENWA_API_KEY) return fail("El gateway de WhatsApp no está configurado en el MCP (OPENWA_API_URL / OPENWA_API_KEY).");
-        const chk = await waCheck({ conversation_id, chat_id, media_url, text: body });
+        const chk = await waCheck({ conversation_id, chat_id, media_url, text: body, tramite_id });
         if ("error" in chk) return fail(chk.error);
         const { ch, sentLastHour } = chk;
 
