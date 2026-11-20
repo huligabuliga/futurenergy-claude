@@ -18,7 +18,7 @@
 import { createSign, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { guardedTool } from "./guard.js";
+import { guardedTool, setShadowCheck } from "./guard.js";
 
 export interface MailDeps {
   userId: string;
@@ -188,6 +188,31 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
     },
   );
 
+  /** Allowlist + attachment ownership; also run in shadow (guard.shadowChecks). */
+  async function mailCheck({ to, project_id, attachment_file_ids }: { to: string; project_id?: string; attachment_file_ids?: string[] }): Promise<{ error: string } | { addr: string; project: any }> {
+    let addr: string;
+    try { addr = assertSafeAddress(to, "To").toLowerCase(); } catch (e: any) { return { error: e.message }; }
+    const domain = addr.split("@")[1] ?? "";
+    const gestoras: any[] = await sbApi(`/gestoras?select=email&activo=eq.true`).catch(() => []);
+    let project: any = null;
+    if (project_id) {
+      const col = uuidRx.test(project_id) ? "id" : "efu";
+      project = (await sbApi(`/projects?${col}=eq.${encodeURIComponent(project_id)}&select=id,efu,email_facturacion,client_id,clients(email)&limit=1`))?.[0] ?? null;
+      if (!project) return { error: `No existe el proyecto ${project_id} (o no tienes acceso).` };
+    }
+    const clientEmails = project ? [project.email_facturacion, project.clients?.email].filter(Boolean).map((e: string) => e.toLowerCase()) : [];
+    const allowed = domain === "cfe.mx" || gestoras.some((g) => String(g.email ?? "").toLowerCase() === addr) || clientEmails.includes(addr);
+    if (!allowed) return { error: `Destinatario no permitido: ${addr}. Solo gestoras registradas, @cfe.mx o el correo del cliente del proyecto indicado.` };
+    for (const fid of attachment_file_ids ?? []) {
+      const f = (await sbApi(`/project_files?id=eq.${fid}&select=id,project_id,firebase_url&limit=1`))?.[0];
+      if (!f) return { error: `Archivo ${fid} no existe o no tienes acceso.` };
+      if (project && f.project_id !== project.id) return { error: `El archivo ${fid} no pertenece al proyecto ${project.efu ?? project.id}.` };
+      if (!FIREBASE_HOSTS.includes(new URL(f.firebase_url).hostname)) return { error: `El archivo ${fid} no está en Firebase Storage.` };
+    }
+    return { addr, project };
+  }
+  setShadowCheck(server, "futurerp_mail_draft", async (a) => { const r = await mailCheck(a); return "error" in r ? r.error : null; });
+
   tool(
     "futurerp_mail_draft",
     "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.",
@@ -200,18 +225,9 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
     },
     async ({ to, subject, text: bodyText, project_id, attachment_file_ids }) => {
       try {
-        const addr = assertSafeAddress(to, "To").toLowerCase();
-        const domain = addr.split("@")[1] ?? "";
-        const gestoras: any[] = await sbApi(`/gestoras?select=email&activo=eq.true`).catch(() => []);
-        let project: any = null;
-        if (project_id) {
-          const col = uuidRx.test(project_id) ? "id" : "efu";
-          project = (await sbApi(`/projects?${col}=eq.${encodeURIComponent(project_id)}&select=id,efu,email_facturacion,client_id,clients(email)&limit=1`))?.[0] ?? null;
-          if (!project) return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-        }
-        const clientEmails = project ? [project.email_facturacion, project.clients?.email].filter(Boolean).map((e: string) => e.toLowerCase()) : [];
-        const allowed = domain === "cfe.mx" || gestoras.some((g) => String(g.email ?? "").toLowerCase() === addr) || clientEmails.includes(addr);
-        if (!allowed) return fail(`Destinatario no permitido: ${addr}. Solo gestoras registradas, @cfe.mx o el correo del cliente del proyecto indicado.`);
+        const chk = await mailCheck({ to, project_id, attachment_file_ids });
+        if ("error" in chk) return fail(chk.error);
+        const { addr, project } = chk;
 
         const attachments: { filename: string; mimeType: string; bytes: Buffer }[] = [];
         for (const fid of attachment_file_ids ?? []) {

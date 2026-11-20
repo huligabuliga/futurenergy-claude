@@ -12,6 +12,11 @@ const EXPEDIENTE_SLOTS = new Set([
 ]);
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 const tel = (s) => (s ? s.replace(/[^\d+]/g, "") : null);
+const d10 = (s) => String(s ?? "").replace(/\D/g, "").slice(-10);
+/** Files outside every slot and not linked to a trámite: the expediente may be hiding in them. */
+export function sinSlot(files, slotOf, linked) {
+    return (files ?? []).filter((f) => !linked.has(f.id) && !EXPEDIENTE_SLOTS.has(slotOf(f.document_id ?? null)));
+}
 export function registerContextoTool(server, deps) {
     server.tool("futurerp_tramite_contexto", "Start here for any trámite work on a project: one call returns the project (zona, tarifa, stage, required labels, vetoes, RFC, address, Maps link), the client (name, phones, email), every trámite with its fields, the expediente slots with their files (ids for futurerp_read_document / mail attachments; files attached from the trámite card included), the BOM (panels, micros, kW), active bloqueos and the last timeline notes. Accepts an EFU or a uuid.", { project_id: z.string().describe("Project uuid or EFU code") }, async ({ project_id }) => {
         try {
@@ -33,6 +38,25 @@ export function registerContextoTool(server, deps) {
             const linkRows = tramIds.length ? await deps.sbApi(`/tramite_file_links?select=tramite_id,doc_key,project_files(id,file_name,mime_type,file_size)&tramite_id=in.(${tramIds.join(",")})`) : links;
             const c = p.clients ?? {};
             const cliente = { nombre: [c.first_name, c.last_name].filter(Boolean).join(" ") || c.name || null, celular: tel(c.mobile_phone), telefono: tel(c.phone), email: c.email ?? p.email_facturacion ?? null };
+            // Trami's own WhatsApp to this client (its channel, the client's phones): tells
+            // avisar-cliente whether the introduction was already sent and what was said last.
+            let waTrami = "nunca le ha escrito (el primer mensaje lleva la presentación)";
+            try {
+                const phones = [cliente.celular, cliente.telefono].map(d10).filter((x) => x.length === 10);
+                const ch = phones.length ? (await deps.sbApi(`/whatsapp_channels?vendor_user_id=eq.${deps.userId}&select=id&limit=1`))?.[0] : null;
+                if (ch) {
+                    const convs = (await deps.sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&is_group=is.false&select=id,chat_id,contact_phone`)) ?? [];
+                    const ids = convs.filter((c) => phones.includes(d10(c.contact_phone ?? c.chat_id))).map((c) => c.id);
+                    if (ids.length) {
+                        const out = (await deps.sbApi(`/whatsapp_messages?conversation_id=in.(${ids.join(",")})&direction=eq.outbound&deleted=is.false&select=body,sent_at&order=sent_at.desc&limit=3`)) ?? [];
+                        if (out.length)
+                            waTrami = `${out.length === 3 ? "3 o más" : out.length} mensaje(s); el último ${String(out[0].sent_at).slice(0, 16).replace("T", " ")} UTC: "${String(out[0].body ?? "").replace(/\s+/g, " ").slice(0, 160)}"`;
+                    }
+                }
+            }
+            catch { /* a missing channel or RLS just means "unknown"; say so */
+                waTrami = "no se pudo leer (trátalo como si nunca le hubieras escrito y pregunta a Flor si dudas)";
+            }
             const requeridos = [...new Set([...(p.tramites_requeridos_manual ?? []), ...(p.tramites_requeridos_vtecnica ?? [])])];
             const lat = p.proyecto_latitude ?? p.instalacion_latitude, lng = p.proyecto_longitude ?? p.instalacion_longitude;
             const direccion = [p.proyecto_street ?? p.instalacion_street, p.proyecto_city ?? p.instalacion_city, p.proyecto_state_code, p.proyecto_postal_code].filter(Boolean).join(", ");
@@ -56,7 +80,8 @@ export function registerContextoTool(server, deps) {
                 if (!arr.some((a) => a.id === l.project_files.id))
                     arr.push({ id: l.project_files.id, nombre: l.project_files.file_name, tipo: l.project_files.mime_type ?? null, kb: Math.round((l.project_files.file_size ?? 0) / 1024) });
             }
-            const otros = (files ?? []).filter((f) => !f.document_id || !EXPEDIENTE_SLOTS.has(nameOf.get(f.document_id))).slice(0, 15).map((f) => `${f.file_name} (${f.id})`);
+            const linked = new Set((linkRows ?? []).map((l) => l.project_files?.id).filter(Boolean));
+            const sueltos = sinSlot(files ?? [], (did) => (did ? nameOf.get(did) : null), linked);
             const paneles = (bom ?? []).filter((b) => b.catalog_items?.category === "Paneles");
             const micros = (bom ?? []).filter((b) => ["Microinversores", "Inversores"].includes(b.catalog_items?.category));
             const kw = paneles.reduce((s, b) => s + Number(b.quantity) * Number(b.catalog_items?.watts_per_unit ?? 0), 0) / 1000;
@@ -65,6 +90,7 @@ export function registerContextoTool(server, deps) {
                 `Etapa: ${p.stage ?? "—"}${p.last_stage_change_date ? ` (desde ${String(p.last_stage_change_date).slice(0, 10)})` : ""} · Zona CFE: ${p.zona_cfe ?? "SIN ZONA"} · Tarifa: ${p.tarifa_cfe ?? "—"} · Tipo: ${p.tipo_proyecto ?? "—"}${p.rfc ? ` · RFC ${p.rfc}${String(p.rfc).length === 12 ? " (persona moral)" : ""}` : ""}${p.razon_social ? ` · ${p.razon_social}` : ""}`,
                 `Anticipo completo: ${p.fecha_anticipo_completo ?? "—"} · Dirección: ${direccion || "—"}${lat && lng ? ` · Maps: https://www.google.com/maps/search/?api=1&query=${lat},${lng}` : ""}`,
                 `Cliente: ${cliente.nombre ?? "—"} · cel ${cliente.celular ?? "—"} · tel ${cliente.telefono ?? "—"} · ${cliente.email ?? "sin email"}`,
+                `WhatsApp de Trami al cliente: ${waTrami}`,
                 `Requeridos (VT + manual): ${requeridos.join(", ") || "ninguno"}${p.tramites_requeridos_vetados?.length ? ` · VETADOS (no volver a poner): ${p.tramites_requeridos_vetados.join(", ")}` : ""}${p.tramites_requeridos_otro ? ` · Otro: "${p.tramites_requeridos_otro}"` : ""}`,
                 "",
                 `## Trámites (${(tramites ?? []).length})`,
@@ -72,7 +98,10 @@ export function registerContextoTool(server, deps) {
                 "",
                 "## Expediente (slot → archivos; usa el id con futurerp_read_document o como adjunto)",
                 ...[...porSlot.entries()].map(([slot, v]) => `- ${slot}${v.requerido ? " (requerido)" : ""}: ${v.archivos.length ? v.archivos.map((a) => `${a.nombre} [${a.id}${a.tipo ? `, ${a.tipo}` : ""}${a.kb ? `, ${a.kb} KB` : ""}]`).join("; ") : "VACÍO"}`),
-                otros.length ? `- Otros archivos del proyecto: ${otros.join(", ")}` : "",
+                "",
+                sueltos.length
+                    ? `## Archivos SIN slot (${sueltos.length}): ábrelos con futurerp_read_document antes de dar un documento por faltante; si es uno del expediente, vincúlalo con futurerp_tramite_link_file\n${sueltos.slice(0, 25).map((f) => `- ${f.file_name} [${f.id}${f.mime_type ? `, ${f.mime_type}` : ""}, subido ${String(f.created_at).slice(0, 10)}${f.document_id && nameOf.get(f.document_id) ? `, slot "${nameOf.get(f.document_id)}"` : ""}]`).join("\n")}${sueltos.length > 25 ? `\n- … y ${sueltos.length - 25} más (futurerp_list_files)` : ""}`
+                    : "## Archivos SIN slot: ninguno",
                 "",
                 `## Equipo (BOM): ${paneles.length ? paneles.map((b) => `${b.quantity} × ${b.catalog_items.name}`).join(", ") : "sin paneles en el BOM"}; ${micros.length ? micros.map((b) => `${b.quantity} × ${b.catalog_items.name}`).join(", ") : "sin microinversores en el BOM"}; ${kw ? `${kw.toFixed(2)} kW, ~${(kw * 5.1).toFixed(1)} kWh/día` : p.potencia_total ? `${(Number(p.potencia_total) / 1000).toFixed(2)} kW (columna del proyecto)` : "potencia desconocida"}${p.paneles_solicitados ? ` · paneles solicitados: ${p.paneles_solicitados}` : ""}`,
                 "",

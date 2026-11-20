@@ -5,29 +5,44 @@ export const SHADOW_TOOLS = new Set([
     "futurerp_bloqueo_open", "futurerp_verification_tick", "futurerp_ticket_create",
     "futurerp_whatsapp_send", "futurerp_mail_draft",
 ]);
-let modeCache = { at: 0, mode: "shadow" };
+let modeCache = { at: 0, mode: "shadow", live: new Set() };
 const MODE_TTL_MS = Number(process.env.TRAMI_MODE_CACHE_MS ?? 30_000);
-export async function tramiMode(deps) {
-    if (Date.now() - modeCache.at < MODE_TTL_MS)
-        return modeCache.mode;
-    try {
-        const rows = await deps.sbApi(`/system_config?config_key=eq.trami_mode&select=config_value`, deps.serviceHeaders());
-        const mode = rows?.[0]?.config_value === "live" ? "live" : "shadow";
-        modeCache = { at: Date.now(), mode };
+/**
+ * 'live' when the global trami_mode is live, or when `tool` was released on its
+ * own (system_config.trami_tools_live, set from the panel's Results tab).
+ */
+export async function tramiMode(deps, tool) {
+    if (Date.now() - modeCache.at >= MODE_TTL_MS) {
+        try {
+            const rows = await deps.sbApi(`/system_config?config_key=in.(trami_mode,trami_tools_live)&select=config_key,config_value`, deps.serviceHeaders());
+            const val = (k) => rows?.find((r) => r.config_key === k)?.config_value;
+            let live = [];
+            try {
+                live = JSON.parse(val("trami_tools_live") || "[]");
+            }
+            catch { /* bad JSON = none released */ }
+            modeCache = { at: Date.now(), mode: val("trami_mode") === "live" ? "live" : "shadow", live: new Set(Array.isArray(live) ? live.map(String) : []) };
+        }
+        catch {
+            // ponytail: unreadable flag = shadow; never fail open into writing.
+            modeCache = { at: Date.now(), mode: "shadow", live: new Set() };
+        }
     }
-    catch {
-        // ponytail: unreadable flag = shadow; never fail open into writing.
-        modeCache = { at: Date.now(), mode: "shadow" };
-    }
-    return modeCache.mode;
+    return modeCache.mode === "live" || (tool !== undefined && modeCache.live.has(tool)) ? "live" : "shadow";
 }
-export const resetModeCache = () => { modeCache = { at: 0, mode: "shadow" }; };
+export const resetModeCache = () => { modeCache = { at: 0, mode: "shadow", live: new Set() }; };
+const shadowChecks = new WeakMap();
+export function setShadowCheck(server, tool, check) {
+    if (!shadowChecks.has(server))
+        shadowChecks.set(server, new Map());
+    shadowChecks.get(server).set(tool, check);
+}
 const short = (v, n = 160) => { const s = typeof v === "string" ? v : JSON.stringify(v); return s.length > n ? s.slice(0, n) + "…" : s; };
 /** One Spanish line per tool, for the shadow table and the Buzón. */
 export function describeCall(name, a) {
     switch (name) {
         case "futurerp_tramite_create": return `Crear trámite ${a.tipo} en ${a.project_id}`;
-        case "futurerp_tramite_update": return `Actualizar trámite ${a.tramite_id}: ${Object.entries(a.patch ?? {}).map(([k, v]) => `${k}=${short(v, 40)}`).join(", ")}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;
+        case "futurerp_tramite_update": return `Actualizar trámite ${a.tramite_id}: ${Object.entries(a.patch ?? {}).map(([k, v]) => `${k}=${short(v, 40)}`).join(", ")}${a.reingreso ? " · RE-INGRESO" : ""}${a.motivo ? ` (${short(a.motivo, 80)})` : ""}`;
         case "futurerp_ticket_create": return `Ticket al vendedor de ${a.project_id}: "${short(a.asunto, 100)}"`;
         case "futurerp_tramite_link_file": return `Adjuntar ${a.file_name ?? a.file_id ?? a.url} al trámite ${a.tramite_id} como ${a.doc_key}`;
         case "futurerp_project_set_zona_cfe": return `Fijar zona ${a.zona} en ${a.project_id}`;
@@ -95,7 +110,7 @@ async function snapshotAntes(deps, name, a) {
                 if (!cur)
                     return null;
                 const keys = Object.keys(a.patch ?? {}).filter((k) => k !== "type_data" && k in cur);
-                if (a.patch?.type_data)
+                if (a.patch?.type_data || a.reingreso)
                     keys.push("type_data");
                 if (a.patch?.enviado === true)
                     keys.push("enviado_at", "enviado_by");
@@ -162,7 +177,12 @@ export async function logToolError(deps, name, args, detalle) {
 export function guardedTool(server, deps) {
     const wrapped = (name, description, schema, handler) => server.tool(name, description, schema, async (args, extra) => {
         try {
-            if (SHADOW_TOOLS.has(name) && (await tramiMode(deps)) === "shadow") {
+            if (SHADOW_TOOLS.has(name) && (await tramiMode(deps, name)) === "shadow") {
+                const why = await shadowChecks.get(server)?.get(name)?.(args ?? {});
+                if (why) {
+                    await logToolError(deps, name, args, `(sombra) ${why}`);
+                    return { content: [{ type: "text", text: why }], isError: true };
+                }
                 const resumen = describeCall(name, args ?? {});
                 const ids = await resolveIds(deps, args ?? {});
                 await fetch(`${deps.restBase}/agent_shadow_calls`, {

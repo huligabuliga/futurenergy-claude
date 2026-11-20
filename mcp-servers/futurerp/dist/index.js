@@ -34,6 +34,7 @@ import { registerMailTools } from "./mail.js";
 import { registerDocumentTools } from "./documents.js";
 import { registerOpsTools } from "./ops.js";
 import { registerContextoTool } from "./contexto.js";
+import { registerHistorialTool } from "./historial.js";
 import { registerWriteTools } from "./writes.js";
 import { registerUploadTools } from "./uploads.js";
 import { registerCatalogTools } from "./catalogo.js";
@@ -2907,7 +2908,8 @@ Before guessing column names, call \`futurerp_describe_table\`. Before guessing 
         });
         registerDocumentTools(server, { userId: auth.extra?.userId ?? "", uuidRx: UUID_RX, restBase: REST_BASE, authHeaders, sbApi });
         registerOpsTools(server, { sbRpc });
-        registerContextoTool(server, { uuidRx: UUID_RX, sbApi });
+        registerContextoTool(server, { userId: auth.extra?.userId ?? "", uuidRx: UUID_RX, sbApi });
+        registerHistorialTool(server, { userId: auth.extra?.userId ?? "", restBase: REST_BASE, sbApi, serviceHeaders });
         registerMailTools(server, {
             userId: auth.extra?.userId ?? "",
             uuidRx: UUID_RX,

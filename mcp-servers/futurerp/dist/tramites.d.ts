@@ -10,4 +10,6 @@ export interface TramiteDeps {
     sbRpc: (name: string, args?: Record<string, any>) => Promise<any>;
 }
 export declare const TRAMITE_STAGES: Record<string, string[]>;
+/** Refusal text when `ms` is outside the 08:00–19:00 Monterrey send window, else null. */
+export declare function fueraDeHorario(ms: number): string | null;
 export declare function registerTramiteTools(server: McpServer, deps: TramiteDeps): void;

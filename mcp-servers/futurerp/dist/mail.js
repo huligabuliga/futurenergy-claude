@@ -17,7 +17,7 @@
  */
 import { createSign, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { guardedTool } from "./guard.js";
+import { guardedTool, setShadowCheck } from "./guard.js";
 const TOKEN_URL = process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com/token";
 const GMAIL_BASE = (process.env.GMAIL_API_BASE ?? "https://gmail.googleapis.com").replace(/\/$/, "");
 const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
@@ -171,6 +171,40 @@ export function registerMailTools(server, deps) {
             return fail(`No se pudo leer el correo: ${e.message}`);
         }
     });
+    /** Allowlist + attachment ownership; also run in shadow (guard.shadowChecks). */
+    async function mailCheck({ to, project_id, attachment_file_ids }) {
+        let addr;
+        try {
+            addr = assertSafeAddress(to, "To").toLowerCase();
+        }
+        catch (e) {
+            return { error: e.message };
+        }
+        const domain = addr.split("@")[1] ?? "";
+        const gestoras = await sbApi(`/gestoras?select=email&activo=eq.true`).catch(() => []);
+        let project = null;
+        if (project_id) {
+            const col = uuidRx.test(project_id) ? "id" : "efu";
+            project = (await sbApi(`/projects?${col}=eq.${encodeURIComponent(project_id)}&select=id,efu,email_facturacion,client_id,clients(email)&limit=1`))?.[0] ?? null;
+            if (!project)
+                return { error: `No existe el proyecto ${project_id} (o no tienes acceso).` };
+        }
+        const clientEmails = project ? [project.email_facturacion, project.clients?.email].filter(Boolean).map((e) => e.toLowerCase()) : [];
+        const allowed = domain === "cfe.mx" || gestoras.some((g) => String(g.email ?? "").toLowerCase() === addr) || clientEmails.includes(addr);
+        if (!allowed)
+            return { error: `Destinatario no permitido: ${addr}. Solo gestoras registradas, @cfe.mx o el correo del cliente del proyecto indicado.` };
+        for (const fid of attachment_file_ids ?? []) {
+            const f = (await sbApi(`/project_files?id=eq.${fid}&select=id,project_id,firebase_url&limit=1`))?.[0];
+            if (!f)
+                return { error: `Archivo ${fid} no existe o no tienes acceso.` };
+            if (project && f.project_id !== project.id)
+                return { error: `El archivo ${fid} no pertenece al proyecto ${project.efu ?? project.id}.` };
+            if (!FIREBASE_HOSTS.includes(new URL(f.firebase_url).hostname))
+                return { error: `El archivo ${fid} no está en Firebase Storage.` };
+        }
+        return { addr, project };
+    }
+    setShadowCheck(server, "futurerp_mail_draft", async (a) => { const r = await mailCheck(a); return "error" in r ? r.error : null; });
     tool("futurerp_mail_draft", "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated.", {
         to: z.string().email(),
         subject: z.string().min(3).max(200),
@@ -179,20 +213,10 @@ export function registerMailTools(server, deps) {
         attachment_file_ids: z.array(z.string().uuid()).max(10).optional().describe("project_files ids to attach"),
     }, async ({ to, subject, text: bodyText, project_id, attachment_file_ids }) => {
         try {
-            const addr = assertSafeAddress(to, "To").toLowerCase();
-            const domain = addr.split("@")[1] ?? "";
-            const gestoras = await sbApi(`/gestoras?select=email&activo=eq.true`).catch(() => []);
-            let project = null;
-            if (project_id) {
-                const col = uuidRx.test(project_id) ? "id" : "efu";
-                project = (await sbApi(`/projects?${col}=eq.${encodeURIComponent(project_id)}&select=id,efu,email_facturacion,client_id,clients(email)&limit=1`))?.[0] ?? null;
-                if (!project)
-                    return fail(`No existe el proyecto ${project_id} (o no tienes acceso).`);
-            }
-            const clientEmails = project ? [project.email_facturacion, project.clients?.email].filter(Boolean).map((e) => e.toLowerCase()) : [];
-            const allowed = domain === "cfe.mx" || gestoras.some((g) => String(g.email ?? "").toLowerCase() === addr) || clientEmails.includes(addr);
-            if (!allowed)
-                return fail(`Destinatario no permitido: ${addr}. Solo gestoras registradas, @cfe.mx o el correo del cliente del proyecto indicado.`);
+            const chk = await mailCheck({ to, project_id, attachment_file_ids });
+            if ("error" in chk)
+                return fail(chk.error);
+            const { addr, project } = chk;
             const attachments = [];
             for (const fid of attachment_file_ids ?? []) {
                 const f = (await sbApi(`/project_files?id=eq.${fid}&select=id,file_name,mime_type,firebase_url,project_id&limit=1`))?.[0];

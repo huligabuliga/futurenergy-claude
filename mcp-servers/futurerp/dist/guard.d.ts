@@ -19,8 +19,21 @@ export interface GuardDeps {
 }
 /** Tools that change the world. Notes (activity_add) and reads are never shadowed. */
 export declare const SHADOW_TOOLS: Set<string>;
-export declare function tramiMode(deps: GuardDeps): Promise<"shadow" | "live">;
+/**
+ * 'live' when the global trami_mode is live, or when `tool` was released on its
+ * own (system_config.trami_tools_live, set from the panel's Results tab).
+ */
+export declare function tramiMode(deps: GuardDeps, tool?: string): Promise<"shadow" | "live">;
 export declare const resetModeCache: () => void;
+/**
+ * Checks a tool must pass even in shadow (send window, rate limit, own channel,
+ * mail allowlist): a shadow call that live would refuse is refused the same way,
+ * so Flor never grades an action that could not have happened.
+ * Return a reason to refuse, or null. Per server: each session's checks read
+ * through that session's token.
+ */
+type ShadowCheck = (args: any) => Promise<string | null>;
+export declare function setShadowCheck(server: McpServer, tool: string, check: ShadowCheck): void;
 /** One Spanish line per tool, for the shadow table and the Buzón. */
 export declare function describeCall(name: string, a: Record<string, any>): string;
 export declare function logToolError(deps: GuardDeps, name: string, args: unknown, detalle: string): Promise<void>;
@@ -30,3 +43,4 @@ export declare function logToolError(deps: GuardDeps, name: string, args: unknow
  * argument types inferred from their zod schema.
  */
 export declare function guardedTool(server: McpServer, deps: GuardDeps): McpServer["tool"];
+export {};

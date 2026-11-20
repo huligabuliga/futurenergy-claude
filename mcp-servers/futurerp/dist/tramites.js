@@ -11,7 +11,7 @@
  * src/types/tramite.ts and src/config/tramiteRequirements.ts. Keep in sync.
  */
 import { z } from "zod";
-import { guardedTool } from "./guard.js";
+import { guardedTool, setShadowCheck } from "./guard.js";
 const OPENWA_API_URL = (process.env.OPENWA_API_URL ?? "").replace(/\/$/, "");
 const OPENWA_API_KEY = process.env.OPENWA_API_KEY ?? "";
 const WA_SENDS_PER_HOUR = 20;
@@ -76,6 +76,11 @@ const UPDATABLE = [
     "ultimo_estatus_cfe", "ultimo_estatus_cfe_at", "ultimo_estatus_cfe_avisado_at",
 ];
 const FIREBASE_HOSTS = ["firebasestorage.googleapis.com", "storage.googleapis.com"];
+/** Refusal text when `ms` is outside the 08:00–19:00 Monterrey send window, else null. */
+export function fueraDeHorario(ms) {
+    const hour = Math.floor(((ms - 6 * 3600_000) % 86_400_000) / 3_600_000);
+    return hour < WA_HOUR_FROM || hour >= WA_HOUR_TO ? `Fuera de horario (${String(hour).padStart(2, "0")}:00 Monterrey). Solo se envía de ${WA_HOUR_FROM}:00 a ${WA_HOUR_TO}:00.` : null;
+}
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 export function registerTramiteTools(server, deps) {
@@ -155,7 +160,7 @@ export function registerTramiteTools(server, deps) {
         }
     });
     // ── futurerp_tramite_update ───────────────────────────────────────────────
-    tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list, unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
+    tool("futurerp_tramite_update", "Update fields of a trámite the way the trámite card does: stage moves only FORWARD along the tipo's stage list (except a re-ingreso: reingreso=true + motivo lets the stage go back, never to the first stage, and keeps the previous numero_si / fecha_ingreso in type_data.ingresos_anteriores), unchanged values are dropped, and every changed field is logged on the project timeline (field_update, old → new). enviado=true also stamps enviado_at/enviado_by. type_data keys are merged, never replaced. Returns what changed; a no-op if nothing differs.", {
         tramite_id: z.string().uuid(),
         patch: z.object({
             stage: z.string().optional(),
@@ -182,7 +187,8 @@ export function registerTramiteTools(server, deps) {
             type_data: z.record(z.string(), z.any()).optional().describe("Keys merged into type_data (e.g. fecha_medidor_instalado, fecha_envio_gestor)"),
         }).describe("Only the fields to change"),
         motivo: z.string().optional().describe("Why (goes into the timeline entries)"),
-    }, async ({ tramite_id, patch, motivo }) => {
+        reingreso: z.boolean().optional().describe("true = CFE cancelled or returned the ingreso and it is filed again: allows a backward stage move (needs motivo) and archives the previous SI and date"),
+    }, async ({ tramite_id, patch, motivo, reingreso }) => {
         try {
             const rows = await sbApi(`/project_tramites?id=eq.${tramite_id}&select=*&limit=1`);
             const cur = rows[0];
@@ -194,8 +200,18 @@ export function registerTramiteTools(server, deps) {
                 const to = stages.indexOf(patch.stage);
                 if (to < 0)
                     return fail(`Etapa inválida para ${cur.tipo}: ${patch.stage}. Válidas: ${stages.join(" → ")}.`);
-                if (from >= 0 && to < from)
-                    return fail(`Un trámite nunca se mueve hacia atrás (${cur.stage} → ${patch.stage}).`);
+                if (from >= 0 && to < from && !reingreso)
+                    return fail(`Un trámite nunca se mueve hacia atrás (${cur.stage} → ${patch.stage}). Si CFE canceló o regresó el ingreso, es un re-ingreso: reingreso=true con motivo.`);
+                if (from >= 0 && to < from && to === 0)
+                    return fail(`Un re-ingreso no regresa a ${stages[0]}: el expediente ya se envió una vez.`);
+            }
+            if (reingreso) {
+                if (!motivo || motivo.trim().length < 5)
+                    return fail("Un re-ingreso necesita motivo (qué dijo la gestora o CFE).");
+                // The previous filing is history, not garbage: keep it next to the row.
+                const prev = { numero_si: cur.numero_si ?? null, fecha_ingreso: cur.fecha_ingreso ?? null, stage: cur.stage, motivo, at: new Date().toISOString() };
+                const hist = Array.isArray(cur.type_data?.ingresos_anteriores) ? cur.type_data.ingresos_anteriores : [];
+                patch.type_data = { ...(patch.type_data ?? {}), ingresos_anteriores: [...hist, prev] };
             }
             const update = {};
             const changes = [];
@@ -235,11 +251,11 @@ export function registerTramiteTools(server, deps) {
                 await logActivity(cur.project_id, "field_update", `Etapa de trámite: ${cur.tipo}`, motivo ?? null, {
                     old_value: String(stageChange.from ?? ""),
                     new_value: String(stageChange.to),
-                    metadata: { tramite_id, tipo: cur.tipo, from_stage: stageChange.from, to_stage: stageChange.to, source: "mcp" },
+                    metadata: { tramite_id, tipo: cur.tipo, from_stage: stageChange.from, to_stage: stageChange.to, source: "mcp", ...(reingreso ? { reingreso: true } : {}) },
                 });
             }
             else if (motivo) {
-                await logActivity(cur.project_id, "note", `Trámite ${cur.tipo}: ${changes.map((c) => c.field).join(", ")}`, motivo, { metadata: { tramite_id, source: "mcp" } });
+                await logActivity(cur.project_id, "note", `${reingreso ? "Re-ingreso " : ""}Trámite ${cur.tipo}: ${changes.map((c) => c.field).join(", ")}`, motivo, { metadata: { tramite_id, source: "mcp" } });
             }
             return text(`Trámite ${tramite_id} actualizado (${changes.map((c) => `${c.field}: ${c.from ?? "—"} → ${c.to}`).join("; ")}). Etapa actual: ${after?.stage ?? cur.stage}.`);
         }
@@ -445,6 +461,47 @@ export function registerTramiteTools(server, deps) {
             return fail(`No se pudo abrir el bloqueo: ${e.message}`);
         }
     });
+    /**
+     * Everything whatsapp_send refuses before touching the gateway: send window,
+     * Firebase-only media, own channel, 20/hour, the conversation is ours, chat id
+     * format. Also run in shadow (guard.setShadowCheck), so a shadow send that live
+     * would refuse is refused too.
+     */
+    async function waCheck({ conversation_id, chat_id, media_url }) {
+        const hora = fueraDeHorario(Date.now());
+        if (hora)
+            return { error: hora };
+        if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname))
+            return { error: "Solo se adjuntan archivos del Storage de Firebase." };
+        const ch = (await sbApi(`/whatsapp_channels?vendor_user_id=eq.${userId}&active=is.true&select=id,session_id,connection_status,label&limit=1`))?.[0];
+        if (!ch)
+            return { error: "No tienes una sesión de WhatsApp propia (whatsapp_channels.vendor_user_id). Trami solo escribe desde su número." };
+        if (conversation_id) {
+            const convo = (await sbApi(`/whatsapp_conversations?id=eq.${conversation_id}&channel_id=eq.${ch.id}&select=id&limit=1`))?.[0];
+            if (!convo)
+                return { error: "Esa conversación no es de tu número." };
+        }
+        else if (chat_id) {
+            const cid = chat_id.includes("@") ? chat_id : `${chat_id.replace(/\D/g, "")}@c.us`;
+            if (!/^\d{10,15}@c\.us$|^\d+@g\.us$/.test(cid))
+                return { error: `chat_id inválido: ${chat_id}` };
+        }
+        else {
+            return { error: "Indica conversation_id o chat_id." };
+        }
+        // Rate limit: outbound rows on this channel in the last hour.
+        const since = new Date(Date.now() - 3600_000).toISOString();
+        const convIds = ((await sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&select=id`, serviceHeaders())) ?? []).map((c) => c.id);
+        let sentLastHour = 0;
+        if (convIds.length) {
+            const cnt = await fetch(`${restBase}/whatsapp_messages?select=id&conversation_id=in.(${convIds.join(",")})&direction=eq.outbound&sent_at=gte.${encodeURIComponent(since)}&limit=1`, { headers: serviceHeaders({ Prefer: "count=exact" }) });
+            sentLastHour = parseInt((cnt.headers.get("content-range") ?? "*/0").split("/").pop() ?? "0", 10) || 0;
+        }
+        if (sentLastHour >= WA_SENDS_PER_HOUR)
+            return { error: `Tope alcanzado: ${sentLastHour} envíos en la última hora (máximo ${WA_SENDS_PER_HOUR}).` };
+        return { ch, sentLastHour };
+    }
+    setShadowCheck(server, "futurerp_whatsapp_send", async (a) => { const r = await waCheck(a); return "error" in r ? r.error : null; });
     // ── futurerp_whatsapp_send ────────────────────────────────────────────────
     tool("futurerp_whatsapp_send", "Send a WhatsApp text (optionally with a Firebase Storage file) from YOUR OWN number — the OpenWA session whose vendor_user_id is you (Trami's). To an existing conversation (conversation_id) or a phone/chat (chat_id: digits like 5218112345678, or a @g.us group id). Guards: 08:00–19:00 Monterrey, 20 sends per hour, Firebase-only media. The message is recorded in the inbox like any outbound.", {
         conversation_id: z.string().uuid().optional(),
@@ -456,44 +513,21 @@ export function registerTramiteTools(server, deps) {
         try {
             if (!OPENWA_API_URL || !OPENWA_API_KEY)
                 return fail("El gateway de WhatsApp no está configurado en el MCP (OPENWA_API_URL / OPENWA_API_KEY).");
-            const mty = (Date.now() - 6 * 3600_000) % 86_400_000;
-            const hour = Math.floor(mty / 3_600_000);
-            if (hour < WA_HOUR_FROM || hour >= WA_HOUR_TO)
-                return fail(`Fuera de horario (${String(hour).padStart(2, "0")}:00 Monterrey). Solo se envía de ${WA_HOUR_FROM}:00 a ${WA_HOUR_TO}:00.`);
-            if (media_url && !FIREBASE_HOSTS.includes(new URL(media_url).hostname))
-                return fail("Solo se adjuntan archivos del Storage de Firebase.");
-            const channels = await sbApi(`/whatsapp_channels?vendor_user_id=eq.${userId}&active=is.true&select=id,session_id,connection_status,label&limit=1`);
-            const ch = channels[0];
-            if (!ch)
-                return fail("No tienes una sesión de WhatsApp propia (whatsapp_channels.vendor_user_id). Trami solo escribe desde su número.");
-            // Rate limit: outbound rows on this channel in the last hour.
-            const since = new Date(Date.now() - 3600_000).toISOString();
-            const convIds = ((await sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&select=id`, serviceHeaders())) ?? []).map((c) => c.id);
-            let sentLastHour = 0;
-            if (convIds.length) {
-                const cnt = await fetch(`${restBase}/whatsapp_messages?select=id&conversation_id=in.(${convIds.join(",")})&direction=eq.outbound&sent_at=gte.${encodeURIComponent(since)}&limit=1`, { headers: serviceHeaders({ Prefer: "count=exact" }) });
-                sentLastHour = parseInt((cnt.headers.get("content-range") ?? "*/0").split("/").pop() ?? "0", 10) || 0;
-            }
-            if (sentLastHour >= WA_SENDS_PER_HOUR)
-                return fail(`Tope alcanzado: ${sentLastHour} envíos en la última hora (máximo ${WA_SENDS_PER_HOUR}).`);
+            const chk = await waCheck({ conversation_id, chat_id, media_url });
+            if ("error" in chk)
+                return fail(chk.error);
+            const { ch, sentLastHour } = chk;
             // Conversation under this channel (create for a new chat).
             let convo = null;
             if (conversation_id) {
                 convo = (await sbApi(`/whatsapp_conversations?id=eq.${conversation_id}&channel_id=eq.${ch.id}&select=id,chat_id&limit=1`))?.[0];
-                if (!convo)
-                    return fail("Esa conversación no es de tu número.");
             }
-            else if (chat_id) {
+            else {
                 const cid = chat_id.includes("@") ? chat_id : `${chat_id.replace(/\D/g, "")}@c.us`;
-                if (!/^\d{10,15}@c\.us$|^\d+@g\.us$/.test(cid))
-                    return fail(`chat_id inválido: ${chat_id}`);
                 const up = await fetch(`${restBase}/whatsapp_conversations?on_conflict=channel_id,chat_id`, { method: "POST", headers: serviceHeaders({ Prefer: "return=representation,resolution=merge-duplicates" }), body: JSON.stringify({ channel_id: ch.id, chat_id: cid, is_group: cid.endsWith("@g.us"), contact_phone: cid.endsWith("@c.us") ? cid.split("@")[0] : null }) });
                 if (!up.ok)
                     return fail(`No se pudo abrir la conversación: ${(await up.text()).slice(0, 200)}`);
                 convo = (await up.json())[0];
-            }
-            else {
-                return fail("Indica conversation_id o chat_id.");
             }
             // Gateway call (same routes openwa-send uses).
             const ext = (media_name ?? media_url ?? "").split(".").pop()?.toLowerCase() ?? "";

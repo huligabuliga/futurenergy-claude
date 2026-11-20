@@ -7,6 +7,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 export interface CtxDeps {
+  userId: string;
   uuidRx: RegExp;
   sbApi: (path: string, headers?: Record<string, string>) => Promise<any>;
 }
@@ -19,6 +20,12 @@ const EXPEDIENTE_SLOTS = new Set([
 ]);
 const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true as const });
 const tel = (s: string | null | undefined) => (s ? s.replace(/[^\d+]/g, "") : null);
+const d10 = (s: string | null | undefined) => String(s ?? "").replace(/\D/g, "").slice(-10);
+
+/** Files outside every slot and not linked to a trámite: the expediente may be hiding in them. */
+export function sinSlot(files: any[], slotOf: (documentId: string | null) => string | null | undefined, linked: Set<string>) {
+  return (files ?? []).filter((f) => !linked.has(f.id) && !EXPEDIENTE_SLOTS.has(slotOf(f.document_id ?? null) as string));
+}
 
 export function registerContextoTool(server: McpServer, deps: CtxDeps) {
   server.tool(
@@ -45,6 +52,21 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
 
         const c = p.clients ?? {};
         const cliente = { nombre: [c.first_name, c.last_name].filter(Boolean).join(" ") || c.name || null, celular: tel(c.mobile_phone), telefono: tel(c.phone), email: c.email ?? p.email_facturacion ?? null };
+        // Trami's own WhatsApp to this client (its channel, the client's phones): tells
+        // avisar-cliente whether the introduction was already sent and what was said last.
+        let waTrami = "nunca le ha escrito (el primer mensaje lleva la presentación)";
+        try {
+          const phones = [cliente.celular, cliente.telefono].map(d10).filter((x) => x.length === 10);
+          const ch = phones.length ? (await deps.sbApi(`/whatsapp_channels?vendor_user_id=eq.${deps.userId}&select=id&limit=1`))?.[0] : null;
+          if (ch) {
+            const convs: any[] = (await deps.sbApi(`/whatsapp_conversations?channel_id=eq.${ch.id}&is_group=is.false&select=id,chat_id,contact_phone`)) ?? [];
+            const ids = convs.filter((c) => phones.includes(d10(c.contact_phone ?? c.chat_id))).map((c) => c.id);
+            if (ids.length) {
+              const out: any[] = (await deps.sbApi(`/whatsapp_messages?conversation_id=in.(${ids.join(",")})&direction=eq.outbound&deleted=is.false&select=body,sent_at&order=sent_at.desc&limit=3`)) ?? [];
+              if (out.length) waTrami = `${out.length === 3 ? "3 o más" : out.length} mensaje(s); el último ${String(out[0].sent_at).slice(0, 16).replace("T", " ")} UTC: "${String(out[0].body ?? "").replace(/\s+/g, " ").slice(0, 160)}"`;
+            }
+          }
+        } catch { /* a missing channel or RLS just means "unknown"; say so */ waTrami = "no se pudo leer (trátalo como si nunca le hubieras escrito y pregunta a Flor si dudas)"; }
         const requeridos = [...new Set([...(p.tramites_requeridos_manual ?? []), ...(p.tramites_requeridos_vtecnica ?? [])])];
         const lat = p.proyecto_latitude ?? p.instalacion_latitude, lng = p.proyecto_longitude ?? p.instalacion_longitude;
         const direccion = [p.proyecto_street ?? p.instalacion_street, p.proyecto_city ?? p.instalacion_city, p.proyecto_state_code, p.proyecto_postal_code].filter(Boolean).join(", ");
@@ -63,7 +85,8 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
           const arr = porSlot.get(l.doc_key)!.archivos;
           if (!arr.some((a) => a.id === l.project_files.id)) arr.push({ id: l.project_files.id, nombre: l.project_files.file_name, tipo: l.project_files.mime_type ?? null, kb: Math.round((l.project_files.file_size ?? 0) / 1024) });
         }
-        const otros = (files ?? []).filter((f: any) => !f.document_id || !EXPEDIENTE_SLOTS.has(nameOf.get(f.document_id) as string)).slice(0, 15).map((f: any) => `${f.file_name} (${f.id})`);
+        const linked = new Set<string>((linkRows ?? []).map((l: any) => l.project_files?.id).filter(Boolean));
+        const sueltos = sinSlot(files ?? [], (did) => (did ? nameOf.get(did) : null), linked);
 
         const paneles = (bom ?? []).filter((b: any) => b.catalog_items?.category === "Paneles");
         const micros = (bom ?? []).filter((b: any) => ["Microinversores", "Inversores"].includes(b.catalog_items?.category));
@@ -74,6 +97,7 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
           `Etapa: ${p.stage ?? "—"}${p.last_stage_change_date ? ` (desde ${String(p.last_stage_change_date).slice(0, 10)})` : ""} · Zona CFE: ${p.zona_cfe ?? "SIN ZONA"} · Tarifa: ${p.tarifa_cfe ?? "—"} · Tipo: ${p.tipo_proyecto ?? "—"}${p.rfc ? ` · RFC ${p.rfc}${String(p.rfc).length === 12 ? " (persona moral)" : ""}` : ""}${p.razon_social ? ` · ${p.razon_social}` : ""}`,
           `Anticipo completo: ${p.fecha_anticipo_completo ?? "—"} · Dirección: ${direccion || "—"}${lat && lng ? ` · Maps: https://www.google.com/maps/search/?api=1&query=${lat},${lng}` : ""}`,
           `Cliente: ${cliente.nombre ?? "—"} · cel ${cliente.celular ?? "—"} · tel ${cliente.telefono ?? "—"} · ${cliente.email ?? "sin email"}`,
+          `WhatsApp de Trami al cliente: ${waTrami}`,
           `Requeridos (VT + manual): ${requeridos.join(", ") || "ninguno"}${p.tramites_requeridos_vetados?.length ? ` · VETADOS (no volver a poner): ${p.tramites_requeridos_vetados.join(", ")}` : ""}${p.tramites_requeridos_otro ? ` · Otro: "${p.tramites_requeridos_otro}"` : ""}`,
           "",
           `## Trámites (${(tramites ?? []).length})`,
@@ -81,7 +105,10 @@ export function registerContextoTool(server: McpServer, deps: CtxDeps) {
           "",
           "## Expediente (slot → archivos; usa el id con futurerp_read_document o como adjunto)",
           ...[...porSlot.entries()].map(([slot, v]) => `- ${slot}${v.requerido ? " (requerido)" : ""}: ${v.archivos.length ? v.archivos.map((a) => `${a.nombre} [${a.id}${a.tipo ? `, ${a.tipo}` : ""}${a.kb ? `, ${a.kb} KB` : ""}]`).join("; ") : "VACÍO"}`),
-          otros.length ? `- Otros archivos del proyecto: ${otros.join(", ")}` : "",
+          "",
+          sueltos.length
+            ? `## Archivos SIN slot (${sueltos.length}): ábrelos con futurerp_read_document antes de dar un documento por faltante; si es uno del expediente, vincúlalo con futurerp_tramite_link_file\n${sueltos.slice(0, 25).map((f: any) => `- ${f.file_name} [${f.id}${f.mime_type ? `, ${f.mime_type}` : ""}, subido ${String(f.created_at).slice(0, 10)}${f.document_id && nameOf.get(f.document_id) ? `, slot "${nameOf.get(f.document_id)}"` : ""}]`).join("\n")}${sueltos.length > 25 ? `\n- … y ${sueltos.length - 25} más (futurerp_list_files)` : ""}`
+            : "## Archivos SIN slot: ninguno",
           "",
           `## Equipo (BOM): ${paneles.length ? paneles.map((b: any) => `${b.quantity} × ${b.catalog_items.name}`).join(", ") : "sin paneles en el BOM"}; ${micros.length ? micros.map((b: any) => `${b.quantity} × ${b.catalog_items.name}`).join(", ") : "sin microinversores en el BOM"}; ${kw ? `${kw.toFixed(2)} kW, ~${(kw * 5.1).toFixed(1)} kWh/día` : p.potencia_total ? `${(Number(p.potencia_total) / 1000).toFixed(2)} kW (columna del proyecto)` : "potencia desconocida"}${p.paneles_solicitados ? ` · paneles solicitados: ${p.paneles_solicitados}` : ""}`,
           "",
