@@ -250,11 +250,15 @@ export function registerTramiteTools(server, deps) {
     const ETAPAS_DEL_CLIENTE = new Set(["medidor_instalado", "sistema_activado", "documentos_recibidos"]);
     const SLOTS_INGRESO = ["Anexo 2", "Comprobante de ingreso"];
     const SLOTS_DE_ETAPA = { folio_ingresado: SLOTS_INGRESO, en_seguimiento_cfe: SLOTS_INGRESO, ingresado_cfe: SLOTS_INGRESO, ingresado: SLOTS_INGRESO };
+    const CAMPOS_CON_EVIDENCIA = ["fecha_ingreso", "subsanacion_active", "motivo_subsanacion", "fecha_subsanacion"];
     async function evidenciaCheck(cur, patch, ev) {
         const etapa = patch.stage;
         const mueve = etapa !== undefined && etapa !== cur.stage && !ETAPAS_PROPIAS.has(etapa);
         const siNuevo = patch.numero_si && patch.numero_si !== cur.numero_si ? patch.numero_si : null;
-        if (!mueve && !siNuevo)
+        // These dates drive the SLA clocks: same evidence rule as a stage move.
+        const campos = CAMPOS_CON_EVIDENCIA.filter((k) => k in patch && String(patch[k] ?? "") !== String(cur[k] ?? ""));
+        const subs = campos.some((k) => k !== "fecha_ingreso");
+        if (!mueve && !siNuevo && !campos.length)
             return null;
         const cli = await clienteDe(cur.project_id);
         // A message storing a NEW SI must name the client: the SI alone could belong to anyone.
@@ -273,12 +277,13 @@ export function registerTramiteTools(server, deps) {
             if (f && f.project_id === cur.project_id) {
                 const links = (await sbApi(`/tramite_file_links?tramite_id=eq.${cur.id}&file_id=eq.${f.id}&select=doc_key`, serviceHeaders())) ?? [];
                 const deElla = f.msgs.filter((m) => m.deGestora);
-                if (links.some((l) => SLOTS_INGRESO.includes(l.doc_key)) && (!mueve || SLOTS_DE_ETAPA[etapa])) {
+                // An ingreso comprobante says nothing about a subsanación.
+                if (!subs && links.some((l) => SLOTS_INGRESO.includes(l.doc_key)) && (!mueve || SLOTS_DE_ETAPA[etapa])) {
                     // The comprobante was linked from her message; a new SI is taken only from its readable text.
                     valida = true;
                     if (siNuevo) {
                         const t = f.firebase_url ? await leerPdf(f.firebase_url) : null;
-                        conSi = !!t && traeSi(t, siNuevo);
+                        conSi = !!t && traeSi(t, siNuevo) && nombraCliente(t, cli.nombres);
                         pdfIlegible = !t;
                     }
                 }
@@ -294,11 +299,11 @@ export function registerTramiteTools(server, deps) {
         }
         if (valida && (!siNuevo || conSi))
             return null;
-        const que = mueve ? `Cambiar la etapa a ${etapa}` : `Poner el numero_si ${siNuevo}`;
+        const que = mueve ? `Cambiar la etapa a ${etapa}` : siNuevo ? `Poner el numero_si ${siNuevo}` : `Cambiar ${campos.join(", ")}`;
         const cual = valida && pdfIlegible
             ? `el comprobante vinculado no tiene texto legible (escaneado), así que el numero_si ${siNuevo} no se puede comprobar; no lo guardes por tu cuenta`
             : valida
-                ? `el numero_si ${siNuevo} tiene que venir escrito en el mensaje de la gestora que pasas como evidencia (o en el comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
+                ? `el numero_si ${siNuevo} tiene que venir escrito, junto con el nombre del cliente, en el mensaje de la gestora que pasas como evidencia (o en el texto del comprobante ya vinculado en Anexo 2); un SI que no está en la evidencia no se guarda`
                 : mueve && ETAPAS_DEL_CLIENTE.has(etapa)
                     ? "evidencia.file_id de la foto o documento que mandó el cliente desde su teléfono, o que subió el instalador al proyecto"
                     : `evidencia.wa_message_id de un mensaje que mandó la gestora (desde su número, no otra persona del grupo) y que nombra a este cliente o su SI, o evidencia.file_id de un archivo que ella mandó para este trámite${SLOTS_DE_ETAPA[etapa ?? ""] || !mueve ? " o del comprobante ya vinculado en Anexo 2 / Comprobante de ingreso" : ""}; un numero_si nuevo tiene que venir escrito en esa evidencia`;

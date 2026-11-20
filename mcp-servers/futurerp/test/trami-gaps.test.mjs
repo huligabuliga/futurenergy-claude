@@ -497,6 +497,7 @@ const F = {
   g22: "2304f7e0-9906-4229-a02b-19306f1f5b25",      // G22's file
   ajeno: "44444444-4444-4444-8444-444444444446",    // a photo that came from ANOTHER client's chat
   anexoScan: "44444444-4444-4444-8444-444444444447", // a scanned comprobante in Anexo 2 (no text layer)
+  anexoOtro: "44444444-4444-4444-8444-444444444448", // a text comprobante in Anexo 2 that is ANOTHER client's
 };
 const FILES = [
   { id: F.gestora, project_id: P1, firebase_url: FB("comprobante.pdf"), uploaded_by: "trami-uid" },
@@ -507,6 +508,7 @@ const FILES = [
   { id: F.g22, project_id: P1, firebase_url: FB("g22.pdf"), uploaded_by: "trami-uid" },
   { id: F.ajeno, project_id: P1, firebase_url: FB("ajeno.jpg"), uploaded_by: "trami-uid" },
   { id: F.anexoScan, project_id: P1, firebase_url: FB("anexo-escaneado.pdf"), uploaded_by: "trami-uid" },
+  { id: F.anexoOtro, project_id: P1, firebase_url: FB("anexo-otro.pdf"), uploaded_by: "trami-uid" },
 ];
 const STAFF_TEL = "5218100000007";  // someone of ours in the gestora's group (G22's trigger was Ana Karen's question)
 const MSGS = [
@@ -532,14 +534,17 @@ function etapaHarness(tramite = {}, proyecto = {}) {
     },
     "/whatsapp_conversations": (p) => [{ chat_id: p.includes("cv-g") ? GRUPO : p.includes("cv-x") ? "5218100000002@c.us" : `${CLIENTE}@c.us` }],
     "/project_files": (p) => FILES.filter((f) => p.includes(f.id)),
-    "/tramite_file_links": (p) => p.includes(F.anexo) || p.includes(F.anexoScan) ? [{ tramite_id: T2, doc_key: "Anexo 2" }] : [],
+    "/tramite_file_links": (p) => p.includes(F.anexo) || p.includes(F.anexoScan) || p.includes(F.anexoOtro) ? [{ tramite_id: T2, doc_key: "Anexo 2" }] : [],
   });
   h.deps.textoPdf = async (url) => PDF_TEXTO[url] ?? null;
   registerTramiteTools(h.server, h.deps);
   return h;
 }
 // The comprobante already in Anexo 2 has a text layer; the scanned one has none.
-const PDF_TEXTO = { [FB("anexo.pdf")]: "ANEXO 2 Comprobante de ingreso. Solicitante: Nombre Cliente. Número de seguimiento SI261120CCCC0003." };
+const PDF_TEXTO = {
+  [FB("anexo.pdf")]: "ANEXO 2 Comprobante de ingreso. Solicitante: Nombre Cliente. Número de seguimiento SI261120CCCC0003.",
+  [FB("anexo-otro.pdf")]: "ANEXO 2 Comprobante de ingreso. Solicitante: Pedro Otro Persona. Número de seguimiento SI261120DDDD0004.",
+};
 
 test("G22: the exact stage move without evidence is refused and becomes a question for tramitología", async () => {
   const h = etapaHarness();
@@ -585,7 +590,7 @@ test("evidencia: a new SI, the gestora's message or file, or the comprobante in 
   // An SI alone (no stage) needs the same evidence; an SI not in it is refused by name.
   const si = (patch, evidencia) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch, evidencia });
   assert.match(txt(await si({ numero_si: "SI261120BBBB0002" })), /Poner el numero_si SI261120BBBB0002 necesita evidencia/);
-  assert.match(txt(await si({ numero_si: "SI261120BBBB0002" }, { wa_message_id: "WA-GESTORA" })), /tiene que venir escrito en el mensaje de la gestora/);
+  assert.match(txt(await si({ numero_si: "SI261120BBBB0002" }, { wa_message_id: "WA-GESTORA" })), /tiene que venir escrito, junto con el nombre del cliente, en el mensaje de la gestora/);
   assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-STAFF" })), /necesita evidencia/, "staff wrote the SI, not the gestora");
   assert.match(txt(await si({ numero_si: "SI261120AAAA0001" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
   // Not stage or SI changes: no evidence needed.
@@ -638,4 +643,21 @@ test("name match ignores stopwords: 'del Norte SA de CV' is not a razón social'
   const mueve = (wa) => etapaHarness({}, { razon_social: "Aceros Garza del Norte SA de CV", clients: {} }).tools.futurerp_tramite_update({ tramite_id: T2, patch: { stage: "en_seguimiento_cfe" }, evidencia: { wa_message_id: wa } });
   assert.match(txt(await mueve("WA-NORTE-MAL")), /necesita evidencia/, "shares only del / norte / sa / de / cv");
   assert.match(txt(await mueve("WA-NORTE-OK")), /^\(sombra\)/, "aceros + garza");
+});
+
+test("a text comprobante in Anexo 2 gives its SI only when it also names this client", async () => {
+  const up = (patch, evidencia) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch, evidencia });
+  assert.match(txt(await up({ numero_si: "SI261120DDDD0004" }, { file_id: F.anexoOtro })), /junto con el nombre del cliente/, "another client's PDF");
+  assert.match(txt(await up({ numero_si: "SI261120CCCC0003" }, { file_id: F.anexo })), /^\(sombra\)/, "this client's PDF");
+});
+
+test("fecha_ingreso and the subsanación fields need the same evidence as a stage move", async () => {
+  const up = (patch, evidencia) => etapaHarness().tools.futurerp_tramite_update({ tramite_id: T2, patch, evidencia });
+  assert.match(txt(await up({ fecha_ingreso: "2026-11-10" })), /^Cambiar fecha_ingreso necesita evidencia/);
+  assert.match(txt(await up({ subsanacion_active: true, motivo_subsanacion: "adeudo", fecha_subsanacion: "2026-11-20" })), /^Cambiar subsanacion_active, motivo_subsanacion, fecha_subsanacion necesita evidencia/);
+  assert.match(txt(await up({ fecha_ingreso: "2026-11-18" })), /^\(sombra\)/, "an unchanged date needs nothing");
+  assert.match(txt(await up({ fecha_ingreso: "2026-11-10" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/, "her message naming the client");
+  assert.match(txt(await up({ fecha_ingreso: "2026-11-10" }, { file_id: F.anexo })), /^\(sombra\)/, "the comprobante dates the ingreso");
+  assert.match(txt(await up({ subsanacion_active: true, motivo_subsanacion: "adeudo" }, { file_id: F.anexo })), /necesita evidencia/, "an ingreso comprobante proves no subsanación");
+  assert.match(txt(await up({ subsanacion_active: true, motivo_subsanacion: "adeudo" }, { wa_message_id: "WA-GESTORA" })), /^\(sombra\)/);
 });
