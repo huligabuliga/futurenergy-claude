@@ -190,7 +190,7 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
   );
 
   /** Allowlist + attachment ownership; also run in shadow (guard.shadowChecks). */
-  async function mailCheck({ to, subject, project_id, attachment_file_ids }: { to: string; subject?: string; project_id?: string; attachment_file_ids?: string[] }): Promise<{ error: string } | { addr: string; project: any }> {
+  async function mailCheck({ to, subject, project_id, tramite_id, attachment_file_ids }: { to: string; subject?: string; project_id?: string; tramite_id?: string; attachment_file_ids?: string[] }): Promise<{ error: string } | { addr: string; project: any }> {
     let addr: string;
     try { addr = assertSafeAddress(to, "To").toLowerCase(); } catch (e: any) { return { error: e.message }; }
     const domain = addr.split("@")[1] ?? "";
@@ -210,13 +210,18 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
       if (project && f.project_id !== project.id) return { error: `El archivo ${fid} no pertenece al proyecto ${project.efu ?? project.id}.` };
       if (!FIREBASE_HOSTS.includes(new URL(f.firebase_url).hostname)) return { error: `El archivo ${fid} no está en Firebase Storage.` };
     }
-    // The expediente email ("Trámite nuevo – <tipo> – <zona> – <cliente>") waits for the DD10/DD11 week.
-    // Cambio de nombre, 220 V, UVIE and alta are eligible right away and pass.
+    // The expediente email ("Trámite nuevo – <tipo> – <zona> – <cliente>") names its trámite; a primary
+    // (bidireccional) one waits for the DD10/DD11 week. The exemption comes from the trámite's tipo, never
+    // from the subject: a client name can contain "alta" or "nombre".
     const asunto = String(subject ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-    if (/^\s*tramite nuevo\b/.test(asunto) && !/nombre|220|uvie|alta/.test(asunto)) {
-      if (!project) return { error: "Un expediente (asunto 'Trámite nuevo – …') lleva project_id: sin él no se puede revisar si ya toca enviarlo." };
-      const espera = await esperaAnticipo(sbApi, serviceHeaders(), project.id);
-      if (espera) return { error: espera };
+    if (/^\s*tramite nuevo\b/.test(asunto)) {
+      if (!project || !tramite_id || !uuidRx.test(tramite_id)) return { error: "Un expediente (asunto 'Trámite nuevo – …') lleva project_id y tramite_id: sin ellos no se puede revisar si ya toca enviarlo." };
+      const t = (await sbApi(`/project_tramites?id=eq.${tramite_id}&select=id,project_id,tipo&limit=1`))?.[0];
+      if (!t || t.project_id !== project.id) return { error: `El trámite ${tramite_id} no existe o no es del proyecto ${project.efu ?? project.id}.` };
+      if (String(t.tipo ?? "").startsWith("primary")) {
+        const espera = await esperaAnticipo(sbApi, serviceHeaders(), project.id);
+        if (espera) return { error: espera };
+      }
     }
     return { addr, project };
   }
@@ -224,17 +229,18 @@ export function registerMailTools(server: McpServer, deps: MailDeps) {
 
   tool(
     "futurerp_mail_draft",
-    "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated. An expediente (subject 'Trámite nuevo – …', project_id required) for a DD10/DD11 project is refused until 7 days after the anticipo; the error gives the date to put in the timeline note.",
+    "Create a DRAFT in the trámites mailbox (nothing is sent; a person reviews and sends it from Gmail). Recipients are allow-listed: a gestora's email (public.gestoras), any @cfe.mx address, or the client email of the project passed in project_id. Attachments are project_files ids (Firebase Storage). Plain text; the HTML part is generated. An expediente (subject 'Trámite nuevo – …', project_id and tramite_id required) for a bidireccional in a DD10/DD11 project is refused until 7 days after the anticipo; the error gives the date to put in the timeline note.",
     {
       to: z.string().email(),
       subject: z.string().min(3).max(200),
       text: z.string().min(1).max(20000),
       project_id: z.string().optional().describe("Project uuid or EFU; required when writing to the client, and used for the timeline note"),
+      tramite_id: z.string().uuid().optional().describe("The trámite this email is about; required for an expediente (subject 'Trámite nuevo – …')"),
       attachment_file_ids: z.array(z.string().uuid()).max(10).optional().describe("project_files ids to attach"),
     },
-    async ({ to, subject, text: bodyText, project_id, attachment_file_ids }) => {
+    async ({ to, subject, text: bodyText, project_id, tramite_id, attachment_file_ids }) => {
       try {
-        const chk = await mailCheck({ to, subject, project_id, attachment_file_ids });
+        const chk = await mailCheck({ to, subject, project_id, tramite_id, attachment_file_ids });
         if ("error" in chk) return fail(chk.error);
         const { addr, project } = chk;
 
