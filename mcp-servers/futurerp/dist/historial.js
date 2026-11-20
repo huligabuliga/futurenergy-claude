@@ -20,7 +20,7 @@ export function horaMty(iso) {
     return `${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 export function registerHistorialTool(server, deps) {
-    server.tool("futurerp_whatsapp_historial", "Read the WhatsApp messages of ONE chat (an ACTIVE gestora's group …@g.us or 1:1 …@c.us from public.gestoras.whatsapp_chat_ids, or a client chat on your own number) between two dates, oldest first, with sender and attachments. Use it for the Thursday desglose (the week's payment list Iris posted) and to re-read what the gestora said before acting. Dates are Monterrey days, YYYY-MM-DD, inclusive; default the last 7 days. The read is logged in the Bitácora.", {
+    server.tool("futurerp_whatsapp_historial", "Read the WhatsApp messages of ONE chat (an ACTIVE gestora's group …@g.us or 1:1 …@c.us from public.gestoras.whatsapp_chat_ids, or a client chat on your own number) between two dates, oldest first, with sender and attachments. Use it for the Thursday desglose (the week's payment list the gestora posted) and to re-read what the gestora said before acting. Dates are Monterrey days, YYYY-MM-DD, inclusive; default the last 7 days. The read is logged in the Bitácora.", {
         chat_id: z.string().regex(/^\d+@(g|c)\.us$/).describe("WhatsApp chat id: …@g.us (group) or …@c.us (1:1)"),
         desde: z.string().regex(fecha).optional().describe("First day, YYYY-MM-DD (default: 7 days ago)"),
         hasta: z.string().regex(fecha).optional().describe("Last day, YYYY-MM-DD (default: today)"),
